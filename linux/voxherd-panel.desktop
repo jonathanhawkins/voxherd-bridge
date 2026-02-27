@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=VoxHerd Panel
+Comment=GUI for VoxHerd bridge server management
+Exec=python3 -m voxherd_panel
+Icon=utilities-terminal
+Terminal=false
+Categories=Development;Utility;
+Keywords=voxherd;claude;ai;voice;
+StartupNotify=true

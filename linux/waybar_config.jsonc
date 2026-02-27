@@ -1,0 +1,18 @@
+// Waybar config snippet for VoxHerd bridge status module.
+// Add this to your Waybar config (usually ~/.config/waybar/config.jsonc).
+//
+// Add "custom/voxherd" to your "modules-right" (or wherever you want it):
+//   "modules-right": ["custom/voxherd", "clock", ...]
+
+{
+    "custom/voxherd": {
+        "exec": "python3 ~/.local/share/voxherd/waybar_module.py",
+        "return-type": "json",
+        "interval": 5,
+        "on-click": "python3 -m voxherd_panel",
+        "tooltip": true,
+        "format": "{}",
+        // Optional: override bridge URL
+        // "exec-env": { "VOXHERD_BRIDGE_URL": "http://127.0.0.1:7777" }
+    }
+}

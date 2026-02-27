@@ -1,0 +1,344 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		11E2F97F4BA10E3B6970A52F /* NetworkInfo.swift in Sources */ = {isa = PBXBuildFile; fileRef = 68DADADA5C858D1984A7C8A1 /* NetworkInfo.swift */; };
+		196184F8F04F2C1A78075534 /* VoxHerdBridgeApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9968D8FE85F14E49FEC74864 /* VoxHerdBridgeApp.swift */; };
+		2890E0A5FCC0A75FE4FE7B7B /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B238C677328FFD3F9D6EE46A /* Assets.xcassets */; };
+		2B0F37DF5F16E48F5B10D15C /* LogView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 69EDA489DBA75DCDBFFA7611 /* LogView.swift */; };
+		31D9663D4F3673C30FB2048E /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = D61C35261E18403BAEF71F0A /* Models.swift */; };
+		6D703B613C78E936070803C8 /* BridgeProcessManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00C10905CFA2B995F881C37 /* BridgeProcessManager.swift */; };
+		8DE871AAE1B21993004E63C0 /* StatusBarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CC3AFBA53741B8E0A6D7829 /* StatusBarView.swift */; };
+		ABFB8257B5E31178AD77395C /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A2F4AC295FF4C2DF5B34A97 /* SettingsView.swift */; };
+		C35C848F851AB460492D2B56 /* Preferences.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC74DB2A71239D8C0FA3728F /* Preferences.swift */; };
+		EB01F929F10E7D488DEC8870 /* QRCodeGenerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = F75D5541D7F990E5BE9DA197 /* QRCodeGenerator.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		4A2F4AC295FF4C2DF5B34A97 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		68DADADA5C858D1984A7C8A1 /* NetworkInfo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkInfo.swift; sourceTree = "<group>"; };
+		69EDA489DBA75DCDBFFA7611 /* LogView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogView.swift; sourceTree = "<group>"; };
+		7CC3AFBA53741B8E0A6D7829 /* StatusBarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusBarView.swift; sourceTree = "<group>"; };
+		9968D8FE85F14E49FEC74864 /* VoxHerdBridgeApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoxHerdBridgeApp.swift; sourceTree = "<group>"; };
+		A0B8813F3C9C498A6F790693 /* VoxHerdBridge.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = VoxHerdBridge.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		AC74DB2A71239D8C0FA3728F /* Preferences.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Preferences.swift; sourceTree = "<group>"; };
+		B238C677328FFD3F9D6EE46A /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		D61C35261E18403BAEF71F0A /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
+		F00C10905CFA2B995F881C37 /* BridgeProcessManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeProcessManager.swift; sourceTree = "<group>"; };
+		F75D5541D7F990E5BE9DA197 /* QRCodeGenerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QRCodeGenerator.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		042DE9EF8210E0F45F9AD1D3 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A0B8813F3C9C498A6F790693 /* VoxHerdBridge.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		62B3D8518389464D277E74D1 = {
+			isa = PBXGroup;
+			children = (
+				E1766725C8A7E37F631432AD /* Sources */,
+				042DE9EF8210E0F45F9AD1D3 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		E1766725C8A7E37F631432AD /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				B238C677328FFD3F9D6EE46A /* Assets.xcassets */,
+				F00C10905CFA2B995F881C37 /* BridgeProcessManager.swift */,
+				69EDA489DBA75DCDBFFA7611 /* LogView.swift */,
+				D61C35261E18403BAEF71F0A /* Models.swift */,
+				68DADADA5C858D1984A7C8A1 /* NetworkInfo.swift */,
+				AC74DB2A71239D8C0FA3728F /* Preferences.swift */,
+				F75D5541D7F990E5BE9DA197 /* QRCodeGenerator.swift */,
+				4A2F4AC295FF4C2DF5B34A97 /* SettingsView.swift */,
+				7CC3AFBA53741B8E0A6D7829 /* StatusBarView.swift */,
+				9968D8FE85F14E49FEC74864 /* VoxHerdBridgeApp.swift */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		EACF11CA476BBC2BA1215741 /* VoxHerdBridge */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = CF6FB9CC63D90B9B941F077B /* Build configuration list for PBXNativeTarget "VoxHerdBridge" */;
+			buildPhases = (
+				ABC108EA53913858D29519C1 /* Sources */,
+				1CFF6412B39C27204B32E075 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = VoxHerdBridge;
+			packageProductDependencies = (
+			);
+			productName = VoxHerdBridge;
+			productReference = A0B8813F3C9C498A6F790693 /* VoxHerdBridge.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		FDFC8AF5F9532E924D12F29C /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1600;
+				TargetAttributes = {
+					EACF11CA476BBC2BA1215741 = {
+						DevelopmentTeam = YOUR_TEAM_ID;
+					};
+				};
+			};
+			buildConfigurationList = 353D361E1451D57E5A5F3595 /* Build configuration list for PBXProject "VoxHerdBridge" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 62B3D8518389464D277E74D1;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				EACF11CA476BBC2BA1215741 /* VoxHerdBridge */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		1CFF6412B39C27204B32E075 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				2890E0A5FCC0A75FE4FE7B7B /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		ABC108EA53913858D29519C1 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				6D703B613C78E936070803C8 /* BridgeProcessManager.swift in Sources */,
+				2B0F37DF5F16E48F5B10D15C /* LogView.swift in Sources */,
+				31D9663D4F3673C30FB2048E /* Models.swift in Sources */,
+				11E2F97F4BA10E3B6970A52F /* NetworkInfo.swift in Sources */,
+				C35C848F851AB460492D2B56 /* Preferences.swift in Sources */,
+				EB01F929F10E7D488DEC8870 /* QRCodeGenerator.swift in Sources */,
+				ABFB8257B5E31178AD77395C /* SettingsView.swift in Sources */,
+				8DE871AAE1B21993004E63C0 /* StatusBarView.swift in Sources */,
+				196184F8F04F2C1A78075534 /* VoxHerdBridgeApp.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		5C596BD97AF946EFE2FC5E0C /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = YOUR_TEAM_ID;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				INFOPLIST_KEY_LSUIElement = YES;
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "VoxHerd needs microphone access for voice commands and speech-to-text.";
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.9;
+			};
+			name = Debug;
+		};
+		731D4EA230A681955D1FB7EB /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_IDENTITY = "Developer ID Application";
+				CODE_SIGN_STYLE = Manual;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = YOUR_TEAM_ID;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				INFOPLIST_KEY_LSUIElement = YES;
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "VoxHerd needs microphone access for voice commands and speech-to-text.";
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.9;
+			};
+			name = Release;
+		};
+		D9DC4675D1FAC023C4093535 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = VoxHerdBridge.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "VoxHerd Bridge";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.voxherd.bridge;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		E3EAFC1C37842B2096327A2A /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = VoxHerdBridge.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "VoxHerd Bridge";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.voxherd.bridge;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		353D361E1451D57E5A5F3595 /* Build configuration list for PBXProject "VoxHerdBridge" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				5C596BD97AF946EFE2FC5E0C /* Debug */,
+				731D4EA230A681955D1FB7EB /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		CF6FB9CC63D90B9B941F077B /* Build configuration list for PBXNativeTarget "VoxHerdBridge" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				D9DC4675D1FAC023C4093535 /* Debug */,
+				E3EAFC1C37842B2096327A2A /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = FDFC8AF5F9532E924D12F29C /* Project object */;
+}

@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Convenience wrapper for VoxHerd bridge CLI.
+# Usage:
+#   vh start [--tts] [--listen] [--wake-word]
+#   vh stop
+#   vh restart [--tts] [--listen]
+#   vh status
+#   vh cleanup
+#   vh attach
+#
+# Automatically activates the bridge venv.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+VENV_PYTHON="$REPO_ROOT/bridge/.venv/bin/python"
+
+if [ ! -f "$VENV_PYTHON" ]; then
+    echo "Error: Python venv not found at $VENV_PYTHON"
+    echo "Run: cd $REPO_ROOT && python3 -m venv bridge/.venv && bridge/.venv/bin/pip install -r bridge/requirements.txt"
+    exit 1
+fi
+
+cd "$REPO_ROOT"
+exec "$VENV_PYTHON" -m bridge "$@"

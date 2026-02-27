@@ -1,0 +1,39 @@
+/* Waybar CSS for VoxHerd module — Catppuccin Mocha theme.
+ *
+ * Add to your Waybar style.css (usually ~/.config/waybar/style.css):
+ *   @import url("~/.local/share/voxherd/waybar_style.css");
+ *
+ * Or copy the relevant rules into your existing stylesheet.
+ */
+
+#custom-voxherd {
+    font-family: "JetBrainsMono Nerd Font", "FiraCode Nerd Font", monospace;
+    padding: 0 8px;
+    margin: 0 4px;
+    border-radius: 8px;
+}
+
+#custom-voxherd.active {
+    color: #89b4fa;           /* Catppuccin Blue */
+    background: rgba(137, 180, 250, 0.1);
+}
+
+#custom-voxherd.attention {
+    color: #f9e2af;           /* Catppuccin Yellow */
+    background: rgba(249, 226, 175, 0.15);
+    animation: pulse 2s ease-in-out infinite;
+}
+
+#custom-voxherd.idle {
+    color: #6c7086;           /* Catppuccin Overlay0 */
+}
+
+#custom-voxherd.offline {
+    color: #f38ba8;           /* Catppuccin Red */
+    background: rgba(243, 139, 168, 0.08);
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; }
+}

@@ -1,0 +1,40 @@
+name: VoxHerdBridge
+options:
+  bundleIdPrefix: com.voxherd
+  deploymentTarget:
+    macOS: "14.0"
+  xcodeVersion: "16.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
+    INFOPLIST_KEY_LSUIElement: true
+    INFOPLIST_KEY_NSMicrophoneUsageDescription: "VoxHerd needs microphone access for voice commands and speech-to-text."
+    ENABLE_HARDENED_RUNTIME: true
+  configs:
+    Debug:
+      CODE_SIGN_IDENTITY: "Apple Development"
+      CODE_SIGN_STYLE: Automatic
+    Release:
+      CODE_SIGN_IDENTITY: "Developer ID Application"
+      CODE_SIGN_STYLE: Manual
+
+targets:
+  VoxHerdBridge:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources
+    resources:
+      - path: ../../hooks
+        buildPhase: resources
+        type: folder
+    entitlements:
+      path: VoxHerdBridge.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.voxherd.bridge
+        INFOPLIST_KEY_CFBundleDisplayName: VoxHerd Bridge
+        GENERATE_INFOPLIST_FILE: true

@@ -89,7 +89,7 @@ List all registered sessions with their current status.
     "session_id": "abc-123",
     "assistant": "claude",
     "project": "voxherd",
-    "project_dir": "/Users/light/dev/web-apps/voxherd",
+    "project_dir": "/home/user/projects/voxherd",
     "status": "active",
     "last_summary": "Built the WebSocket reconnection logic.",
     "registered_at": "2026-02-16T10:30:00",
@@ -390,8 +390,8 @@ List available projects that can be spawned. Merges configured projects (`~/.vox
 ```json
 {
   "projects": [
-    { "name": "voxherd", "dir": "/Users/light/dev/web-apps/voxherd", "source": "configured" },
-    { "name": "my-app", "dir": "/Users/light/dev/my-app", "source": "discovered" }
+    { "name": "voxherd", "dir": "/home/user/projects/voxherd", "source": "configured" },
+    { "name": "my-app", "dir": "/home/user/projects/my-app", "source": "discovered" }
   ]
 }
 ```
@@ -443,7 +443,7 @@ Unified view of all tmux sessions cross-referenced with registered sessions and 
   "projects": [
     {
       "name": "voxherd",
-      "dir": "/Users/light/dev/web-apps/voxherd",
+      "dir": "/home/user/projects/voxherd",
       "tmux_session": "voxherd",
       "has_live_process": true,
       "is_registered": true,
@@ -457,7 +457,7 @@ Unified view of all tmux sessions cross-referenced with registered sessions and 
     },
     {
       "name": "my-app",
-      "dir": "/Users/light/dev/my-app",
+      "dir": "/home/user/projects/my-app",
       "tmux_session": null,
       "has_live_process": false,
       "is_registered": false,
@@ -670,7 +670,7 @@ A new session was registered. Contains all session fields plus metadata.
   "type": "session_registered",
   "session_id": "abc-123",
   "project": "voxherd",
-  "project_dir": "/Users/light/dev/web-apps/voxherd",
+  "project_dir": "/home/user/projects/voxherd",
   "assistant": "claude",
   "status": "idle",
   "agent_number": 1,
@@ -1003,7 +1003,7 @@ Spawn a new assistant session in a new tmux window.
 {
   "type": "spawn_session",
   "project": "voxherd",
-  "dir": "/Users/light/dev/web-apps/voxherd",
+  "dir": "/home/user/projects/voxherd",
   "assistant": "claude",
   "prompt": "Fix the login bug"
 }

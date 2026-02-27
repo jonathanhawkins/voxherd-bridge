@@ -1,184 +1,181 @@
-# VoxHerd Bridge
+# VoxHerd
 
-Voice-first bridge server for multi-agent Claude Code orchestration. Route voice commands to the right Claude Code session and get spoken status updates when agents finish work.
+**Herd your AI coding agents with your voice.**
 
-VoxHerd Bridge is the central nervous system that connects Claude Code hook events to mobile clients over WebSocket. It maintains a live registry of all running Claude Code sessions and dispatches commands via `claude --resume`.
-
-**Full product:** [voxherd.com](https://voxherd.com)
+VoxHerd is a voice-first controller for AI coding assistants. It lets you manage multiple [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://developers.openai.com/codex), and [Gemini CLI](https://github.com/google-gemini/gemini-cli) sessions from Meta Ray-Ban glasses, your phone, or just your laptop mic. Agents announce when they finish work via text-to-speech. You issue follow-up commands by talking. No browser tab required -- walk around, supervise, and redirect your agents by voice.
 
 ```
-Claude Code hooks (Stop/Notification/SessionStart)
-    |
-    | HTTP POST
-    v
-Bridge Server (FastAPI :7777) ---- WebSocket ----> Mobile / CLI clients
-    |
-    | claude --resume SESSION_ID -p "message"
-    v
-Claude Code instances (#1..#N)
+Voice input -> STT -> intent parse -> WebSocket -> Bridge Server (FastAPI :7777) -> assistant dispatch
+Assistant hooks (lifecycle events) -> HTTP POST -> Bridge Server -> WebSocket -> TTS -> speaker
 ```
 
-## What's in this repo
+## Why VoxHerd?
 
-| Directory | Contents |
-|-----------|----------|
-| `bridge/` | Python FastAPI bridge server -- REST API, WebSocket, session management, command dispatch |
-| `hooks/` | Bash/PowerShell scripts installed into Claude Code's hook lifecycle |
-| `docs/` | API reference and product requirements |
-| `scripts/` | Dev setup, test automation, Linux deployment |
+If you run multiple AI coding sessions across different projects, you know the pain: tabbing between terminals, reading through output, manually checking what finished. VoxHerd replaces that with a voice loop. Your agents report in when they are done ("Aligned Tools completed: added retry logic to the API client"). You respond naturally ("Good, now add tests for the retry paths"). VoxHerd routes your command to the right session and dispatches it. You never leave your conversation flow.
 
-## Quick start
+## Platforms
 
-### Prerequisites
+| Platform | Component | Status |
+|----------|-----------|--------|
+| **All** | Bridge server (Python) | Stable |
+| **All** | Hook scripts (bash/PS/Python) | Stable |
+| **macOS** | Menu bar app (SwiftUI) | Stable |
+| **macOS** | Native TTS + STT | Stable |
+| **Linux** | systemd service | Stable |
+| **Linux** | GTK4 panel app + Waybar | Beta |
+| **Linux** | espeak-ng TTS | Stable |
+| **Windows** | System tray app (pystray) | Beta |
+| **Windows** | pyttsx3 TTS | Beta |
+| **iOS** | Voice remote app | Available separately |
 
-- Python 3.11+
-- `jq` (for hook scripts)
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (or any supported assistant CLI)
-- `tmux` (required on macOS for TCC mic access; recommended everywhere)
+## Quick Start
 
-### Install and run
-
-```bash
-# Clone
-git clone https://github.com/jonathanhawkins/voxherd-bridge.git
-cd voxherd-bridge
-
-# One-command setup (creates venv, installs deps, deploys hooks, starts bridge)
-bash scripts/dev-setup.sh
-
-# Or manually:
-cd bridge && python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-python -m bridge run --tts
-```
-
-The bridge starts on `http://localhost:7777` with a live color-coded event log in the terminal.
-
-### Install hooks
-
-```bash
-bash hooks/install.sh
-```
-
-This copies hook scripts to `~/.voxherd/hooks/` and registers them in `~/.claude/settings.json`. Every Claude Code session will then report lifecycle events (start, stop, notifications) to the bridge.
-
-### Validate without a mobile app
-
-```bash
-# Watch bridge events via WebSocket
-wscat -c ws://localhost:7777/ws/ios
-
-# Register a fake session
-curl -X POST http://localhost:7777/api/sessions/register \
-  -H "Content-Type: application/json" \
-  -d '{"session_id":"test-123","project":"myproject","project_dir":"/tmp/myproject"}'
-
-# Simulate a stop event
-curl -X POST http://localhost:7777/api/events \
-  -H "Content-Type: application/json" \
-  -d '{"event":"stop","session_id":"test-123","project":"myproject","summary":"Built the thing","stop_reason":"end_turn"}'
-
-# Check sessions
-curl http://localhost:7777/api/sessions
-
-# Run the automated test suite
-bash scripts/test-flow.sh
-```
-
-## Bridge server API
-
-| Method | Endpoint | Purpose |
-|--------|----------|---------|
-| POST | `/api/sessions/register` | Hook registers new Claude Code instance |
-| GET | `/api/sessions` | List all sessions with status |
-| POST | `/api/events` | Hook events (stop, notification, subagent) |
-| POST | `/api/command` | Dispatch a command to a session (REST) |
-| POST | `/api/intent/parse` | Parse voice transcription to structured intent |
-| WS | `/ws/ios` | Persistent client connection (events + commands) |
-
-See [`docs/api.md`](docs/api.md) for the complete API reference including WebSocket message types.
-
-## How hooks work
-
-Claude Code supports lifecycle hooks that run shell scripts at key moments:
-
-- **on-session-start.sh** -- Registers the session with the bridge on startup
-- **on-stop.sh** -- Generates a 1-2 sentence summary (via Claude Haiku) and reports completion
-- **on-notification.sh** -- Forwards permission requests to connected clients
-- **on-subagent-start.sh / on-subagent-stop.sh** -- Tracks sub-agent lifecycle
-
-All hooks read JSON from stdin, extract fields with `jq`, and POST to the bridge. They are designed to fail silently if the bridge is down -- a hook must never block Claude Code.
-
-## Session lifecycle
-
-```
-SessionStart hook fires
-    -> Bridge registers session (status: idle)
-    -> Client gets state_sync
-
-Voice command arrives (WebSocket or REST)
-    -> Bridge dispatches: claude --resume SESSION_ID -p "message"
-    -> Session status: active
-
-Claude Code finishes
-    -> Stop hook fires
-    -> Haiku generates summary
-    -> Bridge updates status: idle
-    -> Client gets agent_event with summary
-    -> TTS announces completion
-```
-
-## Linux deployment
-
-Build a self-contained tarball and deploy as a systemd service:
-
-```bash
-# Build on dev machine
-bash scripts/build-linux-package.sh
-
-# Deploy on Linux
-scp voxherd-bridge.tar.gz user@host:~/
-ssh user@host 'tar xzf voxherd-bridge.tar.gz && cd voxherd-bridge && bash install.sh'
-```
-
-The installer handles Python venv setup, hook deployment, auth token generation, and systemd service installation. Supports Arch, Ubuntu/Debian, and Fedora.
-
-## Docker
+### 1. Set up the bridge server
 
 ```bash
 cd bridge
-docker build -t voxherd-bridge .
-docker run -p 7777:7777 voxherd-bridge
+python3 -m venv .venv
+source .venv/bin/activate      # Linux/macOS
+# .venv\Scripts\activate       # Windows
+pip install -r requirements.txt
 ```
 
-## Platform support
+### 2. Install hooks
 
-| Platform | TTS | STT | Status |
-|----------|-----|-----|--------|
-| macOS | `say` (built-in) | Custom Swift binary | Full support |
-| Linux | `espeak-ng` | -- | Bridge + hooks |
-| Windows | `SAPI` (COM) | -- | Bridge + hooks (PowerShell) |
-| Docker | -- | -- | Bridge only |
+Hooks are small scripts that run inside your AI assistant's lifecycle (session start, task completion, notifications) and report events to the bridge.
 
-## Multi-assistant support
+```bash
+cd hooks
+HOOK_AGENTS=claude bash install.sh              # macOS/Linux (Claude Code only)
+HOOK_AGENTS=claude,gemini bash install.sh       # macOS/Linux (multiple assistants)
+```
 
-VoxHerd Bridge works with multiple AI coding assistants:
+On Windows:
+```powershell
+powershell -ExecutionPolicy Bypass -File hooks\install-hooks.ps1
+```
 
-- **Claude Code** -- Full support (hooks + resume)
-- **Codex CLI** -- Auto-registered by bridge, command dispatch via tmux
-- **Gemini CLI** -- Hook support (same hook format as Claude)
+Verify hooks are installed:
+```bash
+cat ~/.claude/settings.json | jq '.hooks'
+```
+
+### 3. Start the bridge
+
+```bash
+source bridge/.venv/bin/activate
+python -m bridge run --tts
+```
+
+The bridge starts on port 7777 and prints a live, color-coded event log to the terminal. On macOS, use `python -m bridge start --tts` to auto-create a tmux session (required for microphone access).
+
+| Flag | Purpose |
+|------|---------|
+| `--tts` | Enable text-to-speech (macOS: `say`, Linux: `espeak-ng`, Windows: `pyttsx3`) |
+| `--listen` | Enable speech-to-text (macOS only) |
+| `--wake-word` | Enable wake word detection (macOS only) |
+| `--headless` | No interactive terminal (for systemd/services) |
+| `--port N` | Custom port (default: 7777) |
+
+### 4. Platform-specific setup
+
+See [docs/SETUP.md](docs/SETUP.md) for detailed per-platform instructions including the macOS menu bar app, Linux systemd service, and Windows tray app. Or use the one-command installers:
+
+```bash
+# macOS (dev setup)
+bash scripts/dev-setup.sh
+
+# Linux (full install with systemd service)
+bash scripts/install-linux.sh
+
+# Windows
+powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
+```
+
+## How It Works
+
+1. AI assistant hooks fire on session lifecycle events (start, stop/after-turn, notification)
+2. Hook scripts POST events to the bridge server at `localhost:7777`
+3. Bridge forwards events to connected clients over WebSocket
+4. Connected app (iOS, macOS menu bar, Windows tray, Linux panel) announces results via TTS
+5. Voice commands are parsed, routed to the right project, and dispatched to the configured assistant via `--resume`
+
+The bridge is the central hub. Desktop apps manage the bridge process, show session status, and provide QR codes for mobile pairing. AI assistant CLIs keep their own project context -- VoxHerd just routes voice commands to the right session and announces results.
 
 ## Testing
 
 ```bash
-# Python tests
-cd bridge && source .venv/bin/activate
-pytest
+# Run bridge tests
+source bridge/.venv/bin/activate
+python -m pytest bridge/tests/ -v
 
-# End-to-end (requires running bridge)
+# End-to-end test (no mobile app needed)
 bash scripts/test-flow.sh
+
+# Manual testing with curl
+curl http://localhost:7777/api/sessions
+wscat -c ws://localhost:7777/ws/ios
 ```
+
+## Bridge Server API
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| POST | `/api/sessions/register` | Register new assistant session |
+| GET | `/api/sessions` | List all sessions with status |
+| DELETE | `/api/sessions/{session_id}` | Remove a session |
+| POST | `/api/events` | Hook events (stop, notification, subagent) |
+| POST | `/api/command` | Dispatch command to a project (REST) |
+| POST | `/api/intent/parse` | Parse voice transcription via Haiku |
+| POST | `/api/tts` | Speak text via platform TTS |
+| GET | `/api/projects` | List known projects |
+| GET | `/api/connection-info` | Pairing info (URL, QR) |
+| WS | `/ws/ios` | Persistent client WebSocket connection |
+
+See [docs/api.md](docs/api.md) for the full reference with request/response schemas.
+
+## Project Layout
+
+```
+bridge/              Python bridge server (FastAPI + CLI, cross-platform)
+  cli.py             CLI entry point: start, stop, status, qr
+  bridge_server.py   FastAPI app: REST + WebSocket + dispatch
+  session_manager.py Session state management
+  mac_tts.py         macOS TTS (say command)
+  linux_tts.py       Linux TTS (espeak-ng)
+  win_tts.py         Windows TTS (pyttsx3)
+hooks/               Assistant lifecycle hooks
+  on-stop.sh         Post-turn summary + bridge notification (bash)
+  on-stop.py         Same, Python version (cross-platform)
+  on-stop.ps1        Same, PowerShell version (Windows)
+  on-session-start.sh  Register session with bridge
+  on-notification.sh   Forward permission requests
+  install.sh         Deploy hooks + patch settings.json
+macos/               macOS menu bar app
+  VoxHerdBridge/     SwiftUI app (Xcode project)
+  build-app.sh       Build + sign the app bundle
+  create-dmg.sh      Package as DMG
+windows/             Windows system tray app
+  voxherd_tray/      Python tray app (pystray + tkinter)
+linux/               Linux desktop integration
+  voxherd_panel/     GTK4 panel app
+  waybar_module.py   Waybar status module
+scripts/             Dev tooling and installers
+  dev-setup.sh       One-command macOS dev setup
+  install-linux.sh   One-command Linux install
+  install-windows.ps1  One-command Windows install
+  test-flow.sh       End-to-end test script
+docs/                Documentation
+  SETUP.md           Detailed platform setup guide
+  api.md             Full API reference
+  prd.md             Product requirements
+  voice-ux.md        Voice interaction patterns
+```
+
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, code style guidelines, and how to submit a pull request.
 
 ## License
 
-MIT -- see [LICENSE](LICENSE).
+MIT
