@@ -1,0 +1,15 @@
+[Unit]
+Description=VoxHerd Bridge Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=__REPO_ROOT__
+ExecStart=__VENV__/bin/python -m bridge run --tts --headless
+Restart=on-failure
+RestartSec=5
+Environment=PATH=__VENV__/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin
+Environment=HOME=__HOME__
+
+[Install]
+WantedBy=default.target

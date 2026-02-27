@@ -1,0 +1,21 @@
+# Python
+bridge/.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# pytest
+.pytest_cache/
+
+# OS
+.DS_Store
+
+# Logs
+*.log
+
+# Build artifacts
+voxherd-bridge.tar.gz
+
+# Environment / secrets
+.env
+.env.local

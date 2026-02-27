@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "voxherd-bridge"
+version = "1.0.0"
+description = "Voice-first multi-instance Claude Code controller - bridge server"
+readme = "../README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.109,<1.0",
+    "uvicorn[standard]>=0.27,<1.0",
+    "websockets>=12.0,<13.0",
+    "rich>=13.7,<14.0",
+    "httpx>=0.27,<1.0",
+    "zeroconf>=0.131,<1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+voxherd = "bridge.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["bridge*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

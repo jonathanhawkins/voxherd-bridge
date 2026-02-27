@@ -1,0 +1,38 @@
+# Python virtual environment
+.venv/
+
+# Python compiled files and caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Test directories and caches
+tests/
+.pytest_cache/
+.pytest/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Docker files (avoid recursion)
+Dockerfile
+.dockerignore
+
+# Development files
+.env
+.env.local
