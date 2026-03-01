@@ -91,6 +91,10 @@ async def receive_event(request: Request, event: dict) -> dict:
         if val is not None and not isinstance(val, str):
             return {"error": f"field '{field}' must be a string"}
 
+    # Boolean fields
+    if event.get("skip_tts") is not None and not isinstance(event.get("skip_tts"), bool):
+        return {"error": "field 'skip_tts' must be a boolean"}
+
     session_id = event.get("session_id", "")
     event_type = event.get("event", "")
     project = event.get("project", "unknown")
@@ -131,6 +135,7 @@ async def receive_event(request: Request, event: dict) -> dict:
     if event_type == "stop":
         summary = _sanitize_summary(event.get("summary", ""))
         stop_reason = event.get("stop_reason", "end_turn")
+        skip_tts = event.get("skip_tts", False)
         session = sessions.get_session(session_id)
         # Map stop reason to activity type
         if stop_reason == "error":
@@ -159,8 +164,11 @@ async def receive_event(request: Request, event: dict) -> dict:
             session._pending_dispatch_count -= 1
             should_listen = False
 
-        # Delegate TTS to narration engine (handles batching/cooldowns)
-        if _state.narration:
+        # Skip TTS if the project has its own Stop hook (avoids double speech)
+        if skip_tts:
+            log_event("info", project, "TTS skipped: project has own stop hook")
+        elif _state.narration:
+            # Delegate TTS to narration engine (handles batching/cooldowns)
             await _state.narration.on_stop(
                 project=project, session_id=session_id, summary=summary,
                 stop_reason=stop_reason,
@@ -428,7 +436,7 @@ async def list_projects() -> dict:
     result = [dict(p, source="configured") for p in configured]
 
     # Auto-discover from tmux sessions
-    for ts in tmux_manager.list_sessions():
+    for ts in await tmux_manager.async_list_sessions():
         name = ts["name"]
         if name.lower() in configured_names:
             continue
@@ -446,7 +454,7 @@ async def list_tmux_sessions() -> dict:
     """Unified view of all tmux sessions cross-referenced with registered sessions and projects."""
     from bridge.session_manager import Session
 
-    all_tmux = tmux_manager.list_sessions()
+    all_tmux = await tmux_manager.async_list_sessions()
     configured = _load_projects()
     configured_by_name = {p["name"].lower(): p for p in configured}
     registered = sessions.get_all_sessions()
@@ -468,7 +476,7 @@ async def list_tmux_sessions() -> dict:
             continue
 
         seen_names.add(name.lower())
-        has_live = tmux_manager.session_has_live_process(name)
+        has_live = await tmux_manager.async_session_has_live_process(name)
         reg_sessions = registered_by_tmux.get(name, [])
         cfg = configured_by_name.get(name.lower())
 

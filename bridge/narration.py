@@ -100,17 +100,16 @@ class NarrationEngine:
 
         # Errors emit immediately, bypass cooldown
         if stop_reason == "error":
-            if self.verbosity.value != "quiet" or True:  # errors always narrate
-                tts_text = f"{self._tts_prefix(project, session_id, agent_number)} errored. {summary}"
-                await self._emit(NarrationEvent(
-                    event_type="errored",
-                    project=project,
-                    session_id=session_id,
-                    summary=summary,
-                    tts_text=tts_text,
-                    agent_number=agent_number,
-                    listen_after=listen_after,
-                ))
+            tts_text = f"{self._tts_prefix(project, session_id, agent_number)} hit an error. {summary}"
+            await self._emit(NarrationEvent(
+                event_type="errored",
+                project=project,
+                session_id=session_id,
+                summary=summary,
+                tts_text=tts_text,
+                agent_number=agent_number,
+                listen_after=listen_after,
+            ))
             return
 
         # Skip completions in QUIET mode
@@ -144,7 +143,7 @@ class NarrationEngine:
         agent_number: int = 1,
     ) -> None:
         """Handle a notification (approval request). Always emits immediately."""
-        tts_text = f"{self._tts_prefix(project, session_id, agent_number)} is waiting. {message}"
+        tts_text = f"{self._tts_prefix(project, session_id, agent_number)} needs approval. {message}"
         listen_after = self.stt is not None and getattr(self.stt, 'enabled', False) and self.listen_after_enabled
         await self._emit(NarrationEvent(
             event_type="approval",
@@ -212,11 +211,27 @@ class NarrationEngine:
         return self._project_state[project]
 
     def _tts_prefix(self, project: str, session_id: str, agent_number: int) -> str:
-        """Return TTS prefix like 'voxherd agent 2' if multiple agents, else just project."""
+        """Return TTS prefix like 'agent 2 on voxherd' if multiple agents, else just project."""
         same_project = self.sessions.get_sessions_by_project(project)
         if len(same_project) > 1:
-            return f"{project} agent {agent_number}"
+            return f"agent {agent_number} on {project}"
         return project
+
+    @staticmethod
+    def _starts_with_past_verb(text: str) -> bool:
+        """Check if text starts with a past-tense verb (self-describing summary)."""
+        past_verbs = [
+            "Fixed", "Updated", "Added", "Removed", "Refactored", "Implemented",
+            "Configured", "Deployed", "Created", "Resolved", "Applied", "Installed",
+            "Built", "Changed", "Moved", "Renamed", "Merged", "Set", "Enabled",
+            "Disabled", "Cleaned", "Optimized", "Simplified", "Replaced",
+            "Wrote", "Deleted", "Restored", "Upgraded", "Downgraded", "Converted",
+            "Migrated", "Reverted", "Wrapped", "Extracted", "Formatted", "Debugged",
+            "Tested", "Verified", "Confirmed", "Connected", "Started", "Stopped",
+            "Initialized", "Published", "Documented", "Pushed", "Committed",
+            "Patched", "Rewrote", "Restructured",
+        ]
+        return any(text.startswith(v) for v in past_verbs)
 
     async def _flush_batch(self) -> None:
         """Flush all pending completions as individual or batched narrations."""
@@ -253,7 +268,12 @@ class NarrationEngine:
             if len(completions) == 1:
                 c = completions[0]
                 prefix = self._tts_prefix(c.project, c.session_id, c.agent_number)
-                tts_text = f"{prefix} finished. {c.summary}"
+                # If summary starts with a past-tense verb, it's self-describing
+                # — just speak it directly (no "finished" needed).
+                if self._starts_with_past_verb(c.summary):
+                    tts_text = c.summary
+                else:
+                    tts_text = f"{prefix}. {c.summary}"
                 await self._emit(NarrationEvent(
                     event_type="completed",
                     project=c.project,
@@ -266,7 +286,7 @@ class NarrationEngine:
             else:
                 # Multiple completions from same project
                 last = completions[-1]
-                tts_text = f"{project}: {len(completions)} tasks done. Last: {last.summary}"
+                tts_text = f"{len(completions)} tasks done on {project}. {last.summary}"
                 await self._emit(NarrationEvent(
                     event_type="batch_completed",
                     project=project,

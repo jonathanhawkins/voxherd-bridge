@@ -81,12 +81,17 @@ def set_log_handler(handler: Callable[[str, str, str], None]) -> None:
 # TTS — enabled via CLI ``--tts`` flag.
 # Variable keeps the name ``mac_tts`` to avoid cascading renames across
 # routes.py, ws_handler.py, cli.py, etc.
+# OpenAI TTS can override platform TTS when ``--openai-tts`` is passed
+# (set up in cli.py after arg parsing).
 if sys.platform == "darwin":
     mac_tts = MacTTS()
 elif sys.platform == "win32":
     mac_tts = WinTTS()  # type: ignore[assignment]
 else:
     mac_tts = LinuxTTS()  # type: ignore[assignment]
+
+# Flag set by cli.py when --openai-tts is active
+openai_tts_enabled = False
 
 # STT — enabled via CLI ``--listen`` flag (macOS only).
 mac_stt = MacSTT()
@@ -211,6 +216,10 @@ async def broadcast_to_ios(message: dict) -> None:
                 log_event("error", "bridge", f"Broadcast failed (message error): {exc}")
                 break
         for ws in dead:
+            try:
+                await ws.close()
+            except Exception:
+                pass
             try:
                 ios_connections.remove(ws)
             except ValueError:

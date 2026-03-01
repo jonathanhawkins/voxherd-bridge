@@ -269,6 +269,17 @@ async def _terminal_poll_loop(session_id: str, ws: WebSocket) -> None:
                 env=get_subprocess_env(),
             )
             stdout, _ = await proc.communicate()
+            if proc.returncode != 0:
+                # tmux pane is gone — notify subscriber and stop polling
+                try:
+                    await send_signed(ws, {
+                        "type": "terminal_error",
+                        "session_id": session_id,
+                        "message": "Terminal session ended",
+                    })
+                except Exception:
+                    pass
+                break
             raw = stdout.decode("utf-8", errors="replace")
             lines = raw.splitlines()
 
@@ -934,14 +945,14 @@ async def _dispatch_agent(session_id: str, project_dir: str, message: str) -> No
                 stderr=asyncio.subprocess.DEVNULL,
                 env=get_subprocess_env(),
             )
-            await p1.wait()
+            await asyncio.wait_for(p1.wait(), timeout=5.0)
             p2 = await asyncio.create_subprocess_exec(
                 "tmux", "send-keys", "-t", tmux_target, "Enter",
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
                 env=get_subprocess_env(),
             )
-            await p2.wait()
+            await asyncio.wait_for(p2.wait(), timeout=5.0)
             log_event("info", "bridge", f"Sent to tmux pane {tmux_target}")
         except Exception as exc:
             log_event("error", "bridge", f"Failed to send to tmux: {exc}")

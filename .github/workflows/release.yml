@@ -1,0 +1,445 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # macOS: PyInstaller bridge binary -> SwiftUI menu bar app -> DMG
+  # ---------------------------------------------------------------------------
+  build-macos:
+    runs-on: macos-14  # Apple Silicon runner
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r bridge/requirements.txt
+          pip install pyinstaller
+
+      - name: Build bridge binary with PyInstaller
+        run: |
+          # The spec references bridge/stt/voxherd-listen which won't exist in CI.
+          # Create a dummy so PyInstaller doesn't fail on the datas entry.
+          mkdir -p bridge/stt
+          touch bridge/stt/voxherd-listen
+          chmod +x bridge/stt/voxherd-listen
+
+          pyinstaller \
+            --distpath macos/dist \
+            --workpath macos/build \
+            --noconfirm \
+            macos/voxherd-bridge.spec
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Build SwiftUI menu bar app
+        run: |
+          cd macos/VoxHerdBridge
+          xcodegen generate
+          cd ..
+
+          xcodebuild \
+            -project VoxHerdBridge/VoxHerdBridge.xcodeproj \
+            -scheme VoxHerdBridge \
+            -configuration Release \
+            -derivedDataPath /tmp/vh-macos-build \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            -quiet
+
+      - name: Assemble app bundle
+        run: |
+          APP_SRC="/tmp/vh-macos-build/Build/Products/Release/VoxHerdBridge.app"
+          APP_OUT="macos/dist/VoxHerdBridge.app"
+
+          rm -rf "$APP_OUT"
+          cp -R "$APP_SRC" "$APP_OUT"
+
+          RESOURCES="$APP_OUT/Contents/Resources"
+          mkdir -p "$RESOURCES"
+
+          # Copy PyInstaller bridge binary into Resources
+          cp -R macos/dist/voxherd-bridge "$RESOURCES/voxherd-bridge"
+
+          # Copy hook scripts into Resources
+          cp -R hooks "$RESOURCES/hooks"
+          chmod +x "$RESOURCES/hooks/"*.sh 2>/dev/null || true
+
+      - name: Import Apple signing certificate
+        if: ${{ secrets.APPLE_CERTIFICATE != '' }}
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          # Decode the certificate
+          echo "$APPLE_CERTIFICATE" | base64 --decode > /tmp/certificate.p12
+
+          # Create a temporary keychain
+          KEYCHAIN_PATH="/tmp/build.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import the certificate
+          security import /tmp/certificate.p12 \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+
+          # Allow codesign to access the keychain
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Add to search list
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+      - name: Code sign app bundle
+        if: ${{ secrets.APPLE_CERTIFICATE != '' }}
+        env:
+          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY || 'Developer ID Application' }}
+        run: |
+          APP="macos/dist/VoxHerdBridge.app"
+          RESOURCES="$APP/Contents/Resources"
+          ENTITLEMENTS="macos/VoxHerdBridge/VoxHerdBridge.entitlements"
+
+          # Sign dylibs and shared objects
+          find "$RESOURCES/voxherd-bridge" -type f \( -name "*.dylib" -o -name "*.so" \) | while read -r lib; do
+            codesign --force --timestamp --options runtime \
+              --sign "$SIGN_IDENTITY" --entitlements "$ENTITLEMENTS" "$lib" 2>/dev/null || true
+          done
+
+          # Sign frameworks
+          find "$RESOURCES/voxherd-bridge" -type d -name "*.framework" | while read -r fw; do
+            codesign --force --timestamp --options runtime \
+              --sign "$SIGN_IDENTITY" --entitlements "$ENTITLEMENTS" "$fw" 2>/dev/null || true
+          done
+
+          # Sign executables
+          find "$RESOURCES/voxherd-bridge" -type f -perm +111 ! -name "*.dylib" ! -name "*.so" | while read -r bin; do
+            codesign --force --timestamp --options runtime \
+              --sign "$SIGN_IDENTITY" --entitlements "$ENTITLEMENTS" "$bin" 2>/dev/null || true
+          done
+
+          # Sign main bridge binary
+          codesign --force --timestamp --options runtime \
+            --sign "$SIGN_IDENTITY" --entitlements "$ENTITLEMENTS" \
+            "$RESOURCES/voxherd-bridge/voxherd-bridge"
+
+          # Sign outer app
+          codesign --force --timestamp --options runtime \
+            --sign "$SIGN_IDENTITY" --entitlements "$ENTITLEMENTS" "$APP"
+
+      - name: Ad-hoc sign (unsigned build)
+        if: ${{ secrets.APPLE_CERTIFICATE == '' }}
+        run: |
+          codesign --force --deep --sign - macos/dist/VoxHerdBridge.app
+
+      - name: Create DMG
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          APP="macos/dist/VoxHerdBridge.app"
+          DMG="macos/dist/VoxHerdBridge-${VERSION}.dmg"
+
+          # Use hdiutil (always available on macOS runners)
+          STAGING=$(mktemp -d)
+          cp -R "$APP" "$STAGING/"
+          ln -s /Applications "$STAGING/Applications"
+
+          hdiutil create \
+            -volname "VoxHerd Bridge $VERSION" \
+            -srcfolder "$STAGING" \
+            -ov \
+            -format UDZO \
+            -imagekey zlib-level=9 \
+            "$DMG"
+
+          rm -rf "$STAGING"
+          echo "DMG_PATH=$DMG" >> "$GITHUB_ENV"
+
+      - name: Notarize DMG
+        if: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' }}
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          DMG="macos/dist/VoxHerdBridge-${VERSION}.dmg"
+
+          # Store credentials for notarytool
+          xcrun notarytool store-credentials "CI-VoxHerd" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD"
+
+          # Submit and wait
+          xcrun notarytool submit "$DMG" \
+            --keychain-profile "CI-VoxHerd" \
+            --wait
+
+          # Staple the ticket
+          xcrun stapler staple "$DMG"
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: macos/dist/VoxHerdBridge-*.dmg
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Linux: Package bridge + hooks + systemd service into tarball
+  # ---------------------------------------------------------------------------
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build tarball
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          MAC_ONLY_FILES="mac_tts.py mac_stt.py mac_voice_loop.py"
+
+          STAGING=$(mktemp -d)
+          PKG="$STAGING/voxherd-bridge"
+          mkdir -p "$PKG/bridge" "$PKG/hooks"
+
+          # Copy bridge Python files (excluding mac-only)
+          for f in bridge/*.py; do
+            basename="$(basename "$f")"
+            skip=false
+            for mac_file in $MAC_ONLY_FILES; do
+              if [ "$basename" = "$mac_file" ]; then
+                skip=true
+                break
+              fi
+            done
+            if [ "$skip" = false ]; then
+              cp "$f" "$PKG/bridge/"
+            fi
+          done
+
+          # Copy requirements (strip test deps)
+          grep -v -E '^(pytest|#.*[Tt]est)' bridge/requirements.txt \
+            | sed '/^$/N;/^\n$/d' > "$PKG/bridge/requirements.txt"
+          cp bridge/pyproject.toml "$PKG/bridge/" 2>/dev/null || true
+
+          # Copy hook scripts
+          for f in hooks/*; do
+            [ -f "$f" ] && cp "$f" "$PKG/hooks/"
+          done
+
+          # Copy systemd service
+          cp scripts/voxherd-bridge.service "$PKG/"
+
+          # Copy installer
+          cp scripts/install-linux.sh "$PKG/install.sh"
+          chmod +x "$PKG/install.sh"
+
+          # Copy Linux GUI files if present
+          if [ -d "linux" ]; then
+            cp -R linux "$PKG/linux"
+            chmod +x "$PKG/linux/install-gui.sh" 2>/dev/null || true
+          fi
+
+          # Build tarball
+          OUTPUT="voxherd-bridge-${VERSION}-linux.tar.gz"
+          (cd "$STAGING" && tar czf "$GITHUB_WORKSPACE/$OUTPUT" voxherd-bridge/)
+          rm -rf "$STAGING"
+
+          echo "TARBALL_PATH=$OUTPUT" >> "$GITHUB_ENV"
+          echo "Built: $OUTPUT ($(du -h "$OUTPUT" | cut -f1))"
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-tarball
+          path: voxherd-bridge-*-linux.tar.gz
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Windows: PyInstaller bundle -> zip
+  # ---------------------------------------------------------------------------
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r bridge\requirements.txt
+          pip install -r windows\requirements-windows.txt
+
+      - name: Create PyInstaller spec
+        shell: python
+        run: |
+          spec = """\
+          # -*- mode: python ; coding: utf-8 -*-
+          import os, sys
+
+          repo_root = os.path.dirname(SPECPATH)
+
+          a = Analysis(
+              [os.path.join(repo_root, 'windows', 'voxherd_tray', '__main__.py')],
+              pathex=[repo_root],
+              datas=[
+                  (os.path.join(repo_root, 'bridge'), 'bridge'),
+                  (os.path.join(repo_root, 'hooks'), 'hooks'),
+              ],
+              hiddenimports=[
+                  'bridge', 'bridge.cli', 'bridge.bridge_server', 'bridge.server_state',
+                  'bridge.session_manager', 'bridge.env_utils', 'bridge.tailscale',
+                  'bridge.auth', 'bridge.win_tts', 'bridge.narration',
+                  'pystray', 'pystray._win32', 'PIL', 'qrcode', 'pyttsx3',
+                  'uvicorn', 'fastapi', 'starlette',
+              ],
+              noarchive=False,
+          )
+          pyz = PYZ(a.pure)
+          exe = EXE(
+              pyz, a.scripts, [],
+              exclude_binaries=True,
+              name='VoxHerdBridge',
+              debug=False,
+              strip=False,
+              upx=True,
+              console=False,
+              icon=None,
+          )
+          coll = COLLECT(
+              exe, a.binaries, a.datas,
+              strip=False,
+              upx=True,
+              name='VoxHerdBridge',
+          )
+          """
+          import textwrap
+          with open("VoxHerdBridge.spec", "w") as f:
+              f.write(textwrap.dedent(spec))
+
+      - name: Build with PyInstaller
+        run: pyinstaller --distpath dist --workpath build --clean --noconfirm "VoxHerdBridge.spec"
+
+      - name: Package as zip
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          cd dist
+          7z a -tzip "../VoxHerdBridge-${VERSION}-windows.zip" VoxHerdBridge/
+          cd ..
+          echo "ZIP_PATH=VoxHerdBridge-${VERSION}-windows.zip" >> "$GITHUB_ENV"
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-zip
+          path: VoxHerdBridge-*-windows.zip
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Create GitHub Release and upload all artifacts
+  # ---------------------------------------------------------------------------
+  release:
+    needs: [build-macos, build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: find artifacts -type f | sort
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          find . -type f \( -name "*.dmg" -o -name "*.tar.gz" -o -name "*.zip" \) \
+            -exec sh -c 'sha256sum "$1" >> ../checksums.txt' _ {} \;
+          cd ..
+          cat checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: VoxHerd Bridge v${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: |
+            artifacts/macos-dmg/*.dmg
+            artifacts/linux-tarball/*.tar.gz
+            artifacts/windows-zip/*.zip
+            checksums.txt
+          body: |
+            ## VoxHerd Bridge v${{ steps.version.outputs.version }}
+
+            ### Downloads
+
+            | Platform | File | Notes |
+            |----------|------|-------|
+            | **macOS** (Apple Silicon) | `VoxHerdBridge-${{ steps.version.outputs.version }}.dmg` | Menu bar app with embedded bridge server |
+            | **Linux** | `voxherd-bridge-${{ steps.version.outputs.version }}-linux.tar.gz` | Tarball with systemd service and installer |
+            | **Windows** | `VoxHerdBridge-${{ steps.version.outputs.version }}-windows.zip` | System tray app with embedded bridge server |
+
+            ### Installation
+
+            **macOS:** Open the DMG and drag VoxHerd Bridge to Applications.
+
+            **Linux:**
+            ```bash
+            tar xzf voxherd-bridge-${{ steps.version.outputs.version }}-linux.tar.gz
+            cd voxherd-bridge
+            bash install.sh
+            ```
+
+            **Windows:** Extract the zip and run `VoxHerdBridge.exe`.
+
+            ### Checksums
+            See `checksums.txt` attached to this release.

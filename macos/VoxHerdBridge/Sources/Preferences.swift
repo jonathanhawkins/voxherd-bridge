@@ -33,7 +33,12 @@ final class Preferences {
         self.enableTTS = defaults.object(forKey: "enableTTS") as? Bool ?? true
         self.enableSTT = defaults.object(forKey: "enableSTT") as? Bool ?? false
         self.enableWakeWord = defaults.object(forKey: "enableWakeWord") as? Bool ?? false
-        self.launchAtLogin = defaults.object(forKey: "launchAtLogin") as? Bool ?? false
+        self.launchAtLogin = defaults.object(forKey: "launchAtLogin") as? Bool ?? true
+
+        // Register login item on first launch (didSet doesn't fire from init)
+        if self.launchAtLogin {
+            updateLoginItem()
+        }
     }
 
     private func updateLoginItem() {

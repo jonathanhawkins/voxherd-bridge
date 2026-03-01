@@ -80,6 +80,41 @@ def list_sessions() -> list[dict]:
         return []
 
 
+async def async_list_sessions() -> list[dict]:
+    """Async version of list_sessions() using asyncio subprocess.
+
+    Preferred in async contexts (activity poll loop, route handlers)
+    because synchronous subprocess.run() can fail when the bridge
+    runs inside a macOS app bundle (different process context).
+    """
+    import asyncio
+    try:
+        fmt = "#{session_name}\t#{session_windows}\t#{session_created}\t#{session_attached}\t#{session_activity}"
+        proc = await asyncio.create_subprocess_exec(
+            "tmux", "list-sessions", "-F", fmt,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=get_subprocess_env(),
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode != 0:
+            return []
+        sessions = []
+        for line in stdout.decode().strip().splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 5:
+                sessions.append({
+                    "name": parts[0],
+                    "windows": int(parts[1]),
+                    "created": int(parts[2]),
+                    "attached": parts[3] == "1",
+                    "activity": int(parts[4]),
+                })
+        return sessions
+    except Exception:
+        return []
+
+
 def list_voxherd_sessions() -> list[dict]:
     """List only VoxHerd tmux sessions (prefixed with 'vh-')."""
     return [s for s in list_sessions() if s["name"].startswith(VC_PREFIX)]
@@ -111,6 +146,28 @@ def session_has_live_process(name: str) -> bool:
         # If the pane is running a shell, the process it was hosting has exited
         return cmd not in ("zsh", "bash", "sh", "fish", "")
     except (subprocess.TimeoutExpired, FileNotFoundError, IndexError):
+        return False
+
+
+async def async_session_has_live_process(name: str) -> bool:
+    """Async version of session_has_live_process().
+
+    Uses asyncio subprocess to avoid blocking the event loop.
+    """
+    import asyncio
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "tmux", "list-panes", "-t", name, "-F", "#{pane_current_command}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=get_subprocess_env(),
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode != 0:
+            return False
+        cmd = stdout.decode().strip().splitlines()[0].lower() if stdout.decode().strip() else ""
+        return cmd not in ("zsh", "bash", "sh", "fish", "")
+    except Exception:
         return False
 
 

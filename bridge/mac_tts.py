@@ -76,7 +76,7 @@ class SpeechItem:
 class MacTTS:
     """Async wrapper around macOS ``say`` command with queuing."""
 
-    def __init__(self, voice: str = "auto", rate: int = 220) -> None:
+    def __init__(self, voice: str = "auto", rate: int = 190) -> None:
         if voice == "auto":
             voice = detect_best_voice()
             log.info("Auto-detected TTS voice: %s", voice)
@@ -131,13 +131,27 @@ class MacTTS:
                     pass
             self._queue.put_nowait(item)
 
+    @staticmethod
+    def _insert_pause(text: str) -> str:
+        """Insert a 300ms pause after the first sentence in TTS text.
+
+        Uses macOS ``say``'s ``[[slnc 300]]`` tag for natural pacing
+        between a project-name prefix and the summary body.
+        """
+        # Find the first period followed by a space (sentence boundary)
+        idx = text.find(". ")
+        if idx > 0 and idx < len(text) - 2:
+            return text[:idx + 1] + " [[slnc 300]] " + text[idx + 2:]
+        return text
+
     async def _worker(self) -> None:
         """Drain the queue sequentially so utterances don't overlap."""
         while True:
             item = await self._queue.get()
             try:
+                tts_text = self._insert_pause(item.text)
                 proc = await asyncio.create_subprocess_exec(
-                    "say", "-v", self.voice, "-r", str(self.rate), item.text,
+                    "say", "-v", self.voice, "-r", str(self.rate), tts_text,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                     env=get_subprocess_env(),

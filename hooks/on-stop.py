@@ -645,28 +645,13 @@ def try_fast_summary(path: str) -> str:
         if any(first_sentence.startswith(v) for v in past_verbs) and len(first_sentence) < 120:
             return first_sentence + ("." if not first_sentence.endswith(".") else "")
 
-        # Accept sentences that start with a capital letter, are short, contain
-        # no markdown, and don't start with known-bad preambles.  This catches
-        # natural summaries like "All 4 tests passing now."
-        _bad_preambles = [
-            "i ", "i'", "based on", "sure", "okay", "certainly", "of course",
-            "happy to", "great ", "yes", "no,", "note:", "summary:",
-            "here's", "here is", "let me",
-        ]
-        if (first_sentence and first_sentence[0].isupper()
-                and len(first_sentence) < 120
-                and "*" not in first_sentence and "`" not in first_sentence
-                and "#" not in first_sentence
-                and not any(first_sentence.lower().startswith(p) for p in _bad_preambles)):
-            return first_sentence + ("." if not first_sentence.endswith(".") else "")
+        # Skip the general capital-letter check — it's too aggressive and
+        # grabs conversational sentences like "Bridge is running." or
+        # "OK so the default is Samantha." as summaries.  Only the
+        # past-tense verb check above is reliable for fast-path.
 
-    if len(files) == 1:
-        n = edit_count if edit_count else 1
-        return f"Updated {files[0]} with {n} change{'s' if n != 1 else ''}."
-
-    if files:
-        return f"Updated {', '.join(files[:3])}."
-
+    # Don't return file-count summaries like "Updated foo.py with 1 change" —
+    # they're useless. Let Haiku generate a real contextual summary instead.
     return ""
 
 
@@ -915,7 +900,7 @@ if not summary:
         try:
             log("  Calling Haiku for summary...")
             proc = subprocess.run(
-                ["claude", "-p", prompt, "--model", "claude-haiku-4-5-20251001", "--max-tokens", "100"],
+                ["claude", "-p", prompt, "--model", "claude-haiku-4-5-20251001"],
                 capture_output=True,
                 text=True,
                 timeout=HAIKU_TIMEOUT,
@@ -943,21 +928,53 @@ if not summary:
         log("  No context extracted from transcript")
 
 if not summary:
-    # Build a fallback from extracted context
+    # Try extracting a decent fallback from the last assistant text
     if context:
-        # Find files changed line
         for line in context.split("\n"):
-            if line.startswith("Files changed:"):
-                summary = f"Updated {line[len('Files changed: '):]}"
-                break
+            # Look for "Agent's final statement:" section — it has the best material
+            if line.startswith("Agent's final statement: ") or line.startswith("Claude's work summary: "):
+                prefix_len = line.index(": ") + 2
+                text = line[prefix_len:].strip()
+                # Grab the first sentence that looks like a summary
+                for sentence in re.split(r'(?<=[.!])\s+', text):
+                    sentence = sentence.strip().rstrip(".")
+                    if (sentence and sentence[0].isupper()
+                            and 20 <= len(sentence) <= 100
+                            and not sentence.endswith("?")):
+                        summary = sentence + "."
+                        break
+                if summary:
+                    break
     if not summary:
         summary = "Task completed."
     log(f"  Using fallback summary: {summary}")
 
 
+
 # ---------------------------------------------------------------------------
 # POST to bridge server
 # ---------------------------------------------------------------------------
+
+def _project_has_own_stop_hook(proj_dir: str) -> bool:
+    """Check if the project has its own Stop hook in .claude/settings.json.
+
+    If it does, VoxHerd should skip TTS to avoid double speech — the
+    project's own hook handles announcements.
+    """
+    if not proj_dir:
+        return False
+    settings_path = os.path.join(proj_dir, ".claude", "settings.json")
+    try:
+        with open(settings_path, "r") as f:
+            settings = json.loads(f.read())
+    except (OSError, json.JSONDecodeError):
+        return False
+    hooks = settings.get("hooks", {})
+    stop_hooks = hooks.get("Stop", [])
+    if not isinstance(stop_hooks, list):
+        return False
+    return len(stop_hooks) > 0
+
 
 timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -987,6 +1004,12 @@ elif os.environ.get("TMUX"):
     except Exception:
         pass
 
+# Detect if the project has its own Stop hook — if so, skip bridge TTS
+# to avoid double speech (project hook handles its own announcements).
+skip_tts = _project_has_own_stop_hook(project_dir)
+if skip_tts:
+    log(f"  Project has own Stop hook — will set skip_tts=true")
+
 payload = json.dumps({
     "event": "stop",
     "session_id": session_id,
@@ -998,6 +1021,7 @@ payload = json.dumps({
     "transcript_path": transcript_path,
     "timestamp": timestamp,
     "tmux_target": tmux_target,
+    "skip_tts": skip_tts,
 })
 
 # Read auth token from file -- use temp config to keep it out of process list

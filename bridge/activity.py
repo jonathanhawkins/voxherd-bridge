@@ -345,6 +345,7 @@ async def _tmux_pane_path(session_name: str) -> str:
 async def _activity_poll_loop() -> None:
     """Poll tmux for all active sessions every ~1.5s and broadcast snippet changes."""
     sub_agent_poll_counter = 0  # scan task files every 3rd iteration (~4.5s)
+    discovery_poll_counter = 0  # rediscover tmux sessions every 20th iteration (~30s)
     try:
         while True:
             await asyncio.sleep(1.5)
@@ -519,6 +520,22 @@ async def _activity_poll_loop() -> None:
                 except Exception:
                     pass
 
+            # Periodically rediscover tmux sessions (~every 30s).
+            # Catches sessions that started after the bridge, or that were missed
+            # at startup (e.g. sync subprocess failed in macOS app bundle context).
+            discovery_poll_counter += 1
+            if discovery_poll_counter >= 20:
+                discovery_poll_counter = 0
+                try:
+                    newly_found = await _discover_tmux_sessions()
+                    if newly_found:
+                        log_event("success", "bridge", f"Periodic discovery: found {newly_found} new session(s)")
+                        await broadcast_to_ios(_state_sync_msg())
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+
             # Scan task files for sub-agent counts every ~4.5s (every 3rd iteration).
             # This supplements the hook-based tracking (SubagentStart/SubagentStop)
             # which provides real-time data. Task-file scanning catches agents that
@@ -636,7 +653,7 @@ async def _discover_tmux_sessions() -> int:
     Returns the number of newly discovered sessions.
     """
     discovered = 0
-    all_tmux = tmux_manager.list_sessions()
+    all_tmux = await tmux_manager.async_list_sessions()
 
     # Build set of tmux session names already registered
     registered_targets: set[str] = set()

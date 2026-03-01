@@ -199,7 +199,14 @@ def print_banner(
     use_tls: bool = False,
 ) -> None:
     """Display a startup banner with listen address."""
-    tts_line = f"TTS [green]ON[/green] (voice: {voice})" if tts else "TTS [dim]off[/dim] (use --tts to enable)"
+    if tts:
+        from bridge.server_state import openai_tts_enabled
+        if openai_tts_enabled:
+            tts_line = "TTS [green]ON[/green] (OpenAI gpt-4o-mini-tts, Nova)"
+        else:
+            tts_line = f"TTS [green]ON[/green] (voice: {voice})"
+    else:
+        tts_line = "TTS [dim]off[/dim] (use --tts to enable)"
     if listen:
         listen_line = f"STT [green]ON[/green] (timeout: {listen_timeout}s)"
     else:
@@ -244,7 +251,7 @@ def _add_bridge_args(parser: argparse.ArgumentParser) -> None:
     _is_mac = sys.platform == "darwin"
     _is_win = sys.platform == "win32"
     _default_voice = "auto" if (_is_mac or _is_win) else "en"
-    _default_rate = 220 if _is_mac else (200 if _is_win else 175)
+    _default_rate = 190 if _is_mac else (200 if _is_win else 175)
 
     parser.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0; auth token required for security)")
     parser.add_argument("--port", type=int, default=7777, help="Bind port (default: 7777)")
@@ -256,6 +263,7 @@ def _add_bridge_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--listen-timeout", type=int, default=8, help="STT silence timeout in seconds (default: 8)")
     parser.add_argument("--wake-word", action="store_true", help="Enable 'Hey Claude' wake word detection (macOS only; always-on mic)")
     parser.add_argument("--headless", action="store_true", help="Disable Rich display; emit JSON lines to stdout instead")
+    parser.add_argument("--openai-tts", action="store_true", help="Use OpenAI TTS (gpt-4o-mini-tts, Nova voice) instead of platform TTS; requires OPENAI_API_KEY")
     parser.add_argument("--tls", action="store_true", help="Enable TLS (self-signed cert; serves wss:// and https://)")
 
 
@@ -273,13 +281,27 @@ def _run_bridge_directly(args: argparse.Namespace) -> None:
     bridge_server.server_port = args.port
     _is_mac = sys.platform == "darwin"
 
-    # Configure TTS (macOS 'say' or Linux 'espeak-ng').
+    # Configure TTS (macOS 'say', Linux 'espeak-ng', or OpenAI).
+    openai_tts_requested = getattr(args, "openai_tts", False)
+    if openai_tts_requested:
+        from bridge.openai_tts import OpenAITTS
+        oai_tts = OpenAITTS()
+        if oai_tts.available:
+            bridge_server.mac_tts = oai_tts  # type: ignore[assignment]
+            bridge_server._state.mac_tts = oai_tts  # type: ignore[assignment]
+            bridge_server._state.openai_tts_enabled = True
+            console.print("[green]Using OpenAI TTS (gpt-4o-mini-tts, Nova voice)[/green]")
+        else:
+            console.print("[yellow]Warning: --openai-tts requested but OPENAI_API_KEY not set or no audio player found. Falling back to platform TTS.[/yellow]")
+
     bridge_server.mac_tts.enabled = args.tts
-    if args.voice != "auto":
-        # Explicit voice override — use as-is.
-        bridge_server.mac_tts.voice = args.voice
-    # else: keep the auto-detected voice from MacTTS.__init__
-    bridge_server.mac_tts.rate = args.rate
+    if not openai_tts_requested or not bridge_server._state.openai_tts_enabled:
+        if args.voice != "auto":
+            # Explicit voice override — use as-is.
+            bridge_server.mac_tts.voice = args.voice
+        # else: keep the auto-detected voice from MacTTS.__init__
+        if hasattr(bridge_server.mac_tts, "rate"):
+            bridge_server.mac_tts.rate = args.rate
 
     # Configure STT (listen-after-speak).
     # Wake word implies --listen and --tts.
@@ -397,7 +419,7 @@ def _cmd_start(args: argparse.Namespace) -> None:
         bridge_args.append("--tts")
     if args.voice != "auto":
         bridge_args.extend(["--voice", args.voice])
-    if args.rate != 220:
+    if args.rate != 190:
         bridge_args.extend(["--rate", str(args.rate)])
     if args.listen:
         bridge_args.append("--listen")
@@ -409,6 +431,8 @@ def _cmd_start(args: argparse.Namespace) -> None:
         bridge_args.append("--wake-word")
     if args.headless:
         bridge_args.append("--headless")
+    if getattr(args, "openai_tts", False):
+        bridge_args.append("--openai-tts")
     if args.tls:
         bridge_args.append("--tls")
 
@@ -434,7 +458,7 @@ def _cmd_restart(args: argparse.Namespace) -> None:
         bridge_args.append("--tts")
     if args.voice != "auto":
         bridge_args.extend(["--voice", args.voice])
-    if args.rate != 220:
+    if args.rate != 190:
         bridge_args.extend(["--rate", str(args.rate)])
     if args.listen:
         bridge_args.append("--listen")
@@ -446,6 +470,8 @@ def _cmd_restart(args: argparse.Namespace) -> None:
         bridge_args.append("--wake-word")
     if args.headless:
         bridge_args.append("--headless")
+    if getattr(args, "openai_tts", False):
+        bridge_args.append("--openai-tts")
     if args.tls:
         bridge_args.append("--tls")
 
