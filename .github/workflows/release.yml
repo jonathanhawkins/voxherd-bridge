@@ -16,7 +16,7 @@ jobs:
   # macOS: PyInstaller bridge binary -> SwiftUI menu bar app -> DMG
   # ---------------------------------------------------------------------------
   build-macos:
-    runs-on: macos-14  # Apple Silicon runner
+    runs-on: macos-15  # Apple Silicon runner
     env:
       HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' }}
       HAS_NOTARIZE: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' }}
@@ -320,7 +320,7 @@ jobs:
           # -*- mode: python ; coding: utf-8 -*-
           import os, sys
 
-          repo_root = os.path.dirname(SPECPATH)
+          repo_root = SPECPATH
 
           a = Analysis(
               [os.path.join(repo_root, 'windows', 'voxherd_tray', '__main__.py')],
