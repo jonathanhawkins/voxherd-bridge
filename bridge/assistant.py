@@ -6,7 +6,7 @@ import os
 import re
 
 SUPPORTED_ASSISTANTS: tuple[str, ...] = ("claude", "codex", "gemini")
-HOOK_CAPABLE_ASSISTANTS: tuple[str, ...] = ("claude", "gemini")
+HOOK_CAPABLE_ASSISTANTS: tuple[str, ...] = ("claude", "codex", "gemini")
 
 
 def normalize_assistant(value: str | None, *, default: str = "claude") -> str:
@@ -65,7 +65,9 @@ def resume_command_for_assistant(
             "--chrome",
         ]
     if provider == "codex":
-        return ["codex", "exec", "resume", session_id, message]
+        # codex exec resume SESSION_ID PROMPT -- resumes a non-interactive session.
+        # --json outputs newline-delimited JSON events (similar to Claude's stream-json).
+        return ["codex", "exec", "resume", session_id, "--json", message]
     # Gemini dispatch should use tmux send-keys for active sessions.
     return None
 

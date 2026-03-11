@@ -109,27 +109,16 @@ echo ""
 
 # ---------- Deploy hooks ----------
 
-HOOK_STATUS="skipped (no Claude/Gemini CLI found)"
-HOOK_AGENTS_TO_INSTALL="${HOOK_AGENTS:-}"
-if [ -z "$HOOK_AGENTS_TO_INSTALL" ]; then
-  AUTO_HOOK_AGENTS=()
-  if command -v claude &>/dev/null; then
-    AUTO_HOOK_AGENTS+=("claude")
-  fi
-  if command -v gemini &>/dev/null; then
-    AUTO_HOOK_AGENTS+=("gemini")
-  fi
-  if [ "${#AUTO_HOOK_AGENTS[@]}" -gt 0 ]; then
-    HOOK_AGENTS_TO_INSTALL="$(IFS=,; echo "${AUTO_HOOK_AGENTS[*]}")"
-  fi
-fi
+HOOK_STATUS="skipped (no assistant CLI found)"
 
-if [ -n "$HOOK_AGENTS_TO_INSTALL" ]; then
-  echo "Deploying hooks for: $HOOK_AGENTS_TO_INSTALL"
-  HOOK_AGENTS="$HOOK_AGENTS_TO_INSTALL" bash "$REPO_ROOT/hooks/install.sh"
-  HOOK_STATUS="deployed for $HOOK_AGENTS_TO_INSTALL"
+# install.sh auto-detects installed CLIs when HOOK_AGENTS is unset,
+# but honour an explicit override if the caller set HOOK_AGENTS.
+echo "Deploying hooks (auto-detecting installed CLIs)..."
+if HOOK_AGENTS="${HOOK_AGENTS:-}" bash "$REPO_ROOT/hooks/install.sh"; then
+  HOOK_STATUS="deployed (auto-detected)"
 else
-  echo "No hook-capable assistant CLI found (Claude/Gemini). Skipping hook install."
+  echo "Warning: hook installation had errors."
+  HOOK_STATUS="errors during install"
 fi
 echo ""
 

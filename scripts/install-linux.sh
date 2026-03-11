@@ -137,22 +137,11 @@ check_prereq curl curl curl curl
 check_prereq tmux tmux tmux tmux
 check_prereq espeak-ng espeak-ng espeak-ng espeak-ng
 
-# Assistant CLIs (optional; only Claude/Gemini currently support lifecycle hooks)
-HOOK_AGENTS_TO_INSTALL="${HOOK_AGENTS:-}"
-AUTO_HOOK_AGENTS=()
-
+# Assistant CLIs (optional — hooks are installed for whichever CLIs are present)
 if command -v claude &>/dev/null; then
   success "claude CLI found: $(command -v claude)"
-  AUTO_HOOK_AGENTS+=("claude")
 else
   warn "claude CLI not found. Install from https://docs.anthropic.com/en/docs/claude-code"
-fi
-
-if command -v gemini &>/dev/null; then
-  success "gemini CLI found: $(command -v gemini)"
-  AUTO_HOOK_AGENTS+=("gemini")
-else
-  warn "gemini CLI not found. Install from https://github.com/google-gemini/gemini-cli"
 fi
 
 if command -v codex &>/dev/null; then
@@ -161,9 +150,14 @@ else
   warn "codex CLI not found. Install from https://developers.openai.com/codex"
 fi
 
-if [ -z "$HOOK_AGENTS_TO_INSTALL" ] && [ ${#AUTO_HOOK_AGENTS[@]} -gt 0 ]; then
-  HOOK_AGENTS_TO_INSTALL="$(IFS=,; echo "${AUTO_HOOK_AGENTS[*]}")"
+if command -v gemini &>/dev/null; then
+  success "gemini CLI found: $(command -v gemini)"
+else
+  warn "gemini CLI not found. Install from https://github.com/google-gemini/gemini-cli"
 fi
+
+# HOOK_AGENTS can be set explicitly; otherwise install.sh auto-detects
+HOOK_AGENTS_TO_INSTALL="${HOOK_AGENTS:-}"
 
 # Check for python3-venv on Debian/Ubuntu (where venv is a separate package)
 if [ "$PKG_MGR" = "apt" ]; then
@@ -216,14 +210,13 @@ success "Python dependencies installed."
 
 HOOK_STATUS="skipped"
 if [ -f "$REPO_ROOT/hooks/install.sh" ]; then
-  if [ -n "$HOOK_AGENTS_TO_INSTALL" ]; then
-    info "Installing hooks for: $HOOK_AGENTS_TO_INSTALL"
-    HOOK_AGENTS="$HOOK_AGENTS_TO_INSTALL" bash "$REPO_ROOT/hooks/install.sh"
+  info "Installing hooks (auto-detecting installed CLIs)..."
+  if HOOK_AGENTS="$HOOK_AGENTS_TO_INSTALL" bash "$REPO_ROOT/hooks/install.sh"; then
     success "Hooks installed."
-    HOOK_STATUS="installed for $HOOK_AGENTS_TO_INSTALL"
+    HOOK_STATUS="installed (auto-detected)"
   else
-    warn "No hook-capable assistant CLI found (Claude/Gemini). Skipping hook installation."
-    HOOK_STATUS="skipped (no Claude/Gemini CLI found)"
+    warn "Hook installation had errors."
+    HOOK_STATUS="errors during install"
   fi
 else
   warn "hooks/install.sh not found. Skipping hook installation."

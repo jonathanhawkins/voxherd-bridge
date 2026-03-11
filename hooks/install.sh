@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 # install.sh - Install VoxHerd hooks for supported assistant CLIs.
 #
+# By default, auto-detects which CLIs (Claude, Codex, Gemini) are installed
+# and configures hooks for all of them. Falls back to Claude if none detected.
+#
 # Usage:
-#   HOOK_AGENTS=claude,gemini bash hooks/install.sh
+#   bash hooks/install.sh                          # auto-detect all installed CLIs
+#   HOOK_AGENTS=codex bash hooks/install.sh        # install only for Codex
+#   HOOK_AGENTS=claude,codex bash hooks/install.sh # install for specific CLIs
 #
 # Notes:
-# - Claude + Gemini support lifecycle hooks and are configured here.
-# - Codex currently has no native lifecycle hooks; dispatch is supported by the bridge.
+# - Claude + Gemini use lifecycle hooks (JSON via stdin) in ~/.claude/ and ~/.gemini/.
+# - Codex uses a `notify` handler (JSON via argv) configured in ~/.codex/config.toml.
 
 set -e
 
@@ -24,13 +29,14 @@ HOOK_SCRIPTS=(
   "on-notification.sh"
   "on-subagent-start.sh"
   "on-subagent-stop.sh"
+  "codex-notify.py"
 )
 
 VOXHERD_DIR="$HOME/.voxherd"
 HOOKS_DEST="$VOXHERD_DIR/hooks"
 LOGS_DIR="$VOXHERD_DIR/logs"
 
-RAW_HOOK_AGENTS="${HOOK_AGENTS:-claude}"
+RAW_HOOK_AGENTS="${HOOK_AGENTS:-}"
 
 normalize_agents() {
   local raw="$1"
@@ -48,13 +54,23 @@ normalize_agents() {
     out+=("$agent")
     seen="$seen$agent "
   done
-  if [ "${#out[@]}" -eq 0 ]; then
-    out=("claude")
-  fi
   echo "${out[@]}"
 }
 
-read -r -a TARGET_AGENTS <<< "$(normalize_agents "$RAW_HOOK_AGENTS")"
+# If HOOK_AGENTS was explicitly set, use that list. Otherwise auto-detect
+# every supported CLI that is installed on this machine.
+if [ -n "$RAW_HOOK_AGENTS" ]; then
+  read -r -a TARGET_AGENTS <<< "$(normalize_agents "$RAW_HOOK_AGENTS")"
+else
+  TARGET_AGENTS=()
+  command -v claude &>/dev/null && TARGET_AGENTS+=("claude")
+  command -v codex  &>/dev/null && TARGET_AGENTS+=("codex")
+  command -v gemini &>/dev/null && TARGET_AGENTS+=("gemini")
+  # If none detected, default to claude (it may be installed later)
+  if [ "${#TARGET_AGENTS[@]}" -eq 0 ]; then
+    TARGET_AGENTS=("claude")
+  fi
+fi
 
 echo "Creating directories..."
 mkdir -p "$HOOKS_DEST" "$LOGS_DIR"
@@ -169,6 +185,46 @@ install_gemini_hooks() {
   echo "$settings_path"
 }
 
+install_codex_hooks() {
+  # Codex uses a TOML config at ~/.codex/config.toml with a `notify` key.
+  # The notify script receives a JSON argument via sys.argv[1] (not stdin).
+  local config_dir="$HOME/.codex"
+  local config_path="$config_dir/config.toml"
+  mkdir -p "$config_dir"
+
+  local notify_cmd="python3 $HOME/.voxherd/hooks/codex-notify.py"
+
+  if [ -f "$config_path" ]; then
+    # Check if notify is already configured
+    if grep -q "codex-notify.py" "$config_path" 2>/dev/null; then
+      echo "$config_path (already configured)"
+      return
+    fi
+
+    # Check if there's an existing notify line — replace it or append
+    if grep -q '^notify\s*=' "$config_path" 2>/dev/null; then
+      # Back up and replace the existing notify line
+      cp "$config_path" "${config_path}.bak"
+      sed -i.tmp "s|^notify\s*=.*|notify = [\"python3\", \"$HOME/.voxherd/hooks/codex-notify.py\"]|" "$config_path"
+      rm -f "${config_path}.tmp"
+    else
+      # Append notify config
+      printf '\n# VoxHerd: notify bridge on agent-turn-complete\nnotify = ["python3", "%s/.voxherd/hooks/codex-notify.py"]\n' "$HOME" >> "$config_path"
+    fi
+  else
+    # Create config with notify setting
+    cat > "$config_path" <<TOML
+# Codex CLI configuration
+# See: https://developers.openai.com/codex/config-reference
+
+# VoxHerd: notify bridge on agent-turn-complete
+notify = ["python3", "$HOME/.voxherd/hooks/codex-notify.py"]
+TOML
+  fi
+
+  echo "$config_path"
+}
+
 INSTALLED=()
 SKIPPED=()
 
@@ -183,7 +239,8 @@ for agent in "${TARGET_AGENTS[@]}"; do
       INSTALLED+=("gemini:$(install_gemini_hooks)")
       ;;
     codex)
-      SKIPPED+=("codex (no native lifecycle hook API)")
+      echo "Updating Codex settings..."
+      INSTALLED+=("codex:$(install_codex_hooks)")
       ;;
     *)
       SKIPPED+=("$agent (unsupported)")

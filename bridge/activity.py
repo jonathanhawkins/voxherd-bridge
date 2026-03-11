@@ -55,12 +55,22 @@ async def _drain_queued_command(session) -> None:
 # Activity type detection from terminal output
 # ---------------------------------------------------------------------------
 
-# Patterns to detect what Claude Code tool is running from tmux output.
+# Patterns to detect what the assistant is doing from tmux output.
+# These cover Claude Code, Codex, and Gemini CLI tool patterns.
 _TOOL_PATTERNS: list[tuple[re.Pattern, str]] = [
+    # Claude Code tools
     (re.compile(r"(?:^|\s)(?:Edit|Write|MultiEdit)\b", re.MULTILINE), "writing"),
     (re.compile(r"(?:^|\s)Bash\b", re.MULTILINE), "running"),  # refined below
     (re.compile(r"(?:^|\s)(?:Read|Grep|Glob|LS)\b", re.MULTILINE), "searching"),
     (re.compile(r"(?:^|\s)Task\b", re.MULTILINE), "working"),
+    # Codex tools (uses shell, apply_patch, read_file patterns)
+    (re.compile(r"(?:^|\s)(?:apply_patch|patch)\b", re.MULTILINE), "writing"),
+    (re.compile(r"(?:^|\s)(?:shell|exec)\b", re.MULTILINE), "running"),
+    (re.compile(r"(?:^|\s)read_file\b", re.MULTILINE), "searching"),
+    # Gemini CLI tools (uses write_file, run_shell, read_file patterns)
+    (re.compile(r"(?:^|\s)(?:write_file|edit_file)\b", re.MULTILINE), "writing"),
+    (re.compile(r"(?:^|\s)run_shell\b", re.MULTILINE), "running"),
+    (re.compile(r"(?:^|\s)(?:list_dir|search_files)\b", re.MULTILINE), "searching"),
 ]
 
 _TEST_KEYWORDS = ("test", "pytest", "jest", "vitest", "cargo test", "npm test", "yarn test", "xctestrun")
@@ -78,16 +88,17 @@ _IDLE_TIMEOUT_SECONDS = 12.0  # mark active→idle after this many seconds with 
 
 
 def _detect_activity_type(text: str) -> str | None:
-    """Detect what Claude Code is doing from recent terminal output.
+    """Detect what the assistant (Claude/Codex/Gemini) is doing from terminal output.
 
     Returns the detected activity type, or None if nothing specific was found
     (caller should apply sticky logic).
     """
     # Check for spinner characters first — these are the strongest signal
-    # that Claude Code is actively working.
-    has_spinner = bool(re.search(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷]", text))
+    # that the assistant is actively working.  All three CLIs use braille
+    # spinners or similar Unicode animation characters.
+    has_spinner = bool(re.search(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷◐◑◒◓⏳]", text))
 
-    # If Claude Code's idle prompt (❯) appears near the bottom AND there
+    # If the assistant's idle prompt appears near the bottom AND there
     # are no spinners, it's waiting for input.  Tool names in scrollback
     # above the prompt are stale history, not current activity.
     if not has_spinner and _has_idle_prompt(text):
@@ -95,7 +106,7 @@ def _detect_activity_type(text: str) -> str | None:
 
     for pattern, activity in _TOOL_PATTERNS:
         if pattern.search(text):
-            # Refine Bash into testing/building if command matches
+            # Refine Bash/shell into testing/building if command matches
             if activity == "running":
                 lower = text.lower()
                 if any(kw in lower for kw in _TEST_KEYWORDS):
@@ -103,29 +114,34 @@ def _detect_activity_type(text: str) -> str | None:
                 if any(kw in lower for kw in _BUILD_KEYWORDS):
                     return "building"
             return activity
-    # Spinner detected but no tool patterns — Claude is thinking
+    # Spinner detected but no tool patterns — assistant is thinking
     if has_spinner:
         return "thinking"
     return None  # no match — let caller apply sticky logic
 
 
-# Claude Code's idle prompt: bare ❯ on a line (possibly with trailing space).
-# When present in the bottom ~8 lines, Claude Code is waiting for input.
-_IDLE_PROMPT_RE = re.compile(r"^[\u276f>❯]\s*$", re.MULTILINE)  # ❯ or >
+# Idle prompt patterns for all supported assistants:
+# - Claude Code: bare ❯ or > on a line
+# - Codex: "> " prompt or "codex>" style prompt
+# - Gemini CLI: "❯" or ">" prompt, similar to Claude
+_IDLE_PROMPT_RE = re.compile(
+    r"^[\u276f>❯]\s*$"        # Claude/Gemini: bare ❯ or >
+    r"|^codex>\s*$"            # Codex: "codex>" prompt
+    r"|^gemini>\s*$",          # Gemini: "gemini>" prompt
+    re.MULTILINE | re.IGNORECASE,
+)
 
 
 def _has_idle_prompt(text: str) -> bool:
-    """Return True if Claude Code's idle prompt appears near the bottom of text.
+    """Return True if the assistant's idle prompt appears near the bottom of text.
 
-    Claude Code's terminal layout when idle:
-        (content / tool output)
-        ❯                       ← idle prompt
-        ─────────────────────── ← separator
-        🤖 Opus 4.6 $0.34 ...  ← model/cost bar
-        ⏵⏵ bypass permissions  ← permission mode
+    Checks for idle prompts from all supported assistants:
+    - Claude Code: ❯ prompt with model/cost bar below
+    - Codex: "> " or "codex>" prompt
+    - Gemini CLI: ❯ or ">" prompt
 
-    We check the bottom 12 lines for the bare ❯ prompt.  If found, Claude
-    Code is at its input prompt, not actively working.
+    We check the bottom 12 lines for any idle prompt.  If found, the
+    assistant is at its input prompt, not actively working.
     """
     lines = text.rstrip().splitlines()
     bottom = lines[-12:] if len(lines) > 12 else lines
@@ -159,13 +175,14 @@ _SHELL_COMMANDS = frozenset({
     "bash", "zsh", "fish", "sh", "dash", "tcsh", "csh", "login", "-bash", "-zsh",
 })
 
-# Patterns that identify Claude Code's status bar lines (bottom of terminal).
+# Patterns that identify assistant status bar lines (bottom of terminal).
 # These should be skipped when extracting the activity snippet.
+# Covers Claude Code, Codex, and Gemini CLI chrome.
 _STATUS_BAR_RE = re.compile(
     r"permissions on|"               # permission mode line: "bypass permissions on · 1 bash"
     r"auto-compact|"                 # context line: "Context left until auto-compact: 9%"
     r"shift\+tab to cycle|"          # hint line
-    r"Opus \d|Sonnet \d|Haiku \d|"   # model info: "Opus 4.6 $113.77 ..."
+    r"Opus \d|Sonnet \d|Haiku \d|"   # Claude model info: "Opus 4.6 $113.77 ..."
     r"^\$\d+\.\d+\s|"               # cost at start of line
     r"^\d+\.?\d*k/\d+|"             # token count: "150.9k/200k"
     r"\+\d+\s*completed|"           # task progress: "... +10 completed"
@@ -176,7 +193,15 @@ _STATUS_BAR_RE = re.compile(
     r"^Tip:|"                       # tip lines: "Tip: Use Plan Mode..."
     r"Discombobulating|"            # Claude Code thinking animation
     r"thought for \d+s|"            # thinking indicator: "(59s · ... thought for 2s)"
-    r"\w+ for \d+[ms]\b",           # completion timing: "✻ Worked for 6m 36s", "Sautéed for 53s"
+    r"\w+ for \d+[ms]\b|"           # completion timing: "✻ Worked for 6m 36s", "Sautéed for 53s"
+    # Codex-specific chrome
+    r"codex>|"                       # Codex prompt
+    r"tokens used|"                  # Codex token counter
+    r"thread-id:|"                   # Codex thread info
+    # Gemini-specific chrome
+    r"gemini>|"                      # Gemini prompt
+    r"Gemini \d|"                    # Gemini model info: "Gemini 2.5 ..."
+    r"tokens remaining",             # Gemini token counter
     re.IGNORECASE,
 )
 
@@ -195,7 +220,9 @@ _TASK_CHECKBOX_CHARS = frozenset(
 
 
 def _is_status_bar_line(line: str) -> bool:
-    """Return True if *line* looks like Claude Code UI chrome (not real output).
+    """Return True if *line* looks like assistant UI chrome (not real output).
+
+    Handles status bar patterns from Claude Code, Codex, and Gemini CLI.
 
     Claude Code's terminal layout (bottom-up):
       ⏵⏵ bypass permissions on · 1 bash     ← permission mode
@@ -391,14 +418,14 @@ async def _activity_poll_loop() -> None:
                     is_shell = fg_cmd in _SHELL_COMMANDS or (not fg_cmd and session.tmux_target)
 
                     if is_shell:
-                        # Actual shell prompt — Claude Code has exited.
+                        # Actual shell prompt — the assistant has exited.
                         # Immediately deregister so it disappears from the visualization.
                         sid, proj = session.session_id, session.project
                         sessions.remove_session(sid)
                         _STICKY_ACTIVITY.pop(sid, None)
                         _LAST_REAL_ACTIVITY.pop(sid, None)
                         await _cancel_terminal_subs_for_session(sid, project=proj)
-                        log_event("info", proj, f"Claude exited — deregistered ({sid[:12]}...)")
+                        log_event("info", proj, f"{session.assistant.title()} exited — deregistered ({sid[:12]}...)")
                         await broadcast_to_ios({
                             "type": "session_removed",
                             "session_id": sid,

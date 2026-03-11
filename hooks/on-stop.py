@@ -670,11 +670,10 @@ def generate_openai_summary(context: str, project: str) -> str:
         return ""
 
     system_prompt = (
-        "You create ultra-concise audio summaries of coding agent work. "
+        "You create ultra-concise audio summaries. "
         "Format: 1 sentence what was done + 'Next:' + 1 next step. "
         "Be ruthlessly concise, natural tone, no filler. "
-        "Start with a past-tense verb. No markdown, no code blocks, no file paths. "
-        "Example: 'Fixed the auth bug in login flow. Next: run the tests.'"
+        "Example: 'Fixed the stop hook API integration. Next: test the changes.'"
     )
     user_prompt = f"Project: {project}\n\n{context}"
 
@@ -726,11 +725,11 @@ def generate_gemini_summary(context: str, project: str) -> str:
         return ""
 
     prompt = (
-        "You create ultra-concise audio summaries of coding agent work. "
+        "You create ultra-concise audio summaries. "
         "Format: 1 sentence what was done + 'Next:' + 1 next step. "
         "Be ruthlessly concise, natural tone, no filler. "
-        "Start with a past-tense verb. No markdown, no code blocks, no file paths. "
-        "Example: 'Fixed the auth bug in login flow. Next: run the tests.'\n\n"
+        "Example: 'Fixed the stop hook API integration. Next: test the changes.'\n\n"
+        f"Summarize this coding session:\n"
         f"Project: {project}\n\n{context}"
     )
 
@@ -767,10 +766,11 @@ def generate_gemini_summary(context: str, project: str) -> str:
 
 
 def _clean_summary(text: str) -> str:
-    """Clean and validate an AI-generated summary for TTS.
+    """Clean an AI-generated summary for TTS.
 
-    Shared by both OpenAI and Haiku paths — strips markdown, rejects
-    refusals/roleplaying/first-person, caps length.
+    Light cleanup only — strip markdown and cap length.
+    The AI prompt already constrains the format, so aggressive
+    filtering just kills good summaries and triggers bad fallbacks.
     """
     if not text:
         return ""
@@ -784,43 +784,13 @@ def _clean_summary(text: str) -> str:
         if text.lower().startswith(prefix.lower()):
             text = text[len(prefix):]
 
-    # Reject refusals and roleplaying
+    # Only reject clear refusals (AI saying it can't help)
     refusal_phrases = [
         "i need more context", "i can't", "i don't have",
         "unable to provide", "not enough context",
-        "could you clarify", "i cannot", "i need your",
-        "i'd need to", "can you paste", "i've updated",
-        "i'll ", "let me ", "here's what",
-        "requires your approval", "approve to proceed",
-        "would you like", "should i ", "shall i ",
-        "do you want", "can you confirm",
-        "your permission", "your approval",
         "i'm sorry", "i apologize",
     ]
     if any(p in text.lower() for p in refusal_phrases):
-        return ""
-
-    # Reject first-person responses
-    if any(text.strip().startswith(p) for p in [
-        "I ", "I'", "I've", "I'll", "I'd", "I need", "I can",
-    ]):
-        return ""
-
-    # Reject bad starts
-    bad_starts = [
-        "based on ", "sure", "okay",
-        "certainly", "of course", "happy to", "great ",
-        "yes", "no,", "note:", "summary:",
-    ]
-    if any(text.lower().startswith(p) for p in bad_starts):
-        return ""
-
-    # Reject lowercase start
-    if text and text[0].islower():
-        return ""
-
-    # Reject questions
-    if text.rstrip().endswith("?"):
         return ""
 
     # Take first line if multi-line
@@ -828,8 +798,8 @@ def _clean_summary(text: str) -> str:
         text = text.strip().split("\n")[0]
 
     # Cap length — spoken aloud
-    if len(text) > 150:
-        text = text[:147] + "..."
+    if len(text) > 200:
+        text = text[:197] + "..."
 
     return text.strip()
 
@@ -839,10 +809,10 @@ def _clean_summary(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 if not summary:
-    # Try fast path first — no Haiku needed for simple changes
-    summary = try_fast_summary(transcript_path)
-    if summary:
-        log(f"  Fast-path summary: {summary}")
+    # Skip fast-path — always use AI for better quality summaries.
+    # Fast-path grabs Claude's conversational text which often reads
+    # poorly as a spoken summary.  AI produces natural TTS output.
+    pass
 
 if not summary:
     context = extract_context(transcript_path)
@@ -876,25 +846,13 @@ if not summary:
     # Codex users are covered by OpenAI API; Gemini users by Gemini API.
     if not summary and context and assistant == "claude" and shutil.which("claude"):
         prompt = (
-            "You create ultra-concise audio summaries of coding agent work.\n"
-            "Format: 1 sentence what was done + 'Next:' + 1 next step.\n"
-            "Be ruthlessly concise, natural tone, no filler.\n\n"
-            "RULES:\n"
-            "1. Start with a past-tense verb: Fixed, Updated, Added, Implemented, etc.\n"
-            "2. Focus on the FINAL OUTCOME, not intermediate steps or exploration.\n"
-            "3. The 'Agent's final statement' is the most important — it describes what was actually done.\n"
-            "   Distill that into your summary. Ignore earlier exploration or verification steps.\n"
-            "4. Never use first person (I, I've). Never ask questions.\n"
-            "5. Never mention approvals, permissions, or screenshots.\n"
-            "6. No markdown, code blocks, or file paths. Plain speech.\n\n"
-            "GOOD: Fixed the auth bug in login flow. Next: run the tests.\n"
-            "GOOD: Added status bar filtering for terminal UI. Next: verify on device.\n"
-            "GOOD: Deployed latest build to iPhone. Next: check TestFlight.\n"
-            "BAD: I need to see the actual work (first person)\n"
-            "BAD: The screenshot requires approval (roleplaying)\n"
-            "BAD: Verified the iOS structure exists (describing a check, not an outcome)\n\n"
+            "You create ultra-concise audio summaries. "
+            "Format: 1 sentence what was done + 'Next:' + 1 next step. "
+            "Be ruthlessly concise, natural tone, no filler. "
+            "Example: 'Fixed the stop hook API integration. Next: test the changes.'\n\n"
+            f"Summarize this coding session:\n"
             f"Project: {project_name}\n"
-            f"Log:\n{safe_context}"
+            f"{safe_context}"
         )
 
         try:
