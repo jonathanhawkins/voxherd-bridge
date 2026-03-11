@@ -17,6 +17,9 @@ jobs:
   # ---------------------------------------------------------------------------
   build-macos:
     runs-on: macos-14  # Apple Silicon runner
+    env:
+      HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' }}
+      HAS_NOTARIZE: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -87,7 +90,7 @@ jobs:
           chmod +x "$RESOURCES/hooks/"*.sh 2>/dev/null || true
 
       - name: Import Apple signing certificate
-        if: ${{ secrets.APPLE_CERTIFICATE != '' }}
+        if: env.HAS_APPLE_CERT == 'true'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -118,7 +121,7 @@ jobs:
           echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
 
       - name: Code sign app bundle
-        if: ${{ secrets.APPLE_CERTIFICATE != '' }}
+        if: env.HAS_APPLE_CERT == 'true'
         env:
           SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY || 'Developer ID Application' }}
         run: |
@@ -154,7 +157,7 @@ jobs:
             --sign "$SIGN_IDENTITY" --entitlements "$ENTITLEMENTS" "$APP"
 
       - name: Ad-hoc sign (unsigned build)
-        if: ${{ secrets.APPLE_CERTIFICATE == '' }}
+        if: env.HAS_APPLE_CERT != 'true'
         run: |
           codesign --force --deep --sign - macos/dist/VoxHerdBridge.app
 
@@ -181,7 +184,7 @@ jobs:
           echo "DMG_PATH=$DMG" >> "$GITHUB_ENV"
 
       - name: Notarize DMG
-        if: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' }}
+        if: env.HAS_NOTARIZE == 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
