@@ -10,6 +10,8 @@ Supports subcommands:
     run     - Run the bridge directly (not in tmux; used internally)
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os

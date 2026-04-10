@@ -7,6 +7,8 @@ Includes a truncated SHA-256 hash of the auth token in the TXT record
 so iOS clients can verify the discovered service before connecting.
 """
 
+from __future__ import annotations
+
 import hashlib
 import socket
 from zeroconf import Zeroconf, ServiceInfo

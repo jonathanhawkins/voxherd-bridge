@@ -197,23 +197,35 @@ struct StatusBarView: View {
 
     // MARK: - Controls
 
+    private var isStarting: Bool {
+        processManager.state == .starting
+    }
+
     private var controlsSection: some View {
         HStack {
-            Button(isRunning ? "Stop Bridge" : "Start Bridge") {
-                if isRunning {
-                    processManager.stop()
-                } else {
-                    processManager.start(
-                        port: preferences.bridgePort,
-                        enableTTS: preferences.enableTTS,
-                        enableSTT: preferences.enableSTT,
-                        enableWakeWord: preferences.enableWakeWord
-                    )
+            if isStarting {
+                Button("Starting…") {}
+                    .buttonStyle(.borderedProminent)
+                    .tint(.yellow)
+                    .controlSize(.small)
+                    .disabled(true)
+            } else {
+                Button(isRunning ? "Stop Bridge" : "Start Bridge") {
+                    if isRunning {
+                        processManager.stop()
+                    } else {
+                        processManager.start(
+                            port: preferences.bridgePort,
+                            enableTTS: preferences.enableTTS,
+                            enableSTT: preferences.enableSTT,
+                            enableWakeWord: preferences.enableWakeWord
+                        )
+                    }
                 }
+                .buttonStyle(.borderedProminent)
+                .tint(isRunning ? .red : .green)
+                .controlSize(.small)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(isRunning ? .red : .green)
-            .controlSize(.small)
 
             Spacer()
 

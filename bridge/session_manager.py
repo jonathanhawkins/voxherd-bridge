@@ -4,6 +4,8 @@ Sessions are kept in memory at runtime but persisted to a JSON file
 (``~/.voxherd/sessions.json``) so they survive bridge restarts.
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import os

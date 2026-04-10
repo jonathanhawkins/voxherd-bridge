@@ -1,4 +1,5 @@
 """Input validation and sanitization helpers for the bridge server."""
+from __future__ import annotations
 
 import json
 import os

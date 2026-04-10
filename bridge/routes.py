@@ -4,6 +4,8 @@ Extracted from ``bridge_server.py`` — all REST endpoints live here,
 mounted on a FastAPI ``APIRouter``.
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import os

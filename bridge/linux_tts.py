@@ -5,6 +5,8 @@ Auto-detects which TTS binary is available. Announcements are queued
 to prevent overlapping speech, same as the macOS version.
 """
 
+from __future__ import annotations
+
 import asyncio
 import shutil
 from collections.abc import Awaitable, Callable

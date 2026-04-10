@@ -5,6 +5,8 @@ background loops lives here. Other modules import from this module to
 avoid circular dependencies.
 """
 
+from __future__ import annotations
+
 import asyncio
 import hashlib
 import hmac
@@ -117,6 +119,7 @@ headless_port: int = 0
 # Background tasks for polling loops
 _prune_task: asyncio.Task | None = None
 _activity_poll_task: asyncio.Task | None = None
+_bonjour_task: asyncio.Task | None = None
 
 # Sticky activity state: tracks the last "specific" (non-thinking) activity
 # type per session so we don't flicker to thinking between tool calls.

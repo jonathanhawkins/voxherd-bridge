@@ -45,12 +45,13 @@ final class SettingsWindowController {
         }
 
         let settingsView = SettingsView(preferences: preferences, processManager: processManager)
-            .frame(width: 380, height: 480)
 
         let hostingController = NSHostingController(rootView: settingsView)
         let win = NSWindow(contentViewController: hostingController)
         win.title = "VoxHerd Settings"
-        win.styleMask = [.titled, .closable]
+        win.styleMask = [.titled, .closable, .resizable]
+        win.setContentSize(NSSize(width: 420, height: 800))
+        win.minSize = NSSize(width: 380, height: 600)
         win.center()
         win.isReleasedWhenClosed = false
         win.level = .normal

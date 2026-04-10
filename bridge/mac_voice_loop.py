@@ -11,6 +11,8 @@ iOS ``IntentRouter.swift``), resolves the target project, and dispatches
 the command to the appropriate Claude Code session.
 """
 
+from __future__ import annotations
+
 import asyncio
 import re
 import sys

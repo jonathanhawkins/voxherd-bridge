@@ -5,6 +5,8 @@ terminal output, detect what Claude Code is doing, broadcast changes to iOS,
 prune dead sessions, and discover pre-existing tmux sessions at startup.
 """
 
+from __future__ import annotations
+
 import asyncio
 import re
 import secrets
@@ -416,6 +418,12 @@ async def _activity_poll_loop() -> None:
                     # (bash/zsh) means Claude Code has truly exited.
                     fg_cmd = await _pane_fg_command(session.tmux_target)
                     is_shell = fg_cmd in _SHELL_COMMANDS or (not fg_cmd and session.tmux_target)
+
+                    # Correct assistant field if the actual process differs
+                    # (e.g. session registered as "claude" but running Codex).
+                    detected = infer_assistant_from_process(fg_cmd)
+                    if detected and detected != session.assistant:
+                        session.assistant = detected
 
                     if is_shell:
                         # Actual shell prompt — the assistant has exited.

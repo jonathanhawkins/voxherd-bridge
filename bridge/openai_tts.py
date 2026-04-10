@@ -7,6 +7,8 @@ is set or API calls fail.
 Audio is played via ``afplay`` (macOS) or ``aplay`` (Linux).
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import os

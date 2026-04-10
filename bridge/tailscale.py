@@ -1,5 +1,7 @@
 """Tailscale detection utility for VoxHerd bridge server."""
 
+from __future__ import annotations
+
 import json
 import subprocess
 

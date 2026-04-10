@@ -8,6 +8,8 @@ falsely re-activated idle sessions, causing voice commands to queue with
 import pytest
 
 from bridge.activity import _detect_activity_type, _has_idle_prompt
+from bridge.assistant import infer_assistant_from_process
+from bridge.session_manager import Session
 
 
 # ---------------------------------------------------------------------------
@@ -228,3 +230,93 @@ class TestReactivationGuard:
         # detected is None AND has_idle_prompt → idle immediately
         should_auto_idle = detected is None and has_prompt
         assert should_auto_idle is True, "Should auto-idle when at prompt with no activity"
+
+
+# ---------------------------------------------------------------------------
+# Assistant inference and auto-correction tests
+# ---------------------------------------------------------------------------
+
+
+class TestInferAssistantFromProcess:
+    """Tests for infer_assistant_from_process() — detect assistant from tmux fg command."""
+
+    def test_claude_binary(self):
+        assert infer_assistant_from_process("claude") == "claude"
+
+    def test_claude_semver(self):
+        assert infer_assistant_from_process("2.1.42") == "claude"
+
+    def test_codex_binary(self):
+        assert infer_assistant_from_process("codex") == "codex"
+
+    def test_codex_platform_specific(self):
+        """Codex binary may report as platform-specific name (truncated by tmux)."""
+        assert infer_assistant_from_process("codex-aarch64-a") == "codex"
+
+    def test_codex_full_platform(self):
+        assert infer_assistant_from_process("codex-aarch64-apple-darwin") == "codex"
+
+    def test_gemini_binary(self):
+        assert infer_assistant_from_process("gemini") == "gemini"
+
+    def test_shell_returns_none(self):
+        assert infer_assistant_from_process("bash") is None
+
+    def test_empty_returns_none(self):
+        assert infer_assistant_from_process("") is None
+
+    def test_node_returns_none(self):
+        assert infer_assistant_from_process("node") is None
+
+
+class TestAssistantAutoCorrection:
+    """Tests for the activity poll auto-correcting session.assistant.
+
+    When a session is registered as 'claude' but the tmux pane is actually
+    running Codex (or vice versa), the poll loop should fix the mismatch.
+    """
+
+    def _make_session(self, assistant: str = "claude") -> Session:
+        return Session(
+            session_id="test-123",
+            project="myproject",
+            project_dir="/tmp/test",
+            assistant=assistant,
+            status="active",
+        )
+
+    def test_codex_process_corrects_claude_session(self):
+        """Session registered as claude but running codex should be corrected."""
+        session = self._make_session(assistant="claude")
+        fg_cmd = "codex-aarch64-a"
+        detected = infer_assistant_from_process(fg_cmd)
+        if detected and detected != session.assistant:
+            session.assistant = detected
+        assert session.assistant == "codex"
+
+    def test_claude_process_corrects_codex_session(self):
+        """Session registered as codex but running claude should be corrected."""
+        session = self._make_session(assistant="codex")
+        fg_cmd = "2.1.42"  # Claude reports semver as process name
+        detected = infer_assistant_from_process(fg_cmd)
+        if detected and detected != session.assistant:
+            session.assistant = detected
+        assert session.assistant == "claude"
+
+    def test_matching_assistant_unchanged(self):
+        """No correction when process matches registered assistant."""
+        session = self._make_session(assistant="claude")
+        fg_cmd = "claude"
+        detected = infer_assistant_from_process(fg_cmd)
+        if detected and detected != session.assistant:
+            session.assistant = detected
+        assert session.assistant == "claude"
+
+    def test_shell_process_does_not_overwrite(self):
+        """Shell process (bash) should not clear the assistant field."""
+        session = self._make_session(assistant="codex")
+        fg_cmd = "bash"
+        detected = infer_assistant_from_process(fg_cmd)
+        if detected and detected != session.assistant:
+            session.assistant = detected
+        assert session.assistant == "codex"

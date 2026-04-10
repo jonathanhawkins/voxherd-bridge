@@ -4,6 +4,8 @@ Sets up the FastAPI test client with auth token, and provides helpers
 for registering sessions and sending events.
 """
 
+from __future__ import annotations
+
 import os
 import tempfile
 from unittest.mock import patch, AsyncMock

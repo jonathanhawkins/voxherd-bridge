@@ -28,9 +28,12 @@ final class BridgeProcessManager {
     private var stderrReadTask: Task<Void, Never>?
     private var restartTask: Task<Void, Never>?
     private var forceKillTask: Task<Void, Never>?
+    private var startupTimeoutTask: Task<Void, Never>?
     private var sessionPollTask: Task<Void, Never>?
     private var restartDelay: TimeInterval = 1.0
     private let maxEvents = 200
+    /// Seconds to wait for the ready signal before treating startup as failed.
+    private let startupTimeout: TimeInterval = 15
     private let logger = Logger(subsystem: "com.voxherd.bridge", category: "ProcessManager")
 
     // Health check: consecutive poll failures while state == .running
@@ -121,6 +124,9 @@ final class BridgeProcessManager {
             env["PATH"] = (additions + [currentPath]).joined(separator: ":")
         }
 
+        // Force unbuffered stdout so the ready signal arrives immediately via pipe
+        env["PYTHONUNBUFFERED"] = "1"
+
         // Point to bundled STT binary
         if let sttPath = Self.sttBinaryPath() {
             env["VOXHERD_STT_BINARY"] = sttPath
@@ -159,6 +165,7 @@ final class BridgeProcessManager {
             logger.info("Bridge process started (PID: \(proc.processIdentifier))")
             startReadingOutput(pipe: outPipe)
             startReadingStderr(pipe: errPipe)
+            scheduleStartupTimeout()
         } catch {
             state = .error("Failed to start: \(error.localizedDescription)")
             logger.error("Failed to start bridge: \(error)")
@@ -167,6 +174,9 @@ final class BridgeProcessManager {
 
     func stop() {
         stopSessionPolling()
+
+        startupTimeoutTask?.cancel()
+        startupTimeoutTask = nil
 
         restartTask?.cancel()
         restartTask = nil
@@ -277,6 +287,8 @@ final class BridgeProcessManager {
         // Check for ready signal
         if let ready = try? JSONDecoder().decode(ReadySignal.self, from: data),
            ready.status == "ready" {
+            startupTimeoutTask?.cancel()
+            startupTimeoutTask = nil
             state = .running
             port = ready.port
             logger.info("Bridge ready on port \(ready.port)")
@@ -442,6 +454,27 @@ final class BridgeProcessManager {
             }
         }
         return true
+    }
+
+    // MARK: - Startup Timeout
+
+    /// If the ready signal doesn't arrive within `startupTimeout` seconds,
+    /// kill the process and schedule a restart. This prevents the app from
+    /// being stuck in "Starting..." forever (e.g. due to missing binary,
+    /// Python crash, or stdout buffering issues).
+    private func scheduleStartupTimeout() {
+        startupTimeoutTask?.cancel()
+        startupTimeoutTask = Task {
+            try? await Task.sleep(for: .seconds(startupTimeout))
+            guard !Task.isCancelled else { return }
+            guard self.state == .starting else { return }
+            self.logger.error("Bridge did not emit ready signal within \(self.startupTimeout)s — restarting")
+            self.state = .error("Startup timed out (no ready signal)")
+            // Kill the hung process and retry
+            self.process?.terminate()
+            self.process = nil
+            self.scheduleRestart()
+        }
     }
 
     // MARK: - Auto-restart

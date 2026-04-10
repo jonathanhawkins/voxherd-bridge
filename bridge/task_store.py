@@ -8,6 +8,8 @@ Functions are synchronous — local file I/O is fast enough to call from
 async FastAPI handlers without blocking the event loop noticeably.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import os.path

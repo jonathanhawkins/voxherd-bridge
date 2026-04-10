@@ -179,14 +179,24 @@ async def _lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
 
     _state._prune_task = asyncio.create_task(_periodic_prune())
     _state._activity_poll_task = asyncio.create_task(_activity_poll_loop())
-    try:
-        bonjour.register(port=_state.server_port, auth_token=token or "")
-        _state.log_event("info", "bridge", "Bonjour: advertising _voxherd._tcp")
-    except Exception as e:
-        _state.log_event("warning", "bridge", f"Bonjour registration failed: {e}")
 
-    # Headless ready signal — must come from lifespan because FastAPI ignores
-    # @app.on_event("startup") when a lifespan context manager is set.
+    # Bonjour registration is synchronous and can block for 10+ seconds when
+    # it fails (e.g. no mDNS responder).  Run it in a thread so it doesn't
+    # block the lifespan from yielding — uvicorn won't bind the listening
+    # socket until after yield, so blocking here delays HTTP availability.
+    async def _register_bonjour() -> None:
+        try:
+            await asyncio.to_thread(
+                bonjour.register, port=_state.server_port, auth_token=token or ""
+            )
+            _state.log_event("info", "bridge", "Bonjour: advertising _voxherd._tcp")
+        except Exception as e:
+            _state.log_event("warning", "bridge", f"Bonjour registration failed: {e}")
+
+    _state._bonjour_task = asyncio.create_task(_register_bonjour())
+
+    # Headless ready signal — emitted just before yield so the macOS menu-bar
+    # app knows the server is about to accept connections.
     if _state.headless_port > 0:
         import json as _json, sys as _sys
         ready_line = _json.dumps({"status": "ready", "port": _state.headless_port})
@@ -201,6 +211,8 @@ async def _lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
         _state._prune_task.cancel()
     if _state._activity_poll_task:
         _state._activity_poll_task.cancel()
+    if _state._bonjour_task:
+        _state._bonjour_task.cancel()
     _state.mac_tts.stop()
     try:
         bonjour.unregister()

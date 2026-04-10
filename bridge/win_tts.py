@@ -7,6 +7,8 @@ interface as the other platform TTS modules.
 Falls back to a no-op if pyttsx3 is not installed.
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import threading

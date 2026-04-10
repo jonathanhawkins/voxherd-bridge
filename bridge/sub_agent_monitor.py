@@ -14,6 +14,8 @@ Each task file is a JSON object with at minimum:
 This module scans those directories and returns sub-agent counts per session.
 """
 
+from __future__ import annotations
+
 import json
 import os
 from pathlib import Path

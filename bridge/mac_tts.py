@@ -5,9 +5,10 @@ so the full VoxHerd loop can be tested without an iOS device or glasses.
 Announcements are queued to prevent overlapping speech.
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
-import shutil
 import subprocess
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -46,6 +47,7 @@ def detect_best_voice() -> str:
         result = subprocess.run(
             ["say", "-v", "?"],
             capture_output=True, text=True, timeout=5,
+            env=get_subprocess_env(),
         )
         if result.returncode != 0:
             return "Samantha"
@@ -73,8 +75,25 @@ class SpeechItem:
     listen_after: bool = False
 
 
+_QUEUE_MAXSIZE = 50
+
+
 class MacTTS:
-    """Async wrapper around macOS ``say`` command with queuing."""
+    """Async wrapper around macOS ``say`` command with queuing.
+
+    Event-loop note: the speech queue is intentionally *not* created in
+    ``__init__``. ``MacTTS()`` is instantiated at module-import time
+    (``server_state.py``) before uvicorn's event loop exists. If
+    ``asyncio.Queue()`` were created here, Python 3.9's ``get_event_loop()``
+    would bind it to a throwaway default loop. Later, uvicorn runs the
+    server on a *different* loop, and every ``await queue.get()`` in the
+    worker would hang forever — ``put_nowait`` wakes the getter future on
+    the dead loop, and the worker task (scheduled on uvicorn's loop) never
+    sees the wakeup. Symptom: ``/api/tts`` returns ``{"ok": true}``, items
+    enqueue, no ``say`` subprocess ever spawns, user hears nothing, no
+    error anywhere. The queue is therefore created lazily in ``start()``,
+    which runs inside uvicorn's lifespan on uvicorn's loop.
+    """
 
     def __init__(self, voice: str = "auto", rate: int = 190) -> None:
         if voice == "auto":
@@ -83,9 +102,14 @@ class MacTTS:
         self.voice = voice
         self.rate = rate
         self.enabled = True
-        self._queue: asyncio.Queue[SpeechItem] = asyncio.Queue(maxsize=50)
+        self._queue: asyncio.Queue[SpeechItem] | None = None
         self._worker_task: asyncio.Task | None = None
-        self._available = shutil.which("say") is not None
+        # ``say`` is a required macOS system binary at /usr/bin/say. Do not
+        # gate it behind ``shutil.which`` — inside frozen .app bundles the
+        # probe can silently return None and flip this to False for the life
+        # of the process. The worker invokes say via get_subprocess_env(),
+        # which augments PATH, so the actual subprocess always resolves it.
+        self._available = True
 
         # Callback fired after each utterance completes. Signature:
         #   async (SpeechItem) -> None
@@ -97,8 +121,14 @@ class MacTTS:
         return self._available
 
     def start(self) -> None:
-        """Start the background worker that drains the speech queue."""
+        """Start the background worker that drains the speech queue.
+
+        Must be called from inside a running event loop — the queue binds
+        to this loop so the worker and all future ``speak()`` callers
+        share it. See the class docstring for why this is lazy.
+        """
         if self._worker_task is None:
+            self._queue = asyncio.Queue(maxsize=_QUEUE_MAXSIZE)
             self._worker_task = asyncio.create_task(self._worker())
 
     def stop(self) -> None:
@@ -115,21 +145,29 @@ class MacTTS:
         session_id: str | None = None,
         listen_after: bool = False,
     ) -> None:
-        """Enqueue *text* for speech. Non-blocking, fire-and-forget."""
-        if self.enabled and self._available:
-            item = SpeechItem(
-                text=text,
-                project=project,
-                session_id=session_id,
-                listen_after=listen_after,
-            )
-            if self._queue.full():
-                # Drop oldest item to make room — avoids unbounded growth
-                try:
-                    self._queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-            self._queue.put_nowait(item)
+        """Enqueue *text* for speech. Non-blocking, fire-and-forget.
+
+        If ``start()`` has not yet run (queue not created), the item is
+        dropped. In practice this only happens during early lifespan
+        startup or in tests where ``start`` is mocked.
+        """
+        if not (self.enabled and self._available):
+            return
+        if self._queue is None:
+            return
+        item = SpeechItem(
+            text=text,
+            project=project,
+            session_id=session_id,
+            listen_after=listen_after,
+        )
+        if self._queue.full():
+            # Drop oldest item to make room — avoids unbounded growth
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        self._queue.put_nowait(item)
 
     @staticmethod
     def _insert_pause(text: str) -> str:
@@ -146,6 +184,7 @@ class MacTTS:
 
     async def _worker(self) -> None:
         """Drain the queue sequentially so utterances don't overlap."""
+        assert self._queue is not None  # start() created it before scheduling us
         while True:
             item = await self._queue.get()
             try:

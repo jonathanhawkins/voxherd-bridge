@@ -1,5 +1,7 @@
 """Authentication token management and HTTP middleware for the bridge server."""
 
+from __future__ import annotations
+
 import os
 import secrets
 

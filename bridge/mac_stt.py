@@ -15,6 +15,8 @@ evaluated independently by TCC.  This requires calling private macOS
 APIs via ctypes.
 """
 
+from __future__ import annotations
+
 import asyncio
 import ctypes
 import ctypes.util

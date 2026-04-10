@@ -4,6 +4,8 @@ Extracted from bridge_server.py. The main ``ios_websocket`` function is
 registered by bridge_server via ``app.websocket("/ws/ios")(ios_websocket)``.
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import re
