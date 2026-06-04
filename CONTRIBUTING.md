@@ -222,4 +222,4 @@ Please include:
 
 ## License
 
-This project is licensed under the MIT License. By contributing, you agree that your contributions will be licensed under the same terms.
+This project is licensed under the Business Source License 1.1 (BUSL-1.1); see [LICENSE](LICENSE). By contributing, you agree that your contributions will be licensed under the same terms.

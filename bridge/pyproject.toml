@@ -7,7 +7,7 @@ name = "voxherd-bridge"
 version = "1.0.0"
 description = "Voice-first multi-instance Claude Code controller - bridge server"
 readme = "../README.md"
-license = "MIT"
+license = "BUSL-1.1"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.109,<1.0",

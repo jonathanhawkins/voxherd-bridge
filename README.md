@@ -178,4 +178,4 @@ Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for developmen
 
 ## License
 
-MIT
+Business Source License 1.1 (BUSL-1.1). Non-production use is permitted; production use requires a commercial license. On the Change Date (2030-06-03) the license converts to Apache License, Version 2.0. See [LICENSE](LICENSE).
