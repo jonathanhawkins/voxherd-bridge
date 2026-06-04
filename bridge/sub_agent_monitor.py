@@ -18,9 +18,32 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 
 TASKS_ROOT = Path.home() / ".claude" / "tasks"
+
+# Task JSON files older than this are treated as stale leftovers from a
+# previous Claude Code session that crashed or was killed before marking
+# them completed. Real sub-agents update their task files (status, progress
+# fields) every few seconds while in_progress, so anything with no mtime
+# touch in this window is dead.
+#
+# Why 4 hours? Task JSON does NOT carry an internal `updated_at` timestamp
+# (verified across `~/.claude/tasks/*/`*.json snapshots) — filesystem mtime
+# is the only freshness signal available. Real sub-agents can legitimately
+# go quiet for a long time during a single tool call: a large `npm install`,
+# a slow CI poll, an external API with high latency, or an LLM batch job.
+# Earlier this constant was 30 minutes and a real long-running agent would
+# silently drop from the ⚙ N badge on the dashboard, then reappear minutes
+# later — the user read it as "finished" when nothing had actually changed.
+# 4 hours is a deliberate ceiling: long enough to cover every reasonable
+# single-tool-call wait, short enough that a *truly* crashed run (where
+# the user kills the terminal and walks away) gets cleaned up before the
+# next day's session starts. If a real workload routinely exceeds 4h of
+# quiet, this is the right knob to revisit (or add task-JSON heartbeats
+# upstream in Claude Code).
+_STALE_TASK_AGE_SECONDS = 4 * 3600  # 4 hours
 
 
 def _read_task_file(path: Path) -> dict | None:
@@ -32,11 +55,25 @@ def _read_task_file(path: Path) -> dict | None:
 
 
 def _scan_task_dir(task_dir: Path) -> list[dict]:
-    """Read all task files in a directory and return their data."""
+    """Read all task files in a directory and return their data.
+
+    Skips files older than ``_STALE_TASK_AGE_SECONDS`` so that crashed-
+    session leftovers (in_progress task JSONs that never got flipped to
+    completed because Claude Code was killed) don't get counted as live
+    sub-agents. Real sub-agents rewrite their task file every few seconds
+    while running.
+    """
     if not task_dir.is_dir():
         return []
     tasks: list[dict] = []
+    now = time.time()
     for f in task_dir.glob("*.json"):
+        try:
+            mtime = f.stat().st_mtime
+        except OSError:
+            continue
+        if now - mtime > _STALE_TASK_AGE_SECONDS:
+            continue
         task = _read_task_file(f)
         if task and isinstance(task, dict) and "status" in task:
             tasks.append(task)
@@ -152,16 +189,27 @@ def get_all_sub_agent_counts(sessions: dict[str, "Session"]) -> dict[str, tuple[
         # Determine which session(s) this task list belongs to
         target_sids: list[str] = []
 
-        # UUID match
+        # UUID match — unambiguous, that task dir is owned by one session.
         if entry.name in by_session_id:
             target_sids.append(entry.name)
 
-        # Project name match
+        # Project name match — fallback for older task layouts that key by
+        # project rather than session UUID. Task files in project-name dirs
+        # don't carry session ownership, so when MULTIPLE tmux sessions are
+        # running the same project (e.g. aligned-tools-0 and
+        # aligned-tools-1), attributing the same tasks to every session
+        # produces phantom counts on every row. Skip project-name
+        # attribution when it would be ambiguous; UUID-dir tasks (above)
+        # still attribute correctly per-session.
         entry_lower = entry.name.lower()
         if entry_lower in by_project:
-            for sid in by_project[entry_lower]:
+            candidate_sids = by_project[entry_lower]
+            if len(candidate_sids) == 1:
+                sid = candidate_sids[0]
                 if sid not in target_sids:
                     target_sids.append(sid)
+            # else: multiple sessions share this project — ambiguous,
+            # skip rather than over-attribute.
 
         if not target_sids:
             continue

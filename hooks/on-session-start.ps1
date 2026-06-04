@@ -44,6 +44,13 @@ $ProjectName = if ($ProjectDir) { Split-Path -Leaf $ProjectDir } else { "unknown
 $Assistant = if ($env:VOXHERD_HOOK_ASSISTANT) { $env:VOXHERD_HOOK_ASSISTANT.ToLower() } else { "claude" }
 $Timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 
+# VOXHERD_QUIET: register this session as silent (visible on dashboard, never
+# spoken). Accepts 1/true/yes/on (case-insensitive).
+$Quiet = $false
+if ($env:VOXHERD_QUIET -and @("1","true","yes","on") -contains $env:VOXHERD_QUIET.ToLower()) {
+    $Quiet = $true
+}
+
 # ---------------------------------------------------------------------------
 # Build payload
 # ---------------------------------------------------------------------------
@@ -55,6 +62,7 @@ $payload = @{
     assistant   = $Assistant
     status      = "active"
     timestamp   = $Timestamp
+    quiet       = $Quiet
 } | ConvertTo-Json -Compress
 
 # ---------------------------------------------------------------------------

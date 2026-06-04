@@ -78,6 +78,14 @@ $ProjectDir = $Cwd
 $ProjectName = if ($ProjectDir) { Split-Path -Leaf $ProjectDir } else { "unknown" }
 $Assistant = if ($env:VOXHERD_HOOK_ASSISTANT) { $env:VOXHERD_HOOK_ASSISTANT.ToLower() } else { "claude" }
 
+# VOXHERD_QUIET: this session never speaks. Skip the (slow, paid) Haiku summary
+# and tell the bridge to stay silent via skip_tts. The stop event is still
+# POSTed so the session stays visible on the dashboard/lens.
+$Quiet = $false
+if ($env:VOXHERD_QUIET -and @("1","true","yes","on") -contains $env:VOXHERD_QUIET.ToLower()) {
+    $Quiet = $true
+}
+
 Write-DebugLog "=== on-stop.ps1 invoked ==="
 Write-DebugLog "  SESSION_ID=$SessionId"
 Write-DebugLog "  CWD=$Cwd"
@@ -91,7 +99,9 @@ Write-DebugLog "  ASSISTANT=$Assistant"
 # ---------------------------------------------------------------------------
 
 $Summary = ""
-if ($TranscriptPath -and (Test-Path $TranscriptPath -ErrorAction SilentlyContinue)) {
+if ($Quiet) {
+    Write-DebugLog "  VOXHERD_QUIET set — skipping Haiku summary"
+} elseif ($TranscriptPath -and (Test-Path $TranscriptPath -ErrorAction SilentlyContinue)) {
     Write-DebugLog "  Transcript exists, attempting Haiku summary..."
     try {
         # Get last 50 lines of transcript
@@ -165,6 +175,7 @@ $payload = @{
     stop_reason     = $StopReason
     transcript_path = $TranscriptPath
     timestamp       = $Timestamp
+    skip_tts        = $Quiet
 } | ConvertTo-Json -Compress
 
 # Read auth token

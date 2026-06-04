@@ -23,6 +23,8 @@ a = Analysis(
         'bridge.tmux_manager',
         'bridge.task_store',
         'bridge.sub_agent_monitor',
+        'bridge.session_status',
+        'bridge.choice_detector',
         'bridge.bonjour',
         'bridge.tailscale',
         'bridge.env_utils',

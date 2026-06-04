@@ -377,10 +377,16 @@ final class BridgeProcessManager {
             // The endpoint returns { session_id: { ...session_data } }
             // Decode as a dictionary keyed by session_id
             let decoded = try JSONDecoder().decode([String: SessionInfo].self, from: data)
+            let now = Date()
             let sorted = decoded.values.sorted { a, b in
-                // Active/attention sessions first, then by project name
-                if a.isActive != b.isActive { return a.isActive }
-                if a.needsAttention != b.needsAttention { return a.needsAttention }
+                // Attention-demand bucketing, matching iOS SessionRegistry:
+                //   0 = waiting/just-finished, 1 = working, 2 = older idle
+                let ba = Self.attentionBucket(for: a, now: now)
+                let bb = Self.attentionBucket(for: b, now: now)
+                if ba != bb { return ba < bb }
+                let ta = Self.lastActivityDate(a) ?? .distantPast
+                let tb = Self.lastActivityDate(b) ?? .distantPast
+                if ta != tb { return ta > tb }
                 return a.project.localizedCaseInsensitiveCompare(b.project) == .orderedAscending
             }
             sessions = sorted
@@ -418,6 +424,68 @@ final class BridgeProcessManager {
         }
     }
 
+    // MARK: - Session Sorting
+
+    /// 2-minute window during which a freshly-idle session is treated as
+    /// "just finished" and floats above active sessions. Matches the iOS
+    /// SessionRegistry threshold so both UIs order rows the same way.
+    nonisolated static let justFinishedWindow: TimeInterval = 120
+
+    /// ISO 8601 with fractional seconds — the bridge writes
+    /// `datetime.now(timezone.utc).isoformat()` which includes
+    /// microseconds (6 decimals); Swift's `.withFractionalSeconds`
+    /// parses to millisecond precision and silently truncates the
+    /// extra digits. That's fine here — the 2-minute just-finished
+    /// boundary doesn't care about sub-millisecond drift, and
+    /// downstream comparisons all use the same parsed value. If a
+    /// future feature ever needs microsecond accuracy from this field,
+    /// it'll have to parse the raw string directly.
+    nonisolated private static let lastActivityFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+
+    /// Fallback parser for timestamps without fractional seconds —
+    /// older bridge versions, or any tooling that hand-wrote a
+    /// last_activity value. Cached at file scope so the fallback path
+    /// doesn't allocate a fresh formatter on every miss.
+    nonisolated private static let lastActivityPlainFormatter = ISO8601DateFormatter()
+
+    nonisolated static func lastActivityDate(_ s: SessionInfo) -> Date? {
+        guard !s.lastActivity.isEmpty else { return nil }
+        if let d = lastActivityFormatter.date(from: s.lastActivity) { return d }
+        return lastActivityPlainFormatter.date(from: s.lastActivity)
+    }
+
+    /// Bucket 0 = just-finished (idle within 2 min), 1 = working/waiting,
+    /// 2 = older idle (and unknown). Mirrors
+    /// `SessionRegistry.attentionBucket(for:now:)` on iOS so both UIs
+    /// order rows the same way.
+    ///
+    /// Unlike iOS (which uses an exhaustive `SessionStatus` enum), the
+    /// macOS path receives `status` as a raw String from the REST API.
+    /// We enumerate "idle" explicitly so an unknown status added later
+    /// on the bridge side (e.g. "crashed", "dead") falls through to a
+    /// documented default-bucket-2 outcome rather than silently being
+    /// treated as idle.
+    nonisolated static func attentionBucket(for s: SessionInfo, now: Date) -> Int {
+        switch s.status {
+        case "active", "waiting":
+            return 1
+        case "idle":
+            if let d = lastActivityDate(s),
+               now.timeIntervalSince(d) < justFinishedWindow {
+                return 0
+            }
+            return 2
+        default:
+            // Unknown status — sink to bottom. If this fires often the
+            // bridge has shipped a new status the UI hasn't learned yet.
+            return 2
+        }
+    }
+
     // MARK: - Auth Token
 
     static let authTokenPath = NSHomeDirectory() + "/.voxherd/auth_token"
@@ -433,6 +501,36 @@ final class BridgeProcessManager {
             }
         } catch {
             logger.warning("No auth token at \(Self.authTokenPath): \(error)")
+        }
+    }
+
+    /// Push the current mute state to the running bridge so audio stops/resumes
+    /// without a restart. The persistent preference (`enableTTS`) is the source
+    /// of truth across launches; this just keeps the live process in sync.
+    func setTTSEnabled(_ enabled: Bool) async {
+        guard state == .running, let url = URL(string: "http://127.0.0.1:\(port)/api/tts/state") else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 5
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // CSRF: every POST/PUT/PATCH/DELETE to the bridge needs the X-VoxHerd
+        // header (see bridge/auth.py:107). Without it the bridge returns 403
+        // and the icon flips locally while audio keeps playing.
+        request.setValue("1", forHTTPHeaderField: "X-VoxHerd")
+        if let token = authToken, !token.isEmpty {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["enabled": enabled])
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+                logger.warning("Bridge rejected TTS state update (HTTP \(code))")
+                return
+            }
+            lastEnableTTS = enabled
+        } catch {
+            logger.warning("Failed to push TTS state to bridge: \(error)")
         }
     }
 

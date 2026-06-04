@@ -17,8 +17,19 @@ from bridge.env_utils import get_subprocess_env
 
 log = logging.getLogger(__name__)
 
-# Preferred voices in priority order.  The first one found on the system wins.
-# Premium > Enhanced > default quality.  Names must match ``say -v '?'`` output.
+# Sentinel voice meaning "let ``say`` use the macOS system default voice"
+# (omit ``-v`` entirely). This is the ONLY way to reach the natural Siri
+# voices ("Voice 1/2/3"), which are not enumerated by ``say -v '?'`` and
+# cannot be selected with ``-v``. It is also a better fallback than forcing
+# ``Samantha``, since the user's configured default is usually nicer.
+SYSTEM_DEFAULT_VOICE = "system"
+
+# Named high-quality favorites, in priority order. The first one installed
+# wins. Deliberately contains ONLY premium/enhanced neural voices — no plain
+# compact voices (Samantha/Karen/Daniel). If none of these (and no other
+# premium/enhanced voice) is installed, detection falls through to the macOS
+# system default (see ``SYSTEM_DEFAULT_VOICE``) rather than forcing the old
+# robotic Samantha compact voice.
 _PREFERRED_VOICES: list[str] = [
     # Premium neural voices (macOS 14+, must be downloaded)
     "Zoe (Premium)",
@@ -30,18 +41,27 @@ _PREFERRED_VOICES: list[str] = [
     "Zoe (Enhanced)",
     "Evan (Enhanced)",
     "Ava (Enhanced)",
-    # Decent defaults (always present)
-    "Samantha",
-    "Karen",
-    "Daniel",
 ]
 
 
 def detect_best_voice() -> str:
     """Return the highest-quality English voice installed on this Mac.
 
-    Parses ``say -v '?'`` output and matches against ``_PREFERRED_VOICES``.
-    Falls back to ``Samantha`` if nothing better is found.
+    Selection order:
+      1. A named favorite from ``_PREFERRED_VOICES`` (exact match).
+      2. *Any* installed English ``(Premium)`` neural voice — so whichever
+         premium voice the user downloads via System Settings is picked up
+         automatically, even if it isn't on the favorites list.
+      3. *Any* installed English ``(Enhanced)`` voice.
+      4. ``SYSTEM_DEFAULT_VOICE`` — fall through to the macOS system default
+         (omit ``-v``). This is what the user actually hears from a bare
+         ``say`` and is usually a natural Siri voice, which beats forcing
+         the old ``Samantha`` compact voice.
+
+    Apple's premium/enhanced voices are an OS download (System Settings ->
+    Accessibility -> Spoken Content -> System Voice -> Manage Voices); they
+    cannot be bundled into the .app, so this picks the best of whatever the
+    machine has. en_US is preferred over other English locales.
     """
     try:
         result = subprocess.run(
@@ -50,19 +70,36 @@ def detect_best_voice() -> str:
             env=get_subprocess_env(),
         )
         if result.returncode != 0:
-            return "Samantha"
+            return SYSTEM_DEFAULT_VOICE
         # Each line: "VoiceName            lang    # greeting"
-        installed: set[str] = set()
+        voices: list[tuple[str, str]] = []  # (name, lang)
         for line in result.stdout.splitlines():
-            name = line.split("#")[0].rsplit(None, 1)[0].strip() if "#" in line else line.strip()
-            if name:
-                installed.add(name)
+            left = line.split("#", 1)[0]
+            parts = left.rsplit(None, 1)
+            if len(parts) != 2:
+                continue
+            name, lang = parts[0].strip(), parts[1].strip()
+            if name and lang.startswith("en"):
+                voices.append((name, lang))
+
+        installed = {name for name, _ in voices}
+
+        # 1. Named favorites win outright.
         for voice in _PREFERRED_VOICES:
             if voice in installed:
                 return voice
+
+        # 2/3. Any premium, then any enhanced — en_US ahead of other locales.
+        def _english_sort(item: tuple[str, str]) -> int:
+            return 0 if item[1] == "en_US" else 1
+
+        for tier in ("(Premium)", "(Enhanced)"):
+            matches = sorted((v for v in voices if tier in v[0]), key=_english_sort)
+            if matches:
+                return matches[0][0]
     except Exception:
         pass
-    return "Samantha"
+    return SYSTEM_DEFAULT_VOICE
 
 
 @dataclass
@@ -98,7 +135,10 @@ class MacTTS:
     def __init__(self, voice: str = "auto", rate: int = 190) -> None:
         if voice == "auto":
             voice = detect_best_voice()
-            log.info("Auto-detected TTS voice: %s", voice)
+            if voice == SYSTEM_DEFAULT_VOICE:
+                log.info("TTS voice: macOS system default (no premium voice installed)")
+            else:
+                log.info("Auto-detected TTS voice: %s", voice)
         self.voice = voice
         self.rate = rate
         self.enabled = True
@@ -182,6 +222,20 @@ class MacTTS:
             return text[:idx + 1] + " [[slnc 300]] " + text[idx + 2:]
         return text
 
+    def _build_say_args(self, text: str) -> list[str]:
+        """Build the ``say`` argv for *text*.
+
+        Omits ``-v`` for the system-default sentinel so ``say`` uses the
+        macOS configured voice (the only way to reach natural Siri voices,
+        which can't be passed via ``-v``). Otherwise passes the resolved
+        voice name explicitly.
+        """
+        args = ["say"]
+        if self.voice and self.voice != SYSTEM_DEFAULT_VOICE:
+            args += ["-v", self.voice]
+        args += ["-r", str(self.rate), text]
+        return args
+
     async def _worker(self) -> None:
         """Drain the queue sequentially so utterances don't overlap."""
         assert self._queue is not None  # start() created it before scheduling us
@@ -189,8 +243,9 @@ class MacTTS:
             item = await self._queue.get()
             try:
                 tts_text = self._insert_pause(item.text)
+                say_args = self._build_say_args(tts_text)
                 proc = await asyncio.create_subprocess_exec(
-                    "say", "-v", self.voice, "-r", str(self.rate), tts_text,
+                    *say_args,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                     env=get_subprocess_env(),

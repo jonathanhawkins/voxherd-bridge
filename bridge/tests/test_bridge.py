@@ -352,6 +352,54 @@ async def test_notification_waiting_for_input_suppressed(client: httpx.AsyncClie
     assert session["status"] == "active"
 
 
+@pytest.mark.asyncio
+async def test_notification_waiting_for_input_does_not_broadcast(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: 'waiting for your input' must NOT reach iOS.
+
+    Earlier versions of routes.py suppressed the status update + TTS for
+    this idle-ping message but still fell through to broadcast the raw
+    agent_event. iOS then fired sendPermissionPrompt and a ghost approve/
+    deny card appeared on the glasses lens with no real pending decision.
+    Fix: routes.py returns early; this test pins that behavior.
+    """
+    await register_test_session(client, session_id="ghost-test-1", project="myproject")
+
+    captured: list[dict] = []
+
+    async def fake_broadcast(message: dict) -> None:
+        captured.append(message)
+
+    # Patch both the canonical location and the routes-module re-import
+    # so any code path that emits to iOS is captured.
+    monkeypatch.setattr("bridge.server_state.broadcast_to_ios", fake_broadcast)
+    monkeypatch.setattr("bridge.routes.broadcast_to_ios", fake_broadcast)
+
+    resp = await client.post(
+        "/api/events",
+        json={
+            "event": "notification",
+            "session_id": "ghost-test-1",
+            "project": "myproject",
+            "message": "Claude is waiting for your input",
+        },
+        headers=auth_headers(),
+    )
+    assert resp.status_code == 200
+
+    # No agent_event of type "notification" should have been broadcast to iOS.
+    notification_broadcasts = [
+        m for m in captured
+        if m.get("type") == "agent_event" and m.get("event") == "notification"
+    ]
+    assert notification_broadcasts == [], (
+        "Suppressed 'waiting for your input' notification leaked to iOS broadcast "
+        f"({len(notification_broadcasts)} message(s)). This produces ghost "
+        f"approve/deny cards on the glasses lens. Captured: {notification_broadcasts}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Subagent Events
 # ---------------------------------------------------------------------------
@@ -719,6 +767,89 @@ async def test_tts_missing_text(client: httpx.AsyncClient) -> None:
     assert "error" in resp.json()
 
 
+@pytest.mark.asyncio
+async def test_tts_state_toggle_runtime(client: httpx.AsyncClient) -> None:
+    """GET /api/tts/state reports current flag; POST flips it at runtime."""
+    import bridge.server_state as _state
+    original = _state.mac_tts.enabled
+    try:
+        # Mute
+        resp = await client.post(
+            "/api/tts/state",
+            json={"enabled": False},
+            headers=auth_headers(),
+        )
+        assert resp.status_code == 200
+        assert resp.json()["enabled"] is False
+        assert _state.mac_tts.enabled is False
+
+        # GET reflects the mute
+        resp = await client.get("/api/tts/state", headers=auth_headers())
+        assert resp.status_code == 200
+        assert resp.json()["enabled"] is False
+
+        # Unmute
+        resp = await client.post(
+            "/api/tts/state",
+            json={"enabled": True},
+            headers=auth_headers(),
+        )
+        assert resp.json()["enabled"] is True
+        assert _state.mac_tts.enabled is True
+    finally:
+        _state.mac_tts.enabled = original
+
+
+@pytest.mark.asyncio
+async def test_tts_state_rejects_non_bool(client: httpx.AsyncClient) -> None:
+    """POST /api/tts/state with non-boolean field returns error."""
+    resp = await client.post(
+        "/api/tts/state",
+        json={"enabled": "yes"},
+        headers=auth_headers(),
+    )
+    assert resp.status_code == 200
+    assert "error" in resp.json()
+
+
+@pytest.mark.asyncio
+async def test_tts_state_rejects_missing_field(client: httpx.AsyncClient) -> None:
+    """POST /api/tts/state with no `enabled` key returns error and does not mutate state."""
+    import bridge.server_state as _state
+    original = _state.mac_tts.enabled
+    resp = await client.post(
+        "/api/tts/state",
+        json={},
+        headers=auth_headers(),
+    )
+    assert resp.status_code == 200
+    assert "error" in resp.json()
+    assert _state.mac_tts.enabled is original
+
+
+@pytest.mark.asyncio
+async def test_tts_state_rejects_null_field(client: httpx.AsyncClient) -> None:
+    """POST /api/tts/state with explicit null is rejected; isinstance(None, bool) is False."""
+    resp = await client.post(
+        "/api/tts/state",
+        json={"enabled": None},
+        headers=auth_headers(),
+    )
+    assert resp.status_code == 200
+    assert "error" in resp.json()
+
+
+@pytest.mark.asyncio
+async def test_tts_state_rejects_missing_csrf_header(client: httpx.AsyncClient) -> None:
+    """POST /api/tts/state without X-VoxHerd is rejected by the CSRF middleware."""
+    resp = await client.post(
+        "/api/tts/state",
+        json={"enabled": False},
+        headers={"Authorization": auth_headers()["Authorization"]},  # no X-VoxHerd
+    )
+    assert resp.status_code == 403
+
+
 # ---------------------------------------------------------------------------
 # Session Lifecycle Integration
 # ---------------------------------------------------------------------------
@@ -830,7 +961,25 @@ async def test_connection_info(client: httpx.AsyncClient) -> None:
         data = resp.json()
         assert "local" in data
         assert data["local"].startswith("ws://")
+        # Regression: the URL must never contain a doubled ".local.local",
+        # which does not resolve and strands the iOS app on reconnect.
+        assert ".local.local" not in data["local"]
         assert data["tailscale"] is None
+
+
+def test_mdns_hostname_strips_double_local() -> None:
+    """mDNS hostname normalization yields exactly one trailing .local."""
+    from bridge.routes import mdns_hostname
+
+    # macOS gethostname() already returns the .local FQDN — must not double up.
+    assert mdns_hostname("Jonathans-MacBook-Pro.local") == "Jonathans-MacBook-Pro.local"
+    # Bare hostname gets exactly one .local appended.
+    assert mdns_hostname("macbook") == "macbook.local"
+    # Already-doubled / trailing-dot / case variants all collapse to one.
+    assert mdns_hostname("host.local.local") == "host.local"
+    assert mdns_hostname("host.local.") == "host.local"
+    assert mdns_hostname("Host.LOCAL") == "Host.local"
+    assert mdns_hostname("  spaced.local  ") == "spaced.local"
 
 
 @pytest.mark.asyncio

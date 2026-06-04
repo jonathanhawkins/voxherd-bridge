@@ -184,12 +184,39 @@ async def send_signed(ws: WebSocket, msg: dict) -> None:
 
 
 def _state_sync_msg() -> dict:
-    """Build a state_sync message including active_project."""
+    """Build a state_sync message including active_project.
+
+    ``active_choice_sessions`` / ``active_form_sessions`` carry the
+    AUTHORITATIVE set of sessions that have a live numbered-choice prompt or
+    multi-question form on their Mac terminal right now (the keys of the
+    activity poll's decision trackers). iOS prunes any choice/form lens card
+    whose session is absent from these sets, which self-heals a card stranded
+    when the one-shot ``choice_prompt_cancelled`` / ``question_form_cancelled``
+    broadcast was missed during a disconnect — e.g. the app was backgrounded
+    (WebSocket torn down) while the user resolved the menu directly on the
+    computer, then reconnected when the glasses went on and the stale options
+    were still showing. This mirrors the ``pruneStalePermissions`` contract
+    for the binary approve/deny card; the complementary rising-edge replay of
+    ACTIVE decisions lives in ws_handler._connect_replay_decision_messages.
+    """
+    # Lazy import: ``activity`` imports from ``server_state``, so importing it
+    # at module load would be circular. By the time this runs at request time
+    # both modules are fully loaded. Fail open to empty sets so a state_sync
+    # is never blocked by a tracker hiccup.
+    try:
+        from bridge import activity
+        active_choice_sessions = list(activity._LAST_CHOICE_FOR_SESSION.keys())
+        active_form_sessions = list(activity._LAST_FORM_FOR_SESSION.keys())
+    except Exception:
+        active_choice_sessions = []
+        active_form_sessions = []
     return {
         "type": "state_sync",
         "sessions": sessions.to_dict(),
         "active_project": sessions.active_project,
         "last_announced_session_id": sessions.last_announced_session_id,
+        "active_choice_sessions": active_choice_sessions,
+        "active_form_sessions": active_form_sessions,
     }
 
 

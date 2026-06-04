@@ -9,8 +9,9 @@
 #   5. Sign everything with Developer ID for distribution
 #
 # Usage:
-#   bash macos/build-app.sh              # Release build (Developer ID signed)
-#   bash macos/build-app.sh --debug      # Debug build (ad-hoc signed)
+#   bash macos/build-app.sh                       # Release build (Developer ID signed)
+#   bash macos/build-app.sh --debug               # Debug build (ad-hoc signed)
+#   bash macos/build-app.sh --debug --install     # Build, kill running app, replace /Applications copy, relaunch
 #
 # Output: macos/dist/VoxHerdBridge.app
 
@@ -20,16 +21,19 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 DERIVED_DATA="/tmp/vh-macos-build"
 APP_OUTPUT="$SCRIPT_DIR/dist/VoxHerdBridge.app"
+INSTALL_DEST="/Applications/VoxHerdBridge.app"
 ENTITLEMENTS="$SCRIPT_DIR/VoxHerdBridge/VoxHerdBridge.entitlements"
 # Set your own Developer ID signing identity here, or override via VOXHERD_SIGN_IDENTITY env var.
 # Example: "Developer ID Application: Your Name (YOUR_TEAM_ID)"
 SIGN_IDENTITY="${VOXHERD_SIGN_IDENTITY:-Developer ID Application}"
 DEBUG_MODE=false
+INSTALL_MODE=false
 
 # Parse args
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --debug) DEBUG_MODE=true; shift ;;
+        --install) INSTALL_MODE=true; shift ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -71,11 +75,23 @@ if $DEBUG_MODE; then
     CONFIGURATION="Debug"
 fi
 
+# In --debug mode we re-sign ad-hoc in Step 5, so disable Xcode's own signing
+# during the build itself. This avoids a "No 'Mac Development' signing certificate"
+# error when the dev environment only has an "Apple Development" cert configured.
+XCODE_SIGN_ARGS=()
+if $DEBUG_MODE; then
+    XCODE_SIGN_ARGS=(
+        CODE_SIGNING_REQUIRED=NO
+        CODE_SIGNING_ALLOWED=NO
+    )
+fi
+
 xcodebuild \
     -project "$SCRIPT_DIR/VoxHerdBridge/VoxHerdBridge.xcodeproj" \
     -scheme VoxHerdBridge \
     -configuration "$CONFIGURATION" \
     -derivedDataPath "$DERIVED_DATA" \
+    "${XCODE_SIGN_ARGS[@]}" \
     -quiet
 
 # Find the built app
@@ -114,7 +130,9 @@ echo "--- Step 5: Code signing ---"
 
 if [ "$SIGN_IDENTITY" = "-" ]; then
     echo "  Ad-hoc signing (debug mode)..."
-    codesign --force --deep --sign - "$APP_OUTPUT"
+    # Pass --entitlements so debug runs still get the mic / TCC entitlements
+    # declared in VoxHerdBridge.entitlements (needed for STT, wake word, etc).
+    codesign --force --deep --sign - --entitlements "$ENTITLEMENTS" "$APP_OUTPUT"
 else
     # Verify the signing identity exists
     if ! security find-identity -v -p codesigning | grep -q "$SIGN_IDENTITY"; then
@@ -185,12 +203,45 @@ echo "Output: $APP_OUTPUT"
 SIZE=$(du -sh "$APP_OUTPUT" | cut -f1)
 echo "Size: $SIZE"
 echo ""
+
+# Step 6: Install to /Applications and relaunch
+if $INSTALL_MODE; then
+    echo "--- Step 6: Installing to /Applications ---"
+
+    # Kill the running bridge (both the GUI wrapper and the spawned Python process).
+    # `killall` returns non-zero when no process matches; that's fine — we just want
+    # any running instances gone before we replace the bundle.
+    echo "  Stopping running VoxHerdBridge..."
+    killall VoxHerdBridge 2>/dev/null || true
+    killall voxherd-bridge 2>/dev/null || true
+    # Give launchd a moment to actually reap the process before we rm the bundle.
+    sleep 1
+
+    # Always rm -rf before cp -R: cp -R into an existing .app silently merges
+    # rather than replacing, leaving stale binaries that don't match the new
+    # build. (Documented in memory: feedback_macos_rebuild.md)
+    if [ -d "$INSTALL_DEST" ]; then
+        echo "  Removing old $INSTALL_DEST..."
+        rm -rf "$INSTALL_DEST"
+    fi
+
+    echo "  Copying new build to $INSTALL_DEST..."
+    cp -R "$APP_OUTPUT" "$INSTALL_DEST"
+
+    echo "  Launching $INSTALL_DEST..."
+    open "$INSTALL_DEST"
+    echo ""
+    echo "=== Installed and running ==="
+    exit 0
+fi
+
 if [ "$SIGN_IDENTITY" != "-" ]; then
     echo "Next steps:"
     echo "  1. Create DMG:  bash macos/create-dmg.sh"
     echo "  2. Notarize:    bash macos/notarize.sh macos/dist/VoxHerdBridge-X.Y.Z.dmg"
     echo "  3. Or all-in-one: bash scripts/release-macos.sh"
 else
-    echo "To install: cp -R $APP_OUTPUT /Applications/"
-    echo "To test: open $APP_OUTPUT"
+    echo "To install + relaunch: bash macos/build-app.sh --debug --install"
+    echo "Or manually:           cp -R $APP_OUTPUT /Applications/"
+    echo "To test in place:      open $APP_OUTPUT"
 fi

@@ -97,6 +97,11 @@ async def auth_middleware(request: Request, call_next):
     # Health check is unauthenticated for monitoring/quick-test
     if request.url.path == "/health":
         return await call_next(request)
+    # Brand assets: must be publicly fetchable because Meta's DAT SDK
+    # image loader on the lens has no way to attach a bearer token. The
+    # PNGs are static, non-sensitive mascot art.
+    if request.url.path.startswith("/api/assets/"):
+        return await call_next(request)
     if not _check_auth(request):
         client_host = request.client.host if request.client else "unknown"
         log_event("warning", "bridge", f"Auth rejected: {client_host} {request.method} {request.url.path}")

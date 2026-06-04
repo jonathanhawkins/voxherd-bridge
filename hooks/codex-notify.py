@@ -215,6 +215,10 @@ timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 # Prefix with "codex-" to avoid collision with Claude session IDs.
 session_id = f"codex-{thread_id}" if thread_id else f"codex-{project_name}-{int(time.time())}"
 
+# VOXHERD_QUIET: mark this worker silent so the bridge skips narration
+# (matches on-stop.py / on-stop.sh). Accepts 1/true/yes/on (case-insensitive).
+quiet = os.environ.get("VOXHERD_QUIET", "").strip().lower() in ("1", "true", "yes", "on")
+
 payload = json.dumps({
     "event": "stop",
     "session_id": session_id,
@@ -225,6 +229,7 @@ payload = json.dumps({
     "stop_reason": "end_turn",
     "timestamp": timestamp,
     "tmux_target": tmux_target,
+    "skip_tts": quiet,
 })
 
 # Read auth token

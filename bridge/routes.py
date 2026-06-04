@@ -13,6 +13,9 @@ import re
 import socket
 
 from fastapi import APIRouter, Request
+from fastapi.responses import Response
+
+from bridge.brand_assets import CLAUDE_PIG_PNG
 
 from bridge.server_state import (
     sessions, ios_connections, broadcast_to_ios, _state_sync_msg,
@@ -55,6 +58,19 @@ def _is_loopback_client(request: Request) -> bool:
 async def health_check() -> dict:
     """Unauthenticated health probe. Returns basic server status."""
     return {"ok": True, "service": "voxherd-bridge"}
+
+
+@router.get("/api/assets/claude-pig.png")
+async def claude_pig_png() -> Response:
+    """Orange Claude mascot PNG for the lens splash.
+
+    The Meta DAT SDK's `Image(uri:)` only accepts HTTP(S) URLs (file://
+    and data: are not supported), and its Text widget can't render
+    arbitrary colors. So the iOS app fetches this rasterized version of
+    the ASCII pig and ships it to the lens via the SDK's image path —
+    the only route that actually paints color on the Display.
+    """
+    return Response(content=CLAUDE_PIG_PNG, media_type="image/png")
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +155,13 @@ async def receive_event(request: Request, event: dict) -> dict:
         stop_reason = event.get("stop_reason", "end_turn")
         skip_tts = event.get("skip_tts", False)
         session = sessions.get_session(session_id)
+        # VOXHERD_QUIET: never speak for a quiet worker even if its hook didn't
+        # send skip_tts (codex-notify historically didn't). Also stamp the flag
+        # onto the broadcast event so the lens summary card takes the silent-
+        # dismiss path instead of waiting on narration audio that never comes.
+        if session and session.quiet:
+            skip_tts = True
+            event["skip_tts"] = True
         # Map stop reason to activity type
         if stop_reason == "error":
             idle_activity = "errored"
@@ -166,9 +189,10 @@ async def receive_event(request: Request, event: dict) -> dict:
             session._pending_dispatch_count -= 1
             should_listen = False
 
-        # Skip TTS if the project has its own Stop hook (avoids double speech)
+        # Skip TTS for a quiet worker or when the project has its own Stop hook
+        # (the hook sets skip_tts to avoid double speech).
         if skip_tts:
-            log_event("info", project, "TTS skipped: project has own stop hook")
+            log_event("info", project, "TTS skipped for this stop (quiet / own stop hook)")
         elif _state.narration:
             # Delegate TTS to narration engine (handles batching/cooldowns)
             await _state.narration.on_stop(
@@ -190,15 +214,25 @@ async def receive_event(request: Request, event: dict) -> dict:
     elif event_type == "notification":
         message = event.get("message", "Needs attention.")
         # Skip "waiting for input" notifications — that's just Claude Code
-        # saying it's idle, which is noise in voice mode.
+        # saying it's idle, which is noise in voice mode. We MUST also bail
+        # out before the broadcast at the bottom of this function — otherwise
+        # iOS receives the agent_event, fires sendPermissionPrompt, and the
+        # user sees a ghost approve/deny card on the glasses lens with no
+        # real pending permission. (Previously we only suppressed the status
+        # update and TTS, but still broadcast the raw event.)
         if "waiting for your input" in message.lower():
             log_event("info", project, f"Notification (suppressed): {message}")
+            return {"ok": True}
         else:
             sessions.update_status(session_id, "waiting", activity_type="approval")
             sessions.set_last_announced(project, session_id=session_id)
             log_event("info", project, f"Notification: {message}")
-            if _state.narration:
-                updated = sessions.get_session(session_id)
+            updated = sessions.get_session(session_id)
+            # VOXHERD_QUIET: still surface the approval card on the lens (via the
+            # agent_event broadcast below) — just don't speak the request.
+            if updated and updated.quiet:
+                log_event("info", project, "Approval narration skipped (quiet session)")
+            elif _state.narration:
                 await _state.narration.on_notification(
                     project=project, session_id=session_id, message=message,
                     agent_number=updated.agent_number if updated else 1,
@@ -262,6 +296,12 @@ async def receive_event(request: Request, event: dict) -> dict:
         enriched["sub_agent_count"] = updated_session.sub_agent_count
         enriched["last_summary"] = updated_session.last_summary
         enriched["assistant"] = updated_session.assistant
+        # Include the activity poller's recent non-chrome capture so the
+        # iOS permission card can show "what was Claude doing" context
+        # next to the Approve/Deny buttons — without this the lens just
+        # shows "Claude needs your permission" with no detail, and the
+        # user has to open the phone terminal to know what to decide.
+        enriched["terminal_preview"] = updated_session.terminal_preview
     await broadcast_to_ios(enriched)
     return {"ok": True}
 
@@ -304,12 +344,18 @@ async def register_session(request: Request, body: dict) -> dict:
     if tmux_err:
         return {"error": tmux_err}
 
+    # VOXHERD_QUIET worker: the SessionStart hook sends `quiet:true`. Honor it
+    # (the field was previously dropped on the floor — stored on Session but
+    # never read from the register payload). `is True` so a stray string can't
+    # accidentally enable it.
+    quiet = body.get("quiet") is True
     session, removed_ids = sessions.register_session(
         session_id,
         project,
         project_dir,
         tmux_target=tmux_target,
         assistant=assistant,
+        quiet=quiet,
     )
 
     # Auto-switch active project to the newly registered session
@@ -321,7 +367,10 @@ async def register_session(request: Request, body: dict) -> dict:
     reg_msg["agent_number"] = session.agent_number
     await broadcast_to_ios(reg_msg)
     log_event("success", project, f"Session registered: {session_id}")
-    mac_tts.speak(f"{project} registered.", project=project, session_id=session_id)
+    # Quiet workers are visible on the dashboard/lens but never spoken for —
+    # skip the "registered" announcement (else a swarm barks it N times).
+    if not session.quiet:
+        mac_tts.speak(f"{project} registered.", project=project, session_id=session_id)
     return {"ok": True}
 
 
@@ -418,11 +467,25 @@ async def scan_ports() -> dict:
     return {"ports": active}
 
 
+def mdns_hostname(raw_hostname: str) -> str:
+    """Normalize a host name to a single-`.local` mDNS name.
+
+    `socket.gethostname()` may already return an mDNS FQDN ending in
+    ".local" (it does on macOS). Naively appending ".local" yields
+    "...local.local", which does NOT resolve and strands the iOS app on a
+    failed reconnect. Strip any trailing ".local" (case-insensitive) before
+    re-appending exactly one. Pure so it's unit-testable.
+    """
+    name = raw_hostname.strip().rstrip(".")
+    while name.lower().endswith(".local"):
+        name = name[: -len(".local")]
+    return f"{name}.local"
+
+
 @router.get("/api/connection-info")
 async def connection_info() -> dict:
     """Return local and Tailscale connection info for iOS auto-discovery."""
-    local_hostname = socket.gethostname()
-    local_url = f"ws://{local_hostname}.local:{server_port}/ws/ios"
+    local_url = f"ws://{mdns_hostname(socket.gethostname())}:{server_port}/ws/ios"
     ts = await asyncio.to_thread(detect_tailscale, server_port)
     return {
         "local": local_url,
@@ -593,6 +656,49 @@ async def tts_speak(body: dict) -> dict:
     return {"ok": True}
 
 
+@router.get("/api/tts/state")
+async def tts_state() -> dict:
+    """Report whether TTS is currently emitting audio.
+
+    ``available`` is False on platforms where the TTS backend cannot run
+    (missing /usr/bin/say, missing espeak-ng, etc). ``enabled`` is the
+    runtime mute flag — flips via POST /api/tts/state without restart.
+    """
+    return {"enabled": bool(mac_tts.enabled), "available": bool(mac_tts.available)}
+
+
+@router.post("/api/tts/state")
+async def set_tts_state(body: dict) -> dict:
+    """Toggle the TTS mute flag at runtime. Body: ``{"enabled": bool}``."""
+    if "enabled" not in body or not isinstance(body["enabled"], bool):
+        return {"error": "field 'enabled' must be a boolean"}
+    mac_tts.enabled = body["enabled"]
+    log_event("info", "bridge", f"TTS {'unmuted' if mac_tts.enabled else 'muted'}")
+    return {"enabled": bool(mac_tts.enabled), "available": bool(mac_tts.available)}
+
+
+def _extract_intent_json(text: str) -> dict | None:
+    """Pull the action JSON object out of the model's reply text, tolerating
+    code fences or stray prose around it. Returns None if nothing parses."""
+    text = text.strip()
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        pass
+    # Slice the outermost {...} and retry (handles ```json fences / prose).
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            obj = json.loads(text[start:end + 1])
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
 @router.post("/api/intent/parse")
 async def parse_intent(body: dict) -> dict:
     """Parse a voice transcription into a structured intent using Haiku.
@@ -636,7 +742,26 @@ async def parse_intent(body: dict) -> dict:
             env=get_subprocess_env(),
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-        result = json.loads(stdout.decode().strip())
+        envelope = json.loads(stdout.decode().strip())
+        # `claude --output-format json` wraps the reply in a result envelope:
+        # {"type":"result","is_error":false,"result":"<model text>",...}. The
+        # action JSON lives as a STRING inside "result" — unwrap and parse it.
+        # A bare object (no envelope, has "action") is passed through so direct
+        # callers / future formats keep working.
+        if isinstance(envelope, dict) and "result" in envelope and "action" not in envelope:
+            if envelope.get("is_error"):
+                log_event("error", "bridge", "Intent parsing: assistant reported is_error")
+                return {"error": "Intent parsing failed"}
+            inner = envelope.get("result")
+            result = _extract_intent_json(inner) if isinstance(inner, str) else (
+                inner if isinstance(inner, dict) else None)
+        elif isinstance(envelope, dict):
+            result = envelope
+        else:
+            result = None
+        if not isinstance(result, dict) or "action" not in result:
+            log_event("error", "bridge", "Intent parsing: no action in assistant reply")
+            return {"error": "Intent parsing failed"}
         log_event("info", "bridge", f"Intent parsed: {result.get('action', 'unknown')}")
         return result
     except asyncio.TimeoutError:

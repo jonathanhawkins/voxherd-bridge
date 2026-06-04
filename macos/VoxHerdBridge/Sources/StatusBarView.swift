@@ -229,6 +229,8 @@ struct StatusBarView: View {
 
             Spacer()
 
+            muteButton
+
             Button {
                 SettingsWindowController.shared.open(preferences: preferences, processManager: processManager)
             } label: {
@@ -242,6 +244,19 @@ struct StatusBarView: View {
             }
             .controlSize(.small)
         }
+    }
+
+    private var muteButton: some View {
+        Button {
+            let newValue = !preferences.enableTTS
+            preferences.enableTTS = newValue
+            Task { await processManager.setTTSEnabled(newValue) }
+        } label: {
+            Image(systemName: preferences.enableTTS ? "speaker.wave.2.fill" : "speaker.slash.fill")
+                .foregroundStyle(preferences.enableTTS ? Color.primary : Color.red)
+        }
+        .controlSize(.small)
+        .help(preferences.enableTTS ? "Mute announcements" : "Unmute announcements")
     }
 }
 

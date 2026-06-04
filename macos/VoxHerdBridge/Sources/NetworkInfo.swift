@@ -61,4 +61,17 @@ enum NetworkInfo {
         // 100.64.0.0/10 means first octet is 100, second octet 64-127
         return parts[0] == 100 && (parts[1] & 0xC0) == 64
     }
+
+    /// Detect whether Tailscale is installed on this Mac. Checks the App Store /
+    /// dmg location plus the Homebrew CLI path. We don't require it to be running —
+    /// the onboarding step just wants to know whether the user already has it.
+    static func isTailscaleInstalled() -> Bool {
+        let candidates = [
+            "/Applications/Tailscale.app",
+            "/opt/homebrew/bin/tailscale",
+            "/usr/local/bin/tailscale",
+        ]
+        let fm = FileManager.default
+        return candidates.contains { fm.fileExists(atPath: $0) }
+    }
 }

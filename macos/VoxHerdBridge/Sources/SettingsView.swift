@@ -6,29 +6,34 @@ struct SettingsView: View {
     @State private var hookInstallStatus: String?
     @State private var tokenCopied = false
     @State private var showToken = false
-    @State private var showQRCode = false
-    @State private var qrAutoHideTask: Task<Void, Never>?
+    @State private var showLargeQR = false
+
+    // Walk-Around Mode is owned by a shared controller so the toggle, the menu
+    // bar icon, and app termination all agree on one source of truth (the real
+    // `pmset disablesleep` flag) and the safety auto-off survives this window
+    // closing.
+    private let walkAround = WalkAroundController.shared
 
     var body: some View {
         Form {
             bridgeServerSection
-            authTokenSection
+            pairingSection
             voiceFeaturesSection
+            walkAroundSection
             systemSection
             aboutSection
         }
         .formStyle(.grouped)
-        .frame(minWidth: 400, idealWidth: 420, minHeight: 600, idealHeight: 800)
+        .frame(minWidth: 420, idealWidth: 440, minHeight: 660, idealHeight: 800)
     }
 
     private var bridgeServerSection: some View {
         Section("Bridge Server") {
-            HStack {
-                Text("Port")
-                Spacer()
-                TextField("Port", value: $preferences.bridgePort, format: .number)
+            LabeledContent("Port") {
+                TextField("", value: $preferences.bridgePort, format: .number.grouping(.never))
                     .frame(width: 80)
                     .textFieldStyle(.roundedBorder)
+                    .multilineTextAlignment(.trailing)
             }
             Text("Valid range: 1024–65535")
                 .font(.caption2)
@@ -37,88 +42,83 @@ struct SettingsView: View {
     }
 
     @ViewBuilder
-    private var authTokenSection: some View {
-        Section("Auth Token") {
+    private var pairingSection: some View {
+        Section("Pair iPhone") {
             if let token = processManager?.authToken, !token.isEmpty {
-                tokenDisplay(token: token)
-                tokenActions(token: token)
-                qrCodeSection(token: token)
+                pairingContent(token: token)
             } else {
-                Text("Token will appear after bridge starts")
-                    .font(.caption2)
+                Label("Token will appear after bridge starts", systemImage: "hourglass")
+                    .font(.caption)
                     .foregroundStyle(.secondary)
+                    .padding(.vertical, 4)
             }
         }
     }
 
-    private func tokenDisplay(token: String) -> some View {
-        HStack {
-            if showToken {
-                Text(token)
-                    .font(.system(.caption, design: .monospaced))
-                    .textSelection(.enabled)
-                    .lineLimit(1)
-            } else {
-                Text(String(token.prefix(8)) + "..." + String(token.suffix(4)))
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            Button(showToken ? "Hide" : "Reveal") {
-                showToken.toggle()
-            }
-            .buttonStyle(.borderless)
-            .font(.caption)
-        }
-    }
+    private func pairingContent(token: String) -> some View {
+        let payload = pairingPayload(token: token)
 
-    private func tokenActions(token: String) -> some View {
-        VStack(alignment: .leading) {
-            HStack {
-                Button("Copy Token") {
-                    if processManager?.copyAuthTokenToClipboard() == true {
-                        tokenCopied = true
-                        Task {
-                            try? await Task.sleep(for: .seconds(2))
-                            tokenCopied = false
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 14) {
+                QRThumb(payload: payload, size: 96) { showLargeQR = true }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Scan with the iPhone Camera or the VoxHerd app.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    Button("Enlarge QR Code") { showLargeQR = true }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .popover(isPresented: $showLargeQR, arrowEdge: .leading) {
+                            LargeQRPopover(payload: payload)
                         }
+                }
+                Spacer(minLength: 0)
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Or paste the token manually")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                HStack(spacing: 8) {
+                    Text(showToken ? token : String(token.prefix(8)) + "…" + String(token.suffix(4)))
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                    Button(showToken ? "Hide" : "Reveal") { showToken.toggle() }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
+
+                    Button {
+                        if processManager?.copyAuthTokenToClipboard() == true {
+                            tokenCopied = true
+                            Task {
+                                try? await Task.sleep(for: .seconds(2))
+                                tokenCopied = false
+                            }
+                        }
+                    } label: {
+                        Label(tokenCopied ? "Copied" : "Copy", systemImage: tokenCopied ? "checkmark" : "doc.on.doc")
+                            .labelStyle(.titleAndIcon)
                     }
-                }
-                if tokenCopied {
-                    Text("Copied!")
-                        .font(.caption2)
-                        .foregroundStyle(.green)
-                }
-            }
-            Text("Paste this into the iOS app's Settings to connect securely.")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    @ViewBuilder
-    private func qrCodeSection(token: String) -> some View {
-        Divider()
-
-        Button(showQRCode ? "Hide QR Code" : "Show QR Code for iOS") {
-            showQRCode.toggle()
-            qrAutoHideTask?.cancel()
-            if showQRCode {
-                qrAutoHideTask = Task {
-                    try? await Task.sleep(for: .seconds(60))
-                    guard !Task.isCancelled else { return }
-                    showQRCode = false
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .tint(tokenCopied ? .green : .accentColor)
                 }
             }
         }
-        .buttonStyle(.borderless)
-
-        if showQRCode {
-            qrCodeImage(token: token)
-        }
+        .padding(.vertical, 4)
     }
 
-    private func qrCodeImage(token: String) -> some View {
+    private func pairingPayload(token: String) -> String {
         let host = NetworkInfo.primaryLANAddress() ?? "127.0.0.1"
         let port = processManager?.port ?? 7777
         var components = URLComponents()
@@ -132,62 +132,128 @@ struct SettingsView: View {
         if let ts = NetworkInfo.tailscaleAddress() {
             components.queryItems?.append(URLQueryItem(name: "tailscale", value: ts))
         }
-        let payload = components.string ?? "voxherd://connect"
-
-        return VStack {
-            if let qrImage = QRCodeGenerator.generate(from: payload, size: 200) {
-                Image(nsImage: qrImage)
-                    .interpolation(.none)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(width: 200, height: 200)
-                    .padding(.vertical, 8)
-            }
-
-            Text("Scan with VoxHerd iOS app or iPhone Camera")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-
-            Text("Auto-hides in 60 seconds")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-        }
+        return components.string ?? "voxherd://connect"
     }
 
     private var voiceFeaturesSection: some View {
-        Section("Voice Features") {
-            Toggle("Text-to-Speech (TTS)", isOn: $preferences.enableTTS)
-                .help("Announce events through Mac speakers")
-            Toggle("Speech-to-Text (STT)", isOn: $preferences.enableSTT)
-                .help("Listen for voice commands after announcements")
-            Toggle("Wake Word Detection", isOn: $preferences.enableWakeWord)
-                .help("Always-on microphone listening for 'Hey Claude'")
+        Section {
+            voiceToggle(
+                title: "Text-to-Speech",
+                subtitle: "Announce agent results through your Mac speakers",
+                isOn: Binding(
+                    get: { preferences.enableTTS },
+                    set: { newValue in
+                        preferences.enableTTS = newValue
+                        if let pm = processManager {
+                            Task { await pm.setTTSEnabled(newValue) }
+                        }
+                    }
+                )
+            )
+            voiceToggle(
+                title: "Speech-to-Text",
+                subtitle: "Listen for voice commands after announcements",
+                isOn: $preferences.enableSTT
+            )
+            voiceToggle(
+                title: "Wake Word",
+                subtitle: "Always-on listening for \"Hey Claude\"",
+                isOn: $preferences.enableWakeWord
+            )
+
+            Label {
+                Text("Silence a single agent: start it with `VOXHERD_QUIET=1` set (e.g. `VOXHERD_QUIET=1 claude`). It still shows on the dashboard and glasses but never speaks — handy when several agents are running at once.")
+            } icon: {
+                Image(systemName: "speaker.slash")
+            }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+        } header: {
+            Text("Voice Features")
         }
+    }
+
+    private func voiceToggle(title: String, subtitle: String, isOn: Binding<Bool>) -> some View {
+        Toggle(isOn: isOn) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                Text(subtitle)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var walkAroundSection: some View {
+        Section {
+            Toggle(isOn: Binding(
+                get: { walkAround.isActive },
+                set: { newValue in Task { await walkAround.setEnabled(newValue) } }
+            )) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Keep Mac awake with lid closed")
+                    Text("Stream to your glasses while you walk. Asks for your password the first time.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .disabled(walkAround.inFlight)
+
+            Text("Turns itself off when you quit VoxHerd or after 2 hours. Closing the lid limits airflow — don't run heavy tasks for long stretches.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            if let errorMessage = walkAround.lastError {
+                Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+        } header: {
+            Label("Walk-Around Mode", systemImage: "figure.walk.motion")
+        }
+        .task { await walkAround.refreshFromSystem() }
     }
 
     private var systemSection: some View {
         Section("System") {
             Toggle("Launch at Login", isOn: $preferences.launchAtLogin)
 
-            HStack {
-                Button("Install Hooks") {
-                    installHooks()
-                }
-                .help("Copy Claude Code hook scripts to ~/.voxherd/hooks/")
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 10) {
+                    Button("Install Hooks") { installHooks() }
+                        .help("Copy Claude Code hook scripts to ~/.voxherd/hooks/")
 
-                if let status = hookInstallStatus {
-                    Text(status)
-                        .font(.caption2)
+                    if let status = hookInstallStatus {
+                        Label(
+                            status,
+                            systemImage: status.contains("Failed") ? "xmark.circle.fill" : "checkmark.circle.fill"
+                        )
+                        .font(.caption)
                         .foregroundStyle(status.contains("Failed") ? .red : .green)
+                    }
+
+                    Spacer()
+
+                    Button("Open Welcome…") {
+                        OnboardingWindowController.shared.open(
+                            preferences: preferences,
+                            processManager: processManager
+                        )
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Re-open the first-launch setup window")
                 }
 
-                Spacer()
-
-                Button("Open Logs Folder") {
-                    let logsPath = NSHomeDirectory() + "/.voxherd/logs"
-                    NSWorkspace.shared.open(URL(fileURLWithPath: logsPath))
-                }
+                Text("Hooks let Claude Code notify the bridge when agents finish.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
+
+            Button("Open Logs Folder") {
+                let logsPath = NSHomeDirectory() + "/.voxherd/logs"
+                NSWorkspace.shared.open(URL(fileURLWithPath: logsPath))
+            }
+            .buttonStyle(.borderless)
         }
     }
 
@@ -199,36 +265,68 @@ struct SettingsView: View {
 
     private func installHooks() {
         hookInstallStatus = nil
-
-        guard let resourcePath = Bundle.main.resourcePath else {
-            hookInstallStatus = "Failed: no bundle resources"
-            return
+        switch HookInstaller.install() {
+        case .installed:
+            hookInstallStatus = "Installed"
+        case .failed(let reason):
+            hookInstallStatus = "Failed: \(reason)"
         }
+    }
+}
 
-        // Resolve to canonical path to prevent symlink traversal
-        let rawPath = (resourcePath as NSString).appendingPathComponent("hooks/install.sh")
-        let canonicalPath = (rawPath as NSString).standardizingPath
+/// Thumbnail QR rendered alongside the pairing token. Tap-target for the
+/// enlarged popover so users can either click the image or the dedicated button.
+private struct QRThumb: View {
+    let payload: String
+    let size: CGFloat
+    var onTap: () -> Void
 
-        // Verify the resolved path is still inside the app bundle
-        guard canonicalPath.hasPrefix(resourcePath) else {
-            hookInstallStatus = "Failed: path outside bundle"
-            return
+    var body: some View {
+        Button(action: onTap) {
+            ZStack {
+                if let image = QRCodeGenerator.generate(from: payload, size: size) {
+                    Image(nsImage: image)
+                        .interpolation(.none)
+                        .resizable()
+                        .scaledToFit()
+                } else {
+                    Color.gray.opacity(0.2)
+                    Image(systemName: "qrcode")
+                        .font(.system(size: size * 0.4))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(width: size, height: size)
+            .background(Color.white)
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(Color(NSColor.separatorColor), lineWidth: 1)
+            )
         }
+        .buttonStyle(.plain)
+        .help("Click to enlarge")
+    }
+}
 
-        guard FileManager.default.isExecutableFile(atPath: canonicalPath) else {
-            hookInstallStatus = "Failed: install.sh not found in bundle"
-            return
-        }
+private struct LargeQRPopover: View {
+    let payload: String
 
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-        proc.arguments = [canonicalPath]
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-            hookInstallStatus = proc.terminationStatus == 0 ? "Installed" : "Failed (exit \(proc.terminationStatus))"
-        } catch {
-            hookInstallStatus = "Failed: \(error.localizedDescription)"
+    var body: some View {
+        VStack(spacing: 12) {
+            if let image = QRCodeGenerator.generate(from: payload, size: 320) {
+                Image(nsImage: image)
+                    .interpolation(.none)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 320, height: 320)
+                    .background(Color.white)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+            Text("Scan with the iPhone Camera or the VoxHerd iOS app.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
         }
+        .padding(20)
     }
 }

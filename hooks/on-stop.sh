@@ -27,6 +27,14 @@ PROJECT_DIR="$CWD"
 PROJECT_NAME=$(basename "$PROJECT_DIR")
 ASSISTANT=$(echo "${VOXHERD_HOOK_ASSISTANT:-claude}" | tr '[:upper:]' '[:lower:]')
 
+# VOXHERD_QUIET: this session never speaks. Skip the (slow, paid) Haiku
+# summary entirely and tell the bridge to stay silent via skip_tts. The
+# session still POSTs its stop event so it stays visible on the dashboard.
+QUIET=""
+case "$(printf '%s' "${VOXHERD_QUIET:-}" | tr '[:upper:]' '[:lower:]')" in
+  1|true|yes|on) QUIET=1 ;;
+esac
+
 # Ensure log directory exists
 LOG_DIR="$HOME/.voxherd/logs"
 mkdir -p "$LOG_DIR"
@@ -41,9 +49,11 @@ echo "  TRANSCRIPT_EXISTS=$([ -f "$TRANSCRIPT_PATH" ] && echo YES || echo NO)" >
 echo "  CLAUDE_PATH=$(which claude 2>/dev/null || echo NOT_FOUND)" >> "$DEBUG_LOG"
 echo "  ASSISTANT=$ASSISTANT" >> "$DEBUG_LOG"
 
-# Generate summary via Haiku
+# Generate summary via Haiku (skipped entirely for quiet sessions)
 SUMMARY=""
-if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
+if [ -n "$QUIET" ]; then
+  echo "  VOXHERD_QUIET set — skipping Haiku summary" >> "$DEBUG_LOG"
+elif [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
   echo "  Transcript exists, attempting Haiku summary..." >> "$DEBUG_LOG"
   echo "  Transcript tail (last 5 lines):" >> "$DEBUG_LOG"
   tail -5 "$TRANSCRIPT_PATH" >> "$DEBUG_LOG" 2>&1
@@ -89,7 +99,8 @@ PAYLOAD=$(jq -n \
   --arg stop_reason "$STOP_REASON" \
   --arg transcript_path "$TRANSCRIPT_PATH" \
   --arg timestamp "$TIMESTAMP" \
-  '{event: $event, session_id: $session_id, project: $project, project_dir: $project_dir, assistant: $assistant, summary: $summary, stop_reason: $stop_reason, transcript_path: $transcript_path, timestamp: $timestamp}'
+  --argjson skip_tts "$([ -n "$QUIET" ] && echo true || echo false)" \
+  '{event: $event, session_id: $session_id, project: $project, project_dir: $project_dir, assistant: $assistant, summary: $summary, stop_reason: $stop_reason, transcript_path: $transcript_path, timestamp: $timestamp, skip_tts: $skip_tts}'
 )
 
 # POST to bridge server

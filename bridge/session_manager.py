@@ -10,7 +10,8 @@ import asyncio
 import json
 import os
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from bridge.env_utils import get_subprocess_env
@@ -33,6 +34,7 @@ class Session:
     registered_at: str = ""
     last_activity: str = ""
     tmux_target: str | None = None  # e.g. "voxherd-dev:0.0" — dispatch via send-keys
+    quiet: bool = False  # VOXHERD_QUIET worker: never speak for this session (still visible on dashboard/lens)
     voice_dispatched: bool = False  # DEPRECATED: replaced by _pending_dispatch_count
     _pending_dispatch_count: int = 0  # number of in-flight voice dispatches; suppress listen until 0
     tmux_check_failures: int = 0  # consecutive tmux pane-check failures; remove after 3
@@ -48,6 +50,29 @@ class Session:
     # Hook-tracked sub-agents (SubagentStart/SubagentStop hooks)
     # Maps agent_id -> {agent_type, started_at}
     _live_subagents: dict[str, dict] | None = None
+    # ---- Lens-footer status state (transient; not persisted) -----------
+    # Ring buffer of recent stream-json events captured from the
+    # subprocess stdout of a ``claude --resume -p`` dispatch. The lens
+    # footer extractor walks these to derive a live status line.
+    # ``None`` until the first dispatch populates the buffer.
+    _stream_json_buffer: "deque[dict] | None" = field(default=None, repr=False)
+    # Reader task that pumps stream-json events into the buffer above.
+    # Strong reference kept here so the asyncio GC can't reap the task
+    # mid-stream. ``remove_session`` cancels it; on natural EOF the
+    # task self-terminates inside ``_consume_stream_json``.
+    _stream_json_task: "object | None" = field(default=None, repr=False)
+    # Last status dict broadcast over WebSocket for this session — used
+    # by the activity poll loop to suppress duplicate sends.
+    _last_broadcast_status: dict | None = field(default=None, repr=False)
+    # monotonic() timestamp when the session most recently transitioned
+    # to ``active``. Used by ``session_status.derive_status`` to compute
+    # the elapsed-seconds field that goes into the lens footer.
+    _activity_started_at: float | None = field(default=None, repr=False)
+    # Last context-window percent (0-100) successfully parsed from the
+    # pane chrome. Held so a frame that lacks a parseable gauge (width
+    # truncation, mid-redraw) reuses it instead of blanking the lens
+    # header chip. See ``session_status.sticky_context_percent``.
+    _last_context_pct: int | None = field(default=None, repr=False)
 
     @property
     def live_subagents(self) -> dict[str, dict]:
@@ -96,6 +121,7 @@ class Session:
             "registered_at": self.registered_at,
             "last_activity": self.last_activity,
             "tmux_target": self.tmux_target,
+            "quiet": self.quiet,
             "activity_snippet": self.activity_snippet,
             "terminal_preview": self.terminal_preview,
             "activity_type": self.activity_type,
@@ -144,6 +170,7 @@ class SessionManager:
                     registered_at=d.get("registered_at", ""),
                     last_activity=d.get("last_activity", ""),
                     tmux_target=tmux_target,
+                    quiet=bool(d.get("quiet", False)),
                     activity_type=d.get("activity_type", "sleeping"),
                     stop_reason=d.get("stop_reason", ""),
                     agent_number=d.get("agent_number", 1),
@@ -304,6 +331,7 @@ class SessionManager:
         *,
         tmux_target: str | None = None,
         assistant: str = "claude",
+        quiet: bool = False,
     ) -> tuple[Session, list[str]]:
         """Register a new session or re-register an existing one.
 
@@ -352,8 +380,13 @@ class SessionManager:
             registered_at=now,
             last_activity=now,
             tmux_target=tmux_target,
+            quiet=quiet,
             activity_type="registered",
             agent_number=agent_number,
+            # Registration is the first active edge — anchor the
+            # lens-footer elapsed clock here so footer counters start
+            # from 0 the moment the session shows up.
+            _activity_started_at=time.monotonic(),
         )
         self._sessions[session_id] = session
         self._save()
@@ -364,6 +397,7 @@ class SessionManager:
         session = self._sessions.get(session_id)
         if session is None:
             return None
+        prev_status = session.status
         session.status = status
         session.last_activity = datetime.now(timezone.utc).isoformat()
         if summary is not None:
@@ -372,8 +406,33 @@ class SessionManager:
             session.activity_type = activity_type
         if stop_reason is not None:
             session.stop_reason = stop_reason
+        # Lens footer: anchor "elapsed_s" to the latest idle→active edge
+        # so the footer counter resets every turn. Without this, a long-
+        # running session would show ever-growing elapsed time even
+        # between turns where Claude is sitting idle. Clear on going
+        # idle so the activity poll doesn't re-broadcast a fresh
+        # session_status every tick just because elapsed_s ticked up by
+        # one (idle sessions have no meaningful "started X seconds ago"
+        # anchor; that's a working-state concept).
+        if status == "active" and prev_status != "active":
+            session._activity_started_at = time.monotonic()
+        elif status == "idle":
+            session._activity_started_at = None
         if status == "idle":
             session.activity_snippet = ""
+            # Two idle paths converge here:
+            #   1. Activity poller auto-idle — caller passes no activity_type
+            #      kwarg. The prior "testing"/"building"/etc. label is now
+            #      stale; reset to "sleeping" so state_sync doesn't report
+            #      it. (Bug fixed 2026-05-19: previously the field kept its
+            #      stale label and iOS rendered "still testing" forever.)
+            #   2. Stop-hook idle — caller passes an explicit label like
+            #      "completed"/"errored"/"stopped" carrying semantic info
+            #      about how the turn ended. Don't clobber it.
+            # The `activity_type` parameter was already applied above (line
+            # ~371) when non-None, so we only need to handle the None case.
+            if activity_type is None:
+                session.activity_type = "sleeping"
             session.idle_since = time.monotonic()
             # Clear sub-agent tracking — if session was interrupted,
             # SubagentStop hooks may not have fired.
@@ -452,12 +511,23 @@ class SessionManager:
         return None
 
     def remove_session(self, session_id: str) -> bool:
-        """Remove a session. Returns True if it existed, False otherwise."""
-        if session_id in self._sessions:
-            del self._sessions[session_id]
-            self._save()
-            return True
-        return False
+        """Remove a session. Returns True if it existed, False otherwise.
+
+        Cancels the per-session stream-json reader task if one was
+        running so we don't leak a coroutine + subprocess pipe on a
+        session that's been pruned mid-dispatch.
+        """
+        session = self._sessions.pop(session_id, None)
+        if session is None:
+            return False
+        reader = getattr(session, "_stream_json_task", None)
+        if reader is not None and hasattr(reader, "cancel"):
+            try:
+                reader.cancel()
+            except Exception:
+                pass
+        self._save()
+        return True
 
     def to_dict(self) -> dict:
         """Serializable snapshot of all sessions, suitable for WebSocket state_sync."""

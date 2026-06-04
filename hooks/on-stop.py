@@ -197,6 +197,11 @@ transcript_path = hook_input.get("transcript_path", "")
 stop_reason = hook_input.get("stop_reason", "completed")
 assistant = str(os.environ.get("VOXHERD_HOOK_ASSISTANT", "claude")).strip().lower() or "claude"
 
+# VOXHERD_QUIET: this session never speaks. Skip the (slow, paid) AI summary
+# entirely and tell the bridge to stay silent via skip_tts. The stop event is
+# still POSTed so the session stays visible on the dashboard/lens.
+quiet = str(os.environ.get("VOXHERD_QUIET", "")).strip().lower() in ("1", "true", "yes", "on")
+
 project_dir = cwd
 project_name = os.path.basename(project_dir) if project_dir else "unknown"
 
@@ -207,7 +212,11 @@ log(f"  assistant={assistant}")
 log(f"  transcript_path={transcript_path}")
 log(f"  transcript_exists={os.path.isfile(transcript_path) if transcript_path else False}")
 
-if should_debounce():
+if quiet:
+    log("  VOXHERD_QUIET set — skipping summary generation")
+    # Still POST so the bridge gets the stop event (visible on dashboard).
+    summary = "Task completed."
+elif should_debounce():
     log("  Debounced — skipping summary generation")
     # Still POST with fallback summary so bridge gets the stop event
     summary = "Task completed."
@@ -964,9 +973,9 @@ elif os.environ.get("TMUX"):
 
 # Detect if the project has its own Stop hook — if so, skip bridge TTS
 # to avoid double speech (project hook handles its own announcements).
-skip_tts = _project_has_own_stop_hook(project_dir)
+skip_tts = quiet or _project_has_own_stop_hook(project_dir)
 if skip_tts:
-    log(f"  Project has own Stop hook — will set skip_tts=true")
+    log("  skip_tts=true (quiet session or project has own Stop hook)")
 
 payload = json.dumps({
     "event": "stop",

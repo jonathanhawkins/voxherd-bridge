@@ -22,6 +22,14 @@ ASSISTANT=$(echo "${VOXHERD_HOOK_ASSISTANT:-claude}" | tr '[:upper:]' '[:lower:]
 PROJECT_DIR="$CWD"
 PROJECT_NAME=$(basename "$PROJECT_DIR")
 
+# VOXHERD_QUIET: register this session as silent (visible on dashboard, never
+# spoken). Useful when running a swarm of worker agents so only the supervisor
+# talks. Accepts 1/true/yes/on (case-insensitive).
+QUIET_JSON=false
+case "$(printf '%s' "${VOXHERD_QUIET:-}" | tr '[:upper:]' '[:lower:]')" in
+  1|true|yes|on) QUIET_JSON=true ;;
+esac
+
 # Ensure log directory exists
 LOG_DIR="$HOME/.voxherd/logs"
 mkdir -p "$LOG_DIR"
@@ -48,6 +56,7 @@ PAYLOAD=$(jq -n \
   --arg status "active" \
   --arg ts "$TIMESTAMP" \
   --arg tmux "$TMUX_TARGET" \
+  --argjson quiet "$QUIET_JSON" \
   '{
     session_id: $sid,
     project: $project,
@@ -55,7 +64,8 @@ PAYLOAD=$(jq -n \
     assistant: $assistant,
     status: $status,
     timestamp: $ts,
-    tmux_target: (if $tmux != "" then $tmux else null end)
+    tmux_target: (if $tmux != "" then $tmux else null end),
+    quiet: $quiet
   }')
 
 # Ensure temp files are cleaned up even if the script is killed

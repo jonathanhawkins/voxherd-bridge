@@ -249,3 +249,49 @@ async def test_speak_invokes_subprocess_under_stripped_path(stripped_path):
             )
     finally:
         tts.stop()
+
+
+# ---------------------------------------------------------------------------
+# Voice selection — system default vs. forced -v (the "old computer" bug)
+# ---------------------------------------------------------------------------
+# Forcing `say -v Samantha` made announcements sound like an old robotic
+# computer, while a bare `say` used the user's nicer system default (a Siri
+# voice, unreachable via -v). When no premium/enhanced voice is installed,
+# detection must fall through to the system default and the worker must omit
+# -v so `say` uses the configured voice.
+
+
+def test_system_default_sentinel_omits_v_flag():
+    """voice == SYSTEM_DEFAULT_VOICE must drop -v so `say` uses the macOS
+    configured (Siri) voice — the only way to reach it."""
+    from bridge.mac_tts import MacTTS, SYSTEM_DEFAULT_VOICE
+
+    tts = MacTTS(voice=SYSTEM_DEFAULT_VOICE)
+    args = tts._build_say_args("hello world")
+    assert "-v" not in args, f"system default must not pass -v, got {args!r}"
+    assert args[0] == "say"
+    assert args[-1] == "hello world"
+
+
+def test_named_voice_passes_v_flag():
+    """An explicit premium voice name must be passed via -v."""
+    from bridge.mac_tts import MacTTS
+
+    tts = MacTTS(voice="Ava (Premium)")
+    args = tts._build_say_args("hello world")
+    assert "-v" in args and "Ava (Premium)" in args, (
+        f"named voice must be passed via -v, got {args!r}"
+    )
+
+
+def test_preferred_voices_contains_no_compact_fallback():
+    """The favorites list must not contain plain compact voices — otherwise
+    detection matches Samantha and never falls through to the (nicer) system
+    default. This is the regression that reintroduced the robotic voice."""
+    from bridge.mac_tts import _PREFERRED_VOICES
+
+    for name in _PREFERRED_VOICES:
+        assert "(Premium)" in name or "(Enhanced)" in name, (
+            f"{name!r} is a compact voice; favorites must be premium/enhanced "
+            "only so detection falls through to the system default"
+        )

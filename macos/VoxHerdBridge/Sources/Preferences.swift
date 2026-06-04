@@ -25,6 +25,9 @@ final class Preferences {
             updateLoginItem()
         }
     }
+    var hasCompletedOnboarding: Bool {
+        didSet { UserDefaults.standard.set(hasCompletedOnboarding, forKey: "hasCompletedOnboarding") }
+    }
 
     init() {
         let defaults = UserDefaults.standard
@@ -34,6 +37,7 @@ final class Preferences {
         self.enableSTT = defaults.object(forKey: "enableSTT") as? Bool ?? false
         self.enableWakeWord = defaults.object(forKey: "enableWakeWord") as? Bool ?? false
         self.launchAtLogin = defaults.object(forKey: "launchAtLogin") as? Bool ?? true
+        self.hasCompletedOnboarding = defaults.object(forKey: "hasCompletedOnboarding") as? Bool ?? false
 
         // Register login item on first launch (didSet doesn't fire from init)
         if self.launchAtLogin {

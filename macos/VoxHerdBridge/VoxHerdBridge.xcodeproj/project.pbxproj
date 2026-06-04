@@ -7,29 +7,52 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		03DD796E9172EF5CD198BAB7 /* PowerManagement.swift in Sources */ = {isa = PBXBuildFile; fileRef = F02923023440D1969CAA41B5 /* PowerManagement.swift */; };
 		11E2F97F4BA10E3B6970A52F /* NetworkInfo.swift in Sources */ = {isa = PBXBuildFile; fileRef = 68DADADA5C858D1984A7C8A1 /* NetworkInfo.swift */; };
 		196184F8F04F2C1A78075534 /* VoxHerdBridgeApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9968D8FE85F14E49FEC74864 /* VoxHerdBridgeApp.swift */; };
 		2890E0A5FCC0A75FE4FE7B7B /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B238C677328FFD3F9D6EE46A /* Assets.xcassets */; };
 		2B0F37DF5F16E48F5B10D15C /* LogView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 69EDA489DBA75DCDBFFA7611 /* LogView.swift */; };
 		31D9663D4F3673C30FB2048E /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = D61C35261E18403BAEF71F0A /* Models.swift */; };
 		6D703B613C78E936070803C8 /* BridgeProcessManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00C10905CFA2B995F881C37 /* BridgeProcessManager.swift */; };
+		6F8B1BB97826A9A5D1B85618 /* OnboardingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3314EE4DC4A11A8512B8A39C /* OnboardingView.swift */; };
+		781F657AC1A03714579A742F /* HookInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 04E4BBB8EE432587CC8731DF /* HookInstaller.swift */; };
 		8DE871AAE1B21993004E63C0 /* StatusBarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CC3AFBA53741B8E0A6D7829 /* StatusBarView.swift */; };
+		924A9CF1DB89ED25DCBEF012 /* WalkAroundController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 697470DB4A87E9B0B0F282CC /* WalkAroundController.swift */; };
 		ABFB8257B5E31178AD77395C /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A2F4AC295FF4C2DF5B34A97 /* SettingsView.swift */; };
+		BC42E5EDADF5FB97D9E38854 /* SessionSortTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 49BAA32B44504C296E374381 /* SessionSortTests.swift */; };
 		C35C848F851AB460492D2B56 /* Preferences.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC74DB2A71239D8C0FA3728F /* Preferences.swift */; };
+		EAC47CD264BF329F44EE62C3 /* PowerManagementTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C10B10B26B82C819602C6C3E /* PowerManagementTests.swift */; };
 		EB01F929F10E7D488DEC8870 /* QRCodeGenerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = F75D5541D7F990E5BE9DA197 /* QRCodeGenerator.swift */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		87A10DBD0E306DE38D4D464B /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = FDFC8AF5F9532E924D12F29C /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = EACF11CA476BBC2BA1215741;
+			remoteInfo = VoxHerdBridge;
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
+		04E4BBB8EE432587CC8731DF /* HookInstaller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HookInstaller.swift; sourceTree = "<group>"; };
+		15A36E3F7A3A7F9A0C6798E8 /* VoxHerdBridgeTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = VoxHerdBridgeTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		3314EE4DC4A11A8512B8A39C /* OnboardingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingView.swift; sourceTree = "<group>"; };
+		49BAA32B44504C296E374381 /* SessionSortTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionSortTests.swift; sourceTree = "<group>"; };
 		4A2F4AC295FF4C2DF5B34A97 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		68DADADA5C858D1984A7C8A1 /* NetworkInfo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkInfo.swift; sourceTree = "<group>"; };
+		697470DB4A87E9B0B0F282CC /* WalkAroundController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalkAroundController.swift; sourceTree = "<group>"; };
 		69EDA489DBA75DCDBFFA7611 /* LogView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogView.swift; sourceTree = "<group>"; };
 		7CC3AFBA53741B8E0A6D7829 /* StatusBarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusBarView.swift; sourceTree = "<group>"; };
 		9968D8FE85F14E49FEC74864 /* VoxHerdBridgeApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoxHerdBridgeApp.swift; sourceTree = "<group>"; };
 		A0B8813F3C9C498A6F790693 /* VoxHerdBridge.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = VoxHerdBridge.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		AC74DB2A71239D8C0FA3728F /* Preferences.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Preferences.swift; sourceTree = "<group>"; };
 		B238C677328FFD3F9D6EE46A /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		C10B10B26B82C819602C6C3E /* PowerManagementTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PowerManagementTests.swift; sourceTree = "<group>"; };
 		D61C35261E18403BAEF71F0A /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
 		F00C10905CFA2B995F881C37 /* BridgeProcessManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeProcessManager.swift; sourceTree = "<group>"; };
+		F02923023440D1969CAA41B5 /* PowerManagement.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PowerManagement.swift; sourceTree = "<group>"; };
 		F75D5541D7F990E5BE9DA197 /* QRCodeGenerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QRCodeGenerator.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -38,6 +61,7 @@
 			isa = PBXGroup;
 			children = (
 				A0B8813F3C9C498A6F790693 /* VoxHerdBridge.app */,
+				15A36E3F7A3A7F9A0C6798E8 /* VoxHerdBridgeTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -46,8 +70,18 @@
 			isa = PBXGroup;
 			children = (
 				E1766725C8A7E37F631432AD /* Sources */,
+				695FDD0C00101210580247DE /* Tests */,
 				042DE9EF8210E0F45F9AD1D3 /* Products */,
 			);
+			sourceTree = "<group>";
+		};
+		695FDD0C00101210580247DE /* Tests */ = {
+			isa = PBXGroup;
+			children = (
+				C10B10B26B82C819602C6C3E /* PowerManagementTests.swift */,
+				49BAA32B44504C296E374381 /* SessionSortTests.swift */,
+			);
+			path = Tests;
 			sourceTree = "<group>";
 		};
 		E1766725C8A7E37F631432AD /* Sources */ = {
@@ -55,14 +89,18 @@
 			children = (
 				B238C677328FFD3F9D6EE46A /* Assets.xcassets */,
 				F00C10905CFA2B995F881C37 /* BridgeProcessManager.swift */,
+				04E4BBB8EE432587CC8731DF /* HookInstaller.swift */,
 				69EDA489DBA75DCDBFFA7611 /* LogView.swift */,
 				D61C35261E18403BAEF71F0A /* Models.swift */,
 				68DADADA5C858D1984A7C8A1 /* NetworkInfo.swift */,
+				3314EE4DC4A11A8512B8A39C /* OnboardingView.swift */,
+				F02923023440D1969CAA41B5 /* PowerManagement.swift */,
 				AC74DB2A71239D8C0FA3728F /* Preferences.swift */,
 				F75D5541D7F990E5BE9DA197 /* QRCodeGenerator.swift */,
 				4A2F4AC295FF4C2DF5B34A97 /* SettingsView.swift */,
 				7CC3AFBA53741B8E0A6D7829 /* StatusBarView.swift */,
 				9968D8FE85F14E49FEC74864 /* VoxHerdBridgeApp.swift */,
+				697470DB4A87E9B0B0F282CC /* WalkAroundController.swift */,
 			);
 			path = Sources;
 			sourceTree = "<group>";
@@ -70,6 +108,24 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		3FE3AAC967C46A53BF6F6E3B /* VoxHerdBridgeTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 2F676B0ADF60E7B7413FD86C /* Build configuration list for PBXNativeTarget "VoxHerdBridgeTests" */;
+			buildPhases = (
+				E6D49FFCF8DEC20E01AD5B98 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				0F50F6BF8B14E7C5BE3A704A /* PBXTargetDependency */,
+			);
+			name = VoxHerdBridgeTests;
+			packageProductDependencies = (
+			);
+			productName = VoxHerdBridgeTests;
+			productReference = 15A36E3F7A3A7F9A0C6798E8 /* VoxHerdBridgeTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 		EACF11CA476BBC2BA1215741 /* VoxHerdBridge */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = CF6FB9CC63D90B9B941F077B /* Build configuration list for PBXNativeTarget "VoxHerdBridge" */;
@@ -97,13 +153,15 @@
 				BuildIndependentTargetsInParallel = YES;
 				LastUpgradeCheck = 1600;
 				TargetAttributes = {
+					3FE3AAC967C46A53BF6F6E3B = {
+						DevelopmentTeam = "${DEVELOPMENT_TEAM}";
+					};
 					EACF11CA476BBC2BA1215741 = {
-						DevelopmentTeam = YOUR_TEAM_ID;
+						DevelopmentTeam = "${DEVELOPMENT_TEAM}";
 					};
 				};
 			};
 			buildConfigurationList = 353D361E1451D57E5A5F3595 /* Build configuration list for PBXProject "VoxHerdBridge" */;
-			compatibilityVersion = "Xcode 14.0";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
 			knownRegions = (
@@ -113,10 +171,12 @@
 			mainGroup = 62B3D8518389464D277E74D1;
 			minimizedProjectReferenceProxies = 1;
 			preferredProjectObjectVersion = 77;
+			productRefGroup = 042DE9EF8210E0F45F9AD1D3 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
 				EACF11CA476BBC2BA1215741 /* VoxHerdBridge */,
+				3FE3AAC967C46A53BF6F6E3B /* VoxHerdBridgeTests */,
 			);
 		};
 /* End PBXProject section */
@@ -138,18 +198,39 @@
 			buildActionMask = 2147483647;
 			files = (
 				6D703B613C78E936070803C8 /* BridgeProcessManager.swift in Sources */,
+				781F657AC1A03714579A742F /* HookInstaller.swift in Sources */,
 				2B0F37DF5F16E48F5B10D15C /* LogView.swift in Sources */,
 				31D9663D4F3673C30FB2048E /* Models.swift in Sources */,
 				11E2F97F4BA10E3B6970A52F /* NetworkInfo.swift in Sources */,
+				6F8B1BB97826A9A5D1B85618 /* OnboardingView.swift in Sources */,
+				03DD796E9172EF5CD198BAB7 /* PowerManagement.swift in Sources */,
 				C35C848F851AB460492D2B56 /* Preferences.swift in Sources */,
 				EB01F929F10E7D488DEC8870 /* QRCodeGenerator.swift in Sources */,
 				ABFB8257B5E31178AD77395C /* SettingsView.swift in Sources */,
 				8DE871AAE1B21993004E63C0 /* StatusBarView.swift in Sources */,
 				196184F8F04F2C1A78075534 /* VoxHerdBridgeApp.swift in Sources */,
+				924A9CF1DB89ED25DCBEF012 /* WalkAroundController.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		E6D49FFCF8DEC20E01AD5B98 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				EAC47CD264BF329F44EE62C3 /* PowerManagementTests.swift in Sources */,
+				BC42E5EDADF5FB97D9E38854 /* SessionSortTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		0F50F6BF8B14E7C5BE3A704A /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = EACF11CA476BBC2BA1215741 /* VoxHerdBridge */;
+			targetProxy = 87A10DBD0E306DE38D4D464B /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		5C596BD97AF946EFE2FC5E0C /* Debug */ = {
@@ -188,8 +269,9 @@
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
 				DEBUG_INFORMATION_FORMAT = dwarf;
-				DEVELOPMENT_TEAM = YOUR_TEAM_ID;
+				DEVELOPMENT_TEAM = "${DEVELOPMENT_TEAM}";
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
@@ -210,6 +292,7 @@
 				INFOPLIST_KEY_LSUIElement = YES;
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "VoxHerd needs microphone access for voice commands and speech-to-text.";
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = "0.1.0-dev";
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
@@ -257,8 +340,9 @@
 				CODE_SIGN_IDENTITY = "Developer ID Application";
 				CODE_SIGN_STYLE = Manual;
 				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
-				DEVELOPMENT_TEAM = YOUR_TEAM_ID;
+				DEVELOPMENT_TEAM = "${DEVELOPMENT_TEAM}";
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -273,6 +357,7 @@
 				INFOPLIST_KEY_LSUIElement = YES;
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "VoxHerd needs microphone access for voice commands and speech-to-text.";
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = "0.1.0-dev";
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -280,6 +365,23 @@
 				SWIFT_COMPILATION_MODE = wholemodule;
 				SWIFT_OPTIMIZATION_LEVEL = "-O";
 				SWIFT_VERSION = 5.9;
+			};
+			name = Release;
+		};
+		B824832249E1D60AD03BBFFB /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				COMBINE_HIDPI_IMAGES = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.voxherd.bridge.tests;
+				SDKROOT = macosx;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/VoxHerdBridge.app/Contents/MacOS/VoxHerdBridge";
 			};
 			name = Release;
 		};
@@ -317,9 +419,35 @@
 			};
 			name = Release;
 		};
+		F904EACDDBEB902C2ABC5F00 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				COMBINE_HIDPI_IMAGES = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.voxherd.bridge.tests;
+				SDKROOT = macosx;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/VoxHerdBridge.app/Contents/MacOS/VoxHerdBridge";
+			};
+			name = Debug;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		2F676B0ADF60E7B7413FD86C /* Build configuration list for PBXNativeTarget "VoxHerdBridgeTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F904EACDDBEB902C2ABC5F00 /* Debug */,
+				B824832249E1D60AD03BBFFB /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
 		353D361E1451D57E5A5F3595 /* Build configuration list for PBXProject "VoxHerdBridge" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (

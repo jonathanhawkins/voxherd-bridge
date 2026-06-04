@@ -209,3 +209,70 @@ class TestDispatchVsQueue:
 
         assert dispatched == "fix the bug"
         assert session.queued_command is None
+
+
+# ---------------------------------------------------------------------------
+# Regression: command_queued must not be double-broadcast
+# ---------------------------------------------------------------------------
+
+
+class TestCommandQueuedSingleBroadcast:
+    """Regression for the bug where 'Queued for X, will send when it's free'
+    was spoken twice on iOS when a command got queued.
+
+    Root cause: ``handle_voice_command`` emitted the ``command_queued`` event
+    via BOTH ``send_signed(websocket, ...)`` (direct to requester) AND
+    ``broadcast_to_ios(...)`` (broadcast to every connected iOS socket,
+    including the requester). With a single iOS client connected, both
+    paths landed the same event on the same socket → iOS fired the TTS
+    "Queued for X" twice.
+
+    Fix: removed the ``send_signed`` call; ``broadcast_to_ios`` already
+    covers the requester. This test pins single-broadcast so the fix
+    can't silently regress.
+    """
+
+    @pytest.mark.asyncio
+    async def test_command_queued_broadcast_once_not_twice(self, monkeypatch):
+        from bridge import ws_handler
+
+        active_session = _make_session(status="active", tmux_target="myproject:0.0")
+
+        # Force the "genuinely busy" branch of the queue-vs-dispatch
+        # decision by stubbing the tmux check to report not-idle.
+        async def fake_idle_check(_session):
+            return False
+
+        broadcasts: list[dict] = []
+        send_signed_calls: list[dict] = []
+
+        async def fake_broadcast(message: dict) -> None:
+            broadcasts.append(message)
+
+        async def fake_send_signed(_ws, message: dict) -> None:
+            send_signed_calls.append(message)
+
+        monkeypatch.setattr(ws_handler.sessions, "get_session_by_project",
+                            lambda *_args, **_kw: active_session)
+        monkeypatch.setattr(ws_handler, "_check_session_actually_idle", fake_idle_check)
+        monkeypatch.setattr(ws_handler, "broadcast_to_ios", fake_broadcast)
+        monkeypatch.setattr(ws_handler, "send_signed", fake_send_signed)
+        monkeypatch.setattr(ws_handler, "_check_dispatch_rate", lambda _sid: True)
+
+        await ws_handler.handle_voice_command(
+            {"project": "myproject", "message": "run the tests"},
+            websocket=MagicMock(),
+        )
+
+        queued_broadcasts = [m for m in broadcasts if m.get("type") == "command_queued"]
+        assert len(queued_broadcasts) == 1, (
+            f"command_queued must be broadcast exactly once. "
+            f"Got {len(queued_broadcasts)} broadcast(s): {queued_broadcasts}"
+        )
+
+        queued_direct = [m for m in send_signed_calls if m.get("type") == "command_queued"]
+        assert queued_direct == [], (
+            f"command_queued must NOT be sent via send_signed in addition to "
+            f"broadcast_to_ios — that path caused the duplicate-TTS bug. "
+            f"Direct sends: {queued_direct}"
+        )

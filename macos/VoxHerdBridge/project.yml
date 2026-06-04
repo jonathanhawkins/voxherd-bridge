@@ -13,6 +13,10 @@ settings:
     INFOPLIST_KEY_LSUIElement: true
     INFOPLIST_KEY_NSMicrophoneUsageDescription: "VoxHerd needs microphone access for voice commands and speech-to-text."
     ENABLE_HARDENED_RUNTIME: true
+    # Surfaced in Get Info / About panel so the running build is identifiable.
+    # The release workflow can override MARKETING_VERSION via -setbuildsetting.
+    MARKETING_VERSION: "0.1.0-dev"
+    CURRENT_PROJECT_VERSION: "1"
   configs:
     Debug:
       CODE_SIGN_IDENTITY: "Apple Development"
@@ -37,4 +41,18 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.voxherd.bridge
         INFOPLIST_KEY_CFBundleDisplayName: VoxHerd Bridge
+        GENERATE_INFOPLIST_FILE: true
+
+  VoxHerdBridgeTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests
+        excludes:
+          - "**/.DS_Store"
+    dependencies:
+      - target: VoxHerdBridge
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.voxherd.bridge.tests
         GENERATE_INFOPLIST_FILE: true

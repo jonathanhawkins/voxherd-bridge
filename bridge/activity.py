@@ -8,6 +8,7 @@ prune dead sessions, and discover pre-existing tmux sessions at startup.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 import secrets
 import time
@@ -15,6 +16,11 @@ import time
 from bridge.env_utils import get_subprocess_env
 from bridge import tmux_manager
 from bridge import sub_agent_monitor
+# session_status and choice_detector both import _has_idle_prompt /
+# _is_status_bar_line from THIS module, so eager top-level imports
+# would create a circular ImportError at boot. We import them lazily
+# inside _activity_poll_loop (which is the only consumer) — Python
+# caches the module after the first call, so cost is negligible.
 from bridge.server_state import (
     sessions, broadcast_to_ios, _state_sync_msg, log_event,
     _STICKY_ACTIVITY, _cancel_terminal_subs_for_session,
@@ -22,6 +28,169 @@ from bridge.server_state import (
 import bridge.server_state as _state
 from bridge.validation import _ANSI_RE, _load_projects
 from bridge.assistant import infer_assistant_from_process
+
+
+# Tracks the active numbered-choice prompt per session so the activity
+# poll only broadcasts ``choice_prompt`` on the rising edge (and
+# ``choice_prompt_cancelled`` on the falling edge). Sessions absent from
+# this dict have no live choice on screen. Value type is
+# ``choice_detector.ChoicePrompt`` (lazy import; see comment above).
+_LAST_CHOICE_FOR_SESSION: dict = {}
+
+# Consecutive-tick miss counter per session. The TUI prompt detector
+# can transiently miss (cursor blink overlapping the capture, ANSI
+# escape leaks, brief widget re-render) and a single-tick miss must
+# NOT cancel the lens choice card — the user would tap, the bridge
+# would broadcast cancellation between the tap arriving and iOS
+# rendering the next focus state, and the card would vanish before
+# the user could pick. Hold the previous prompt until we've missed
+# ``_CHOICE_MISS_THRESHOLD`` consecutive polls (~3s at the 1.5s
+# cadence). Cleared when detection re-succeeds or the session is
+# removed.
+_CHOICE_MISS_COUNT: dict[str, int] = {}
+_CHOICE_MISS_THRESHOLD = 2
+
+# Diagnostic throttle: the last "footer present but no options parsed"
+# pane signature we logged per session, so the warning fires once per
+# distinct failing capture instead of on every poll tick. Cleared on a
+# successful detect.
+_CHOICE_PARSE_FAIL: dict[str, str] = {}
+
+# Multi-question AskUserQuestion form tracking — mirrors the single-choice
+# state above. A form supersedes the single-choice path (a form IS a
+# select widget, but richer). The signature changes each time the active
+# question/selection changes (a normal wizard step), so edge-emit on
+# signature change; the falling edge (form gone) is debounced with the
+# same miss threshold as choices. Value type:
+# ``choice_detector.MultiQuestionForm``.
+_LAST_FORM_FOR_SESSION: dict = {}
+_FORM_MISS_COUNT: dict[str, int] = {}
+
+
+def _question_form_msg(session, form) -> dict:
+    """Build the ``question_form`` WS payload for a detected form screen.
+
+    ``options`` carries every navigable row EXCEPT the "Chat about this"
+    meta-row (selecting it declines the form — not something we surface on
+    the lens). The lens branches on ``select_mode`` + each row's ``kind``:
+    single-select rows commit-and-advance, multi-select rows toggle, the
+    ``next`` row advances, ``submit``/``cancel`` finish the review screen,
+    and the ``free_text`` row arms voice dictation.
+    """
+    return {
+        "type": "question_form",
+        "session_id": session.session_id,
+        "project": session.project,
+        "form_id": form.form_id,
+        "signature": form.signature,
+        "select_mode": form.select_mode,
+        "title": form.title,
+        "body": form.body,
+        "questions": [
+            {"label": q.label, "answered": q.answered} for q in form.questions
+        ],
+        "answered_count": form.answered_count,
+        "total_questions": len(form.questions),
+        "options": [
+            {
+                "text": r.text,
+                "kind": r.kind,
+                "checked": bool(r.checked) if r.checked is not None else False,
+            }
+            for r in form.rows
+            if r.kind != "meta"
+        ],
+    }
+
+
+async def _deep_capture_choice_body(tmux_target: str, signature: str) -> list[str] | None:
+    """Return the FULL body for a just-detected choice prompt via a deeper capture.
+
+    The activity poll captures only ~30 on-screen rows, which truncates a long
+    plan's body. On the RISING EDGE of a prompt (rare) we pay one extra
+    ``capture-pane -S -200`` and re-detect; if it's the same prompt (matching
+    ``signature``) we return its fuller ``body``. Returns None when the deep
+    capture fails or resolves to a different/no prompt — the caller then keeps
+    the shallow body.
+    """
+    from bridge import choice_detector
+    from bridge.validation import _validate_tmux_pane_target
+    # Validate for parity with ws_handler's capture paths (defense in depth:
+    # rejects malformed/protected targets and a '-'-leading name tmux could
+    # otherwise read as a flag).
+    target, target_err = _validate_tmux_pane_target(tmux_target)
+    if target_err or not target:
+        return None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "tmux", "capture-pane", "-t", target,
+            "-p", "-S", "-200",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=get_subprocess_env(),
+        )
+        stdout, _ = await proc.communicate()
+    except (OSError, ValueError):
+        return None
+    if proc.returncode != 0 or not stdout:
+        return None
+    clean = _ANSI_RE.sub("", stdout.decode("utf-8", errors="replace"))
+    deep = choice_detector.detect_choice_prompt(clean.splitlines())
+    if deep is not None and deep.signature == signature and deep.body:
+        return deep.body
+    return None
+
+
+async def _broadcast_question_form(session, pane_lines: list[str]) -> bool:
+    """Detect + edge-broadcast a multi-question form for ``session``.
+
+    Returns True when a form is on screen (or within the cancel debounce
+    window) — the caller then SKIPS single-choice detection, because a
+    form supersedes it (the review screen's Submit/Cancel would otherwise
+    read as a 2-option choice prompt). Returns False when no form is or was
+    recently on screen.
+    """
+    from bridge import choice_detector
+
+    sid = session.session_id
+    form = choice_detector.detect_question_form(pane_lines)
+    prev = _LAST_FORM_FOR_SESSION.get(sid)
+
+    if form is not None:
+        _FORM_MISS_COUNT.pop(sid, None)
+        # A live form supersedes any single-choice tracking for this
+        # session — drop it so the choice falling-edge logic can't fire.
+        _LAST_CHOICE_FOR_SESSION.pop(sid, None)
+        _CHOICE_MISS_COUNT.pop(sid, None)
+        is_new = prev is None or form.signature != prev.signature
+        _LAST_FORM_FOR_SESSION[sid] = form  # cache fresh focus every tick
+        if is_new:
+            log_event(
+                "info", session.project,
+                f"Question form ({form.select_mode}) — "
+                f"{form.answered_count}/{len(form.questions)} answered, "
+                f"{len(form.answer_rows)} options"
+            )
+            await broadcast_to_ios(_question_form_msg(session, form))
+        return True
+
+    if prev is not None:
+        # Debounce the falling edge exactly like choices: a one-tick miss
+        # (mid-render, cursor blink) must not dismiss the lens card.
+        miss = _FORM_MISS_COUNT.get(sid, 0) + 1
+        _FORM_MISS_COUNT[sid] = miss
+        if miss < _CHOICE_MISS_THRESHOLD:
+            return True  # still holding the form — skip choice detection
+        _LAST_FORM_FOR_SESSION.pop(sid, None)
+        _FORM_MISS_COUNT.pop(sid, None)
+        await broadcast_to_ios({
+            "type": "question_form_cancelled",
+            "session_id": sid,
+            "project": session.project,
+        })
+        return False
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -100,10 +269,28 @@ def _detect_activity_type(text: str) -> str | None:
     # spinners or similar Unicode animation characters.
     has_spinner = bool(re.search(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷◐◑◒◓⏳]", text))
 
-    # If the assistant's idle prompt appears near the bottom AND there
-    # are no spinners, it's waiting for input.  Tool names in scrollback
-    # above the prompt are stale history, not current activity.
-    if not has_spinner and _has_idle_prompt(text):
+    # Claude's star/asterisk spinner frames (✶ ✢ ✳ * +) aren't in the braille
+    # set above, AND it renders a bare ❯ input box even while working — so a
+    # working session used to match the idle early-return below and get auto-
+    # idled (footer said "Recombobulating" while the session was marked idle).
+    # A present-tense working line is the authoritative "actively working"
+    # signal; share it with the lens footer (lazy import breaks the
+    # activity↔session_status cycle).
+    from bridge.session_status import has_completion_line, has_live_working_line
+    lines = text.splitlines()
+    has_working_line = has_live_working_line(lines)
+
+    # If there's no spinner and no live working line, the session isn't
+    # actively working — provided it's visibly AT REST: either a bare ❯ idle
+    # prompt, OR a turn-completion line ("✻ Churned for 1m 9s") near the
+    # bottom. The completion-line case is what catches "user is TYPING after a
+    # finished turn": the prompt holds typed text (so it's not a bare ❯), but
+    # the turn is done — without this, the tool-pattern loop below matched
+    # stale tool names / the user's own text in scrollback and re-activated the
+    # session as a phantom "Testing".
+    if not has_spinner and not has_working_line and (
+        _has_idle_prompt(text) or has_completion_line(lines)
+    ):
         return None
 
     for pattern, activity in _TOOL_PATTERNS:
@@ -116,8 +303,8 @@ def _detect_activity_type(text: str) -> str | None:
                 if any(kw in lower for kw in _BUILD_KEYWORDS):
                     return "building"
             return activity
-    # Spinner detected but no tool patterns — assistant is thinking
-    if has_spinner:
+    # Spinner / working line detected but no tool patterns — assistant is thinking
+    if has_spinner or has_working_line:
         return "thinking"
     return None  # no match — let caller apply sticky logic
 
@@ -154,6 +341,26 @@ def _has_idle_prompt(text: str) -> bool:
     return False
 
 
+def _should_overwrite_activity_type(
+    session_status: str, local: str, current: str
+) -> bool:
+    """Gate for the poll-loop's per-tick ``session.activity_type`` write.
+
+    Returns True only when the session is currently active AND the
+    locally-computed activity_type differs from what the session already
+    has. For idle/waiting sessions, ``activity_type`` is owned by
+    ``update_status`` (sleeping/completed/approval/input), and the poll
+    loop's fallback "thinking" must not overwrite it — that's the bug
+    where macOS rendered "Thinking" on sessions iOS rendered as idle
+    (status="idle" + activity_type="thinking" mismatch via the REST poll
+    path, masked on iOS by ``displayActivityType``).
+
+    Extracted as a pure helper so the regression tests can exercise the
+    gate directly without re-implementing the expression.
+    """
+    return session_status == "active" and local != current
+
+
 def _resolve_activity_type(session_id: str, detected: str | None, now: float) -> str:
     """Apply sticky hold logic: keep the last specific activity type for a few
     seconds instead of immediately falling back to thinking."""
@@ -183,12 +390,18 @@ _SHELL_COMMANDS = frozenset({
 _STATUS_BAR_RE = re.compile(
     r"permissions on|"               # permission mode line: "bypass permissions on · 1 bash"
     r"auto-compact|"                 # context line: "Context left until auto-compact: 9%"
+    r"\d+%\s*context\s*(?:used|left|remaining)|"  # warning row: "42% context used"
     r"shift\+tab to cycle|"          # hint line
+    r"ctrl-g to edit in|"            # plan-mode editor hint: "ctrl-g to edit in Vim · ~/.claude/plans/..."
     r"Opus \d|Sonnet \d|Haiku \d|"   # Claude model info: "Opus 4.6 $113.77 ..."
     r"^\$\d+\.\d+\s|"               # cost at start of line
     r"^\d+\.?\d*k/\d+|"             # token count: "150.9k/200k"
     r"\+\d+\s*completed|"           # task progress: "... +10 completed"
     r"^\d+ tasks? \(\d+ done|"      # task count: "4 tasks (0 done, 4 open)"
+    # Task truncation tail — handles both shapes:
+    #   "… +5 pending, 165 completed"                 (2 counts)
+    #   "… +1 in progress, 8 pending, 134 completed"  (3 counts)
+    r"^\s*(?:…|\.{3})\s*\+\d+\s+(?:in progress|pending|completed)|"
     r"press up to edit|"            # hint: "Press up to edit queued messages"
     r"blocked by #\d+|"             # task dependency: "› blocked by #113"
     r"twice to enable|"             # wrapped hint: "...twice to enable."
@@ -218,6 +431,10 @@ _TASK_CHECKBOX_CHARS = frozenset(
     "\u2612"  # ☒ BALLOT BOX WITH X
     "\u2713"  # ✓ CHECK MARK
     "\u2714"  # ✔ HEAVY CHECK MARK
+    "\u25a0"  # ■ BLACK SQUARE (filled — Claude Code uses for in-progress)
+    "\u25fc"  # ◼ BLACK MEDIUM SQUARE
+    "\u25aa"  # ▪ BLACK SMALL SQUARE
+    "\u25ae"  # ▮ BLACK VERTICAL RECTANGLE
 )
 
 
@@ -373,6 +590,10 @@ async def _tmux_pane_path(session_name: str) -> str:
 
 async def _activity_poll_loop() -> None:
     """Poll tmux for all active sessions every ~1.5s and broadcast snippet changes."""
+    # Lazy import to break the activity ↔ session_status / choice_detector
+    # circular import (see note next to the import block at module top).
+    from bridge import session_status, choice_detector
+
     sub_agent_poll_counter = 0  # scan task files every 3rd iteration (~4.5s)
     discovery_poll_counter = 0  # rediscover tmux sessions every 20th iteration (~30s)
     try:
@@ -398,6 +619,10 @@ async def _activity_poll_loop() -> None:
                         sessions.remove_session(sid)
                         _STICKY_ACTIVITY.pop(sid, None)
                         _LAST_REAL_ACTIVITY.pop(sid, None)
+                        _LAST_CHOICE_FOR_SESSION.pop(sid, None)
+                        _CHOICE_MISS_COUNT.pop(sid, None)
+                        _LAST_FORM_FOR_SESSION.pop(sid, None)
+                        _FORM_MISS_COUNT.pop(sid, None)
                         await _cancel_terminal_subs_for_session(sid, project=proj)
                         log_event("warning", proj, f"Pane gone — deregistered ({sid[:12]}...)")
                         await broadcast_to_ios({
@@ -432,6 +657,10 @@ async def _activity_poll_loop() -> None:
                         sessions.remove_session(sid)
                         _STICKY_ACTIVITY.pop(sid, None)
                         _LAST_REAL_ACTIVITY.pop(sid, None)
+                        _LAST_CHOICE_FOR_SESSION.pop(sid, None)
+                        _CHOICE_MISS_COUNT.pop(sid, None)
+                        _LAST_FORM_FOR_SESSION.pop(sid, None)
+                        _FORM_MISS_COUNT.pop(sid, None)
                         await _cancel_terminal_subs_for_session(sid, project=proj)
                         log_event("info", proj, f"{session.assistant.title()} exited — deregistered ({sid[:12]}...)")
                         await broadcast_to_ios({
@@ -473,9 +702,21 @@ async def _activity_poll_loop() -> None:
                     # with "session busy" even though nothing is running.
                     idle_cooldown = 10.0  # seconds — prevents flicker right after stop events
                     has_idle_prompt = _has_idle_prompt(clean)
+                    # Claude shows a bare ❯ even while working, so the prompt
+                    # alone no longer means "idle". A present-tense working
+                    # line overrides it — without this, a thinking session
+                    # (which detects as active above) still wouldn't re-activate
+                    # because has_idle_prompt stayed True. See has_live_working_line.
+                    # A turn-completion line ("✻ Churned for 1m 9s") also means
+                    # at-rest — that's the "user is typing after a finished
+                    # turn" case where the prompt isn't bare.
+                    _pane_lines_for_state = clean.splitlines()
+                    has_working_line = session_status.has_live_working_line(_pane_lines_for_state)
+                    at_rest = has_idle_prompt or session_status.has_completion_line(_pane_lines_for_state)
+                    effective_idle = at_rest and not has_working_line
                     if session.status != "active":
-                        if detected is not None and not has_idle_prompt:
-                            # Real activity in the terminal AND no idle prompt —
+                        if detected is not None and not effective_idle:
+                            # Real activity in the terminal AND not effectively idle —
                             # re-activate (with cooldown to avoid flicker after stop events).
                             if session.idle_since and (mono_now - session.idle_since) < idle_cooldown:
                                 pass  # still in cooldown — don't re-activate yet
@@ -497,9 +738,9 @@ async def _activity_poll_loop() -> None:
                         # 2. No idle prompt — wait _IDLE_TIMEOUT_SECONDS before idling
                         #    (might be between tool calls, thinking, etc.)
                         should_idle = False
-                        if has_idle_prompt:
-                            # Idle prompt visible and no active tool patterns —
-                            # Claude Code is definitely waiting for input.
+                        if effective_idle:
+                            # Bare prompt visible, no working line, no active
+                            # tool patterns — Claude Code is waiting for input.
                             should_idle = True
                         else:
                             last_real = _LAST_REAL_ACTIVITY.get(session.session_id, 0.0)
@@ -507,6 +748,15 @@ async def _activity_poll_loop() -> None:
                                 should_idle = True
                         if should_idle:
                             sessions.update_status(session.session_id, "idle")
+                            # update_status set session.activity_type="sleeping".
+                            # Sync the local variable AND drop the sticky entry
+                            # so the post-idle comparison below doesn't re-stamp
+                            # the prior "thinking" label (which would leave
+                            # status="idle" + activity_type="thinking" — a state
+                            # macOS renders as "Thinking" while iOS renders as
+                            # "idle" via displayActivityType).
+                            activity_type = "sleeping"
+                            _STICKY_ACTIVITY.pop(session.session_id, None)
                             reason = "idle prompt detected" if has_idle_prompt else f"no activity for {_IDLE_TIMEOUT_SECONDS:.0f}s"
                             log_event("info", session.project,
                                       f"Auto-idled ({reason})")
@@ -522,7 +772,16 @@ async def _activity_poll_loop() -> None:
                             await _drain_queued_command(session)
 
                     snippet_changed = snippet and snippet != session.activity_snippet
-                    type_changed = activity_type != session.activity_type
+                    # See _should_overwrite_activity_type() for why this
+                    # is gated on session.status — it's the fix for the
+                    # macOS=Thinking / iOS=idle desync bug. Using the
+                    # extracted helper instead of inlining the
+                    # expression so the regression tests in
+                    # test_activity.py::TestActivityTypeGate exercise
+                    # the actual production gate.
+                    type_changed = _should_overwrite_activity_type(
+                        session.status, activity_type, session.activity_type
+                    )
                     preview_changed = terminal_preview and terminal_preview != session.terminal_preview
                     if snippet_changed or type_changed or preview_changed:
                         if snippet_changed:
@@ -550,6 +809,168 @@ async def _activity_poll_loop() -> None:
                             "status": session.status,
                             "sub_agent_count": session.sub_agent_count,
                         })
+
+                    # --- Lens-footer status + numbered-choice detection ---
+                    # Derive a status dict from tmux capture (always) +
+                    # stream-json buffer (when a dispatched run is in
+                    # flight). Broadcast only on edge changes — the
+                    # extractors return identical dicts when nothing
+                    # interesting has changed, so this naturally
+                    # rate-limits sends.
+                    pane_lines = clean.splitlines() if clean else []
+                    tmux_status = session_status.extract_status_from_tmux(pane_lines)
+                    stream_buf = session._stream_json_buffer
+                    stream_status = session_status.extract_status_from_stream_json(
+                        list(stream_buf) if stream_buf else []
+                    )
+                    # Sticky: hold the last parsed percent when this frame
+                    # has no parseable gauge so the lens chip doesn't flicker.
+                    context_pct = session_status.sticky_context_percent(
+                        pane_lines, session._last_context_pct
+                    )
+                    session._last_context_pct = context_pct
+                    derived = session_status.derive_status(
+                        session, tmux_status, stream_status, context_pct
+                    )
+                    # Diff key strips elapsed_s — that field ticks every
+                    # poll for active sessions (Claude Code's footer
+                    # "(54s)" → "(55s)"), and including it would
+                    # broadcast `session_status` on every tick across
+                    # every active session. Active session count × poll
+                    # rate gets noisy fast. iOS animates the counter
+                    # locally between snapshots, so a slightly stale
+                    # elapsed at idle moments is fine.
+                    diff_key = {k: v for k, v in derived.items() if k != "elapsed_s"}
+                    last_diff_key = (
+                        {k: v for k, v in session._last_broadcast_status.items() if k != "elapsed_s"}
+                        if isinstance(session._last_broadcast_status, dict)
+                        else None
+                    )
+                    if diff_key != last_diff_key:
+                        session._last_broadcast_status = derived
+                        await broadcast_to_ios({
+                            "type": "session_status",
+                            "session_id": session.session_id,
+                            **derived,
+                        })
+
+                    # Multi-question AskUserQuestion form detection runs
+                    # FIRST and takes precedence over the single-choice
+                    # path. When a form is on screen (or within its cancel
+                    # debounce) we skip choice detection entirely — a form
+                    # is a richer select widget, and its review screen's
+                    # Submit/Cancel would otherwise misread as a 2-option
+                    # choice prompt.
+                    form_active = await _broadcast_question_form(session, pane_lines)
+
+                    # Numbered-choice prompt detection. Edge-emit when a
+                    # new prompt appears or the signature changes; emit
+                    # ``choice_prompt_cancelled`` when the previously
+                    # detected prompt is no longer on screen.
+                    #
+                    # Note: ``_LAST_CHOICE_FOR_SESSION`` is updated on
+                    # EVERY tick that detects a choice, not just edge
+                    # ticks. The signature is stable across cursor
+                    # movement (focused_index isn't in the hash), so a
+                    # TUI focus shift won't trigger a broadcast — but
+                    # we still need the latest ``focused_index`` cached
+                    # server-side so the commit handler can compute
+                    # the arrow-key delta for "tui_select" mode.
+                    choice = (
+                        None if form_active
+                        else choice_detector.detect_choice_prompt(pane_lines)
+                    )
+                    prev_choice = _LAST_CHOICE_FOR_SESSION.get(session.session_id)
+                    if choice is not None:
+                        # Reset miss + parse-fail trackers on any detect.
+                        _CHOICE_MISS_COUNT.pop(session.session_id, None)
+                        _CHOICE_PARSE_FAIL.pop(session.session_id, None)
+                        is_new_prompt = (
+                            prev_choice is None
+                            or choice.signature != prev_choice.signature
+                        )
+                        # Carry the deep-captured body forward across non-edge
+                        # re-detects. Each tick re-detects with only the shallow
+                        # ~30-line body; without this it would clobber the fuller
+                        # body captured on the rising edge — and the connect-
+                        # replay (ws_handler) reads `body` from THIS cache, so a
+                        # client connecting after the first tick would otherwise
+                        # replay a truncated plan.
+                        if (
+                            prev_choice is not None
+                            and prev_choice.signature == choice.signature
+                            and len(prev_choice.body) > len(choice.body)
+                        ):
+                            choice.body = prev_choice.body
+                        _LAST_CHOICE_FOR_SESSION[session.session_id] = choice
+                        if is_new_prompt:
+                            # Enrich the body with a deeper capture so the lens
+                            # "read" view shows the FULL plan, not just the ~30
+                            # on-screen rows. Only on the rising edge → cheap.
+                            deeper = await _deep_capture_choice_body(
+                                session.tmux_target, choice.signature
+                            )
+                            if deeper:
+                                choice.body = deeper
+                            log_event(
+                                "info", session.project,
+                                f"Choice prompt detected — {len(choice.options)} "
+                                f"options ({choice.input_mode})"
+                            )
+                            await broadcast_to_ios({
+                                "type": "choice_prompt",
+                                "session_id": session.session_id,
+                                "project": session.project,
+                                "title": choice.title,
+                                "options": choice.options,
+                                "signature": choice.signature,
+                                "input_mode": choice.input_mode,
+                                "body": choice.body,
+                            })
+                    elif prev_choice is not None:
+                        # No choice detected this tick AND we previously
+                        # emitted one. Increment the miss counter —
+                        # only broadcast cancellation after enough
+                        # consecutive misses that this isn't a one-tick
+                        # render glitch. Without the debounce, the lens
+                        # focused-list often vanishes the instant the
+                        # user taps to enter it (a poll between
+                        # broadcast and tap lands during a transient
+                        # render and dismisses the prompt iOS-side).
+                        miss_count = _CHOICE_MISS_COUNT.get(
+                            session.session_id, 0
+                        ) + 1
+                        _CHOICE_MISS_COUNT[session.session_id] = miss_count
+                        if miss_count >= _CHOICE_MISS_THRESHOLD:
+                            _LAST_CHOICE_FOR_SESSION.pop(
+                                session.session_id, None
+                            )
+                            _CHOICE_MISS_COUNT.pop(session.session_id, None)
+                            await broadcast_to_ios({
+                                "type": "choice_prompt_cancelled",
+                                "session_id": session.session_id,
+                                "project": session.project,
+                            })
+                        # else: hold prev_choice; iOS keeps the lens
+                        # card up while we wait for the next tick.
+                    elif not form_active and choice_detector.has_select_footer(pane_lines):
+                        # A select-widget footer is visibly on screen but
+                        # we parsed zero options — the prompt will never
+                        # reach the lens. Log once per distinct failing
+                        # pane (throttled by tail signature) so the
+                        # offending capture is recoverable from the bridge
+                        # log without spamming every poll tick.
+                        sig = hashlib.sha1(
+                            "\n".join(pane_lines[-8:]).encode("utf-8")
+                        ).hexdigest()[:12]
+                        if _CHOICE_PARSE_FAIL.get(session.session_id) != sig:
+                            _CHOICE_PARSE_FAIL[session.session_id] = sig
+                            log_event(
+                                "warning", session.project,
+                                "Select-widget footer on screen but no "
+                                "options parsed — choice prompt will not "
+                                "surface"
+                            )
                 except asyncio.CancelledError:
                     raise  # let outer handler exit cleanly
                 except Exception:
@@ -568,8 +989,13 @@ async def _activity_poll_loop() -> None:
                         await broadcast_to_ios(_state_sync_msg())
                 except asyncio.CancelledError:
                     raise
-                except Exception:
-                    pass
+                except Exception as e:
+                    # Used to be `pass` — that swallowed errors when
+                    # discovery failed in the bundled .app context, leaving
+                    # the user wondering why tmux sessions weren't being
+                    # picked up. Surface them loudly so the next time this
+                    # breaks we see WHY in the bridge log.
+                    log_event("error", "bridge", f"Periodic discovery failed: {type(e).__name__}: {e}")
 
             # Scan task files for sub-agent counts every ~4.5s (every 3rd iteration).
             # This supplements the hook-based tracking (SubagentStart/SubagentStop)
@@ -637,6 +1063,17 @@ async def _periodic_prune() -> None:
         if removed:
             log_event("warning", "bridge", f"Pruned {len(removed)} dead session(s)")
             for sid, project in removed:
+                # ``prune_dead`` already removed the Session from the
+                # manager, but module-level per-session caches still
+                # carry the stale key. Pop them here so we don't leak
+                # entries — same cleanup pattern as the exit/pane-gone
+                # paths above in `_activity_poll_loop`.
+                _STICKY_ACTIVITY.pop(sid, None)
+                _LAST_REAL_ACTIVITY.pop(sid, None)
+                _LAST_CHOICE_FOR_SESSION.pop(sid, None)
+                _CHOICE_MISS_COUNT.pop(sid, None)
+                _LAST_FORM_FOR_SESSION.pop(sid, None)
+                _FORM_MISS_COUNT.pop(sid, None)
                 await _cancel_terminal_subs_for_session(sid, project=project)
                 await broadcast_to_ios({
                     "type": "session_removed",
@@ -660,6 +1097,10 @@ async def _periodic_prune() -> None:
             sessions.remove_session(sid)
             _STICKY_ACTIVITY.pop(sid, None)
             _LAST_REAL_ACTIVITY.pop(sid, None)
+            _LAST_CHOICE_FOR_SESSION.pop(sid, None)
+            _CHOICE_MISS_COUNT.pop(sid, None)
+            _LAST_FORM_FOR_SESSION.pop(sid, None)
+            _FORM_MISS_COUNT.pop(sid, None)
             await _cancel_terminal_subs_for_session(sid, project=project)
             log_event("warning", "bridge", f"Deregistered exited session: {project} ({sid[:12]}...)")
             await broadcast_to_ios({
@@ -688,7 +1129,13 @@ async def _discover_tmux_sessions() -> int:
     Returns the number of newly discovered sessions.
     """
     discovered = 0
-    all_tmux = await tmux_manager.async_list_sessions()
+    try:
+        all_tmux = await tmux_manager.async_list_sessions()
+    except Exception as e:
+        # Used to silently propagate to the caller's bare `except: pass`,
+        # leaving the user with no signal that discovery never ran.
+        log_event("error", "bridge", f"Discovery: async_list_sessions failed: {type(e).__name__}: {e}")
+        return 0
 
     # Build set of tmux session names already registered
     registered_targets: set[str] = set()
@@ -701,10 +1148,11 @@ async def _discover_tmux_sessions() -> int:
 
     for ts in all_tmux:
         name = ts["name"]
-        # Skip bridge sessions
+        # Skip bridge sessions and sessions already in the registry. These
+        # are the common paths; no logging — they fire every 30s and would
+        # spam the bridge log.
         if name in (tmux_manager.BRIDGE_SESSION, "bridge"):
             continue
-        # Skip if any session already registered for this tmux session
         if name in registered_targets:
             continue
 
@@ -726,20 +1174,31 @@ async def _discover_tmux_sessions() -> int:
             project_name = name  # use tmux session name as project name
 
         if not project_dir:
+            # Worth surfacing: a pane that looks like an assistant but
+            # whose CWD couldn't be read is a real misconfiguration, not
+            # noise — the user needs to know we saw it and skipped.
+            log_event("warning", "bridge", f"Discovery: skip '{name}' (could not resolve project_dir)")
             continue
 
         # Generate a temporary session_id — will be replaced when the real
         # session hook fires and deduplicates by tmux_target.
         temp_id = f"discovered-{secrets.token_hex(8)}"
-        session, _ = sessions.register_session(
-            temp_id,
-            project_name,
-            project_dir,
-            tmux_target=tmux_target,
-            assistant=assistant,
-        )
-        # Mark as active since an assistant process is running.
-        sessions.update_status(temp_id, "active", activity_type="working")
+        try:
+            session, _ = sessions.register_session(
+                temp_id,
+                project_name,
+                project_dir,
+                tmux_target=tmux_target,
+                assistant=assistant,
+            )
+            # Mark as active since an assistant process is running.
+            sessions.update_status(temp_id, "active", activity_type="working")
+        except Exception as e:
+            # register_session can fail validation (project name, path).
+            # Don't let one bad entry block the rest of the scan, and log
+            # the reason so the next missing-session report has a trail.
+            log_event("error", "bridge", f"Discovery: register '{name}' failed: {type(e).__name__}: {e}")
+            continue
         log_event("success", project_name, f"Discovered {assistant} in tmux '{name}'")
         discovered += 1
 
