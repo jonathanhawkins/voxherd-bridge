@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import secrets
 import time
@@ -31,6 +32,8 @@ from bridge.auth import get_auth_token
 from bridge import task_store
 from bridge import tmux_manager
 from bridge.env_utils import get_subprocess_env
+from bridge.transcript_render import find_transcript_path, render_transcript_cached
+import bridge.server_state as _state
 from bridge.assistant import (
     default_assistant,
     is_supported_assistant,
@@ -228,27 +231,36 @@ async def ios_websocket(websocket: WebSocket) -> None:
     try:
         while True:
             raw = await websocket.receive_text()
+            _state.bump_inbound("received")
             # Reject oversized messages
             if len(raw) > _MAX_EVENT_PAYLOAD_LEN:
+                _state.bump_inbound("oversized")
                 log_event("warning", "bridge", f"Oversized WS message dropped ({len(raw)} bytes)")
                 continue
             try:
                 data = json.loads(raw)
             except (json.JSONDecodeError, ValueError):
+                _state.bump_inbound("malformed")
                 log_event("warning", "bridge", "Malformed JSON on WebSocket")
                 continue
 
             # Verify HMAC signature when auth is enabled
             if not verify_message(dict(data)):
+                # No per-type key here: the type string is client-controlled
+                # and unverified at this point.
+                _state.bump_inbound("hmac_fail")
                 log_event("warning", "bridge", "HMAC verification failed on incoming WS message")
                 continue
 
             msg_type = data.get("type", "")
 
-            # Drop unknown message types
+            # Drop unknown message types (bump the per-type counter only for
+            # KNOWN types so client-supplied strings can't mint stat keys).
             if msg_type not in _KNOWN_WS_TYPES:
+                _state.bump_inbound("unknown_type")
                 log_event("warning", "bridge", f"Unknown WS message type: {msg_type!r}")
                 continue
+            _state.bump_inbound(f"ok:{msg_type}")
 
             if msg_type == "voice_command":
                 await handle_voice_command(data, websocket)
@@ -350,13 +362,41 @@ async def _handle_task_update(data: dict, ws: WebSocket) -> None:
 # Terminal streaming
 # ---------------------------------------------------------------------------
 
-# How many lines back through the tmux scrollback we capture each poll. This
-# is the ceiling on how far the glasses "read mode" (full-screen transcript)
-# can scroll back: iOS stores the full snapshot verbatim and the lens renders
-# all of it, so a longer capture = more readable history. Kept bounded because
-# every poll (~500ms, per subscriber) decodes + chrome-strips this many rows
-# and ships the survivors over the WebSocket when the snapshot changes.
-_TERMINAL_CAPTURE_LINES = 300
+# How many lines back through the tmux scrollback we capture each poll. For a
+# pane WITHOUT a transcript (plain shell), this is the full mirror the phone
+# scrolls — iOS snapshot-replaces terminalContent, so the capture window is the
+# scrollback depth. For Claude/Codex panes we instead source deep history from
+# the transcript JSONL (see below) and keep only the last _TRANSCRIPT_LIVE_TAIL_ROWS
+# of this capture as the "live" tail — because those panes render in the tmux
+# alternate screen and keep zero scrollback (history_size=0), so a big capture
+# returns only the one visible screen anyway. Change-gated: an idle pane costs
+# nothing.
+_TERMINAL_CAPTURE_LINES = 2000
+
+# --- Transcript-sourced scrollback ----------------------------------------
+# Claude Code / Codex render in the tmux alternate screen, where tmux keeps no
+# scrollback — so the live capture above can only show one screen. The real
+# conversation is on disk in the assistant transcript JSONL. When we can find
+# it, the poll loop renders it (bridge/transcript_render.py) and splices it in
+# FRONT of the live tmux tail, so the phone can scroll back through the whole
+# chat log. Falls back to the plain tmux mirror whenever no transcript exists.
+_TRANSCRIPT_SCROLLBACK_ENABLED = os.environ.get("VOXHERD_TRANSCRIPT_SCROLLBACK", "1") not in (
+    "0", "false", "no", "off",
+)
+_TRANSCRIPT_MAX_LINES = 2000  # cap on rendered history lines (newest kept)
+_TRANSCRIPT_LIVE_TAIL_ROWS = 80  # rows of the live tmux screen to append below history
+_TRANSCRIPT_SEPARATOR = "──────────── live ────────────"  # divider: history above, live below
+
+# When the ONLY poll-to-poll delta is the animated working line's ticking
+# elapsed/spinner, resend at this relaxed cadence instead of every 500ms poll
+# (the visible timer still advances; the wire/CPU cost drops 4x).
+_WORKING_TICK_RESEND_SECONDS = 2.0
+
+# Hard ceiling on the characters across a terminal_content `lines` array.
+# iOS's URLSessionWebSocketTask receive cap is 1 MiB/message; with JSON+ANSI
+# escaping overhead (ESC encodes as 6 chars), ~600k raw chars keeps the
+# encoded frame comfortably under it. Oldest lines are dropped first.
+_MAX_OUTBOUND_CONTENT_CHARS = 600_000
 
 
 # Substring markers that identify Claude Code's status footer rows. Kept
@@ -848,7 +888,13 @@ def _strip_context_indicator_rows(lines: list[str]) -> list[str]:
 # elapsed inside the parens.
 _WORKING_STATUS_RE = re.compile(
     r"^\s*"
-    r"[\*\+✳✴✵✶✷✸✹✺✻✱✢✦✧·•⠀-⣿]+"                       # ≥1 leading spinner / braille glyph
+    # ≥1 leading spinner glyph. The sparkle RANGE ✢-❇ (U+2722–U+2747) covers
+    # EVERY Dingbats frame Claude's spinner cycles through (✦✧✱✳✴✶✷✸✻✼✽✾✿❀…),
+    # not just the handful we used to enumerate — the gaps (✼✽✾…) were why the
+    # row flickered in and out as the animation ticked. Plus ascii */+ and the
+    # ·/• dots and braille frames. ("-" is intentionally excluded: it's a real
+    # markdown bullet and would false-strip "- Verb-ing X (Ns)" prose.)
+    r"[\*\+✢-❇·•⠀-⣿]+"
     r"\s*[A-Za-z]+ing\b"                                  # gerund verb (Cogitating, Thinking, …)
     r"[^)]*\("                                            # … up to an opening paren
     r"[^)]*\b(?:\d+\s*[ms]\b|esc\s+to\s+interrupt\b)",    # elapsed or interrupt inside the parens
@@ -865,9 +911,9 @@ _WORKING_STATUS_RE = re.compile(
 # trailing time unit, so a real "Verb for N <noun>" line can't false-match.
 _COMPLETION_STATUS_RE = re.compile(
     r"^\s*"
-    r"[\*✳✴✵✶✷✸✹✺✻✱✢✦✧]+\s*"                          # leading sparkle/spinner glyph(s)
+    r"[\*✢-❇]+\s*"                                       # leading sparkle/spinner glyph(s) — full ✢-❇ range
     r"\w+\s+for\s+\d+(?:\.\d+)?\s*(?:ms|m|s|h)\b",       # "<Verb> for <duration>"
-    re.IGNORECASE,
+    re.IGNORECASE,                                       # NOT ·/• (lead real bullet prose)
 )
 
 
@@ -972,7 +1018,17 @@ async def _terminal_poll_loop(session_id: str, ws: WebSocket) -> None:
     # at minimum [""] for an empty pane, never None). Forces the first
     # iteration to always emit, so iOS clears its "Connecting to terminal…"
     # spinner even when the pane is currently idle.
-    last_snapshot: list[str] | None = None
+    last_content_key: list[str] | None = None  # working-rows-stripped compare key
+    last_raw_lines: list[str] | None = None    # raw lines as last sent
+    last_sent_at = 0.0                          # monotonic time of last send
+
+    # Resolve the transcript JSONL once up front (cheap glob). It may not exist
+    # yet if the session just started — in that case re-glob every ~5s until it
+    # appears, then transparently upgrade the mirror to transcript-sourced
+    # scrollback. None throughout = plain tmux mirror (e.g. a non-assistant pane).
+    transcript_assistant = (getattr(session, "assistant", "claude") or "claude")
+    transcript_path = find_transcript_path(session) if _TRANSCRIPT_SCROLLBACK_ENABLED else None
+    transcript_retry_at = 0.0  # time.monotonic() gate for re-globbing
     try:
         while True:
             # Re-lookup session each iteration so we pick up re-registrations
@@ -1070,12 +1126,17 @@ async def _terminal_poll_loop(session_id: str, ws: WebSocket) -> None:
             # (see GlassesDisplayManager.buildFooter), so the inline chrome row
             # is redundant — cutting it keeps the read view cleaner.
             body = _strip_context_indicator_rows(body)
-            # Working-status pass: drop Claude Code's animated "✻ Cogitating…
-            # (5m 42s)" spinner/elapsed row. The footer already shows the
-            # session status (verb + elapsed), so the inline copy is redundant —
-            # and removing the animating row stops the transcript from bouncing
-            # as the spinner/timer ticks each poll.
-            body = _strip_working_status_rows(body)
+            # NOTE: Claude Code's animated working-status row ("✻ Cogitating…
+            # (5m 42s)") is intentionally NOT stripped here. It's useful live
+            # signal everywhere the shared terminal_content goes — the iOS phone
+            # mirror AND the Glassbox web view (which proxies this feed through
+            # its own server, so it has no browser Origin to single out). The
+            # ONLY place it's unwanted is the GLASSES LENS, so that strip lives
+            # lens-side in iOS (GlassesDisplayManager.isWorkingStatusRow, applied
+            # in AppState's onRequestTranscriptLines). _strip_working_status_rows
+            # / _is_working_status_row + the complete-frame _WORKING_STATUS_RE
+            # are kept here purely as the source of truth that the Swift port
+            # mirrors (and for tests).
 
             # Per-line strip of long leading/trailing decorative runs
             # (e.g. `---------------- mem0 integration` → ` mem0
@@ -1086,21 +1147,83 @@ async def _terminal_poll_loop(session_id: str, ws: WebSocket) -> None:
 
             lines = art_rows + body
 
+            # --- Transcript scrollback splice -----------------------------
+            # When a transcript JSONL exists for this session, prepend the
+            # rendered conversation (deep history) and keep only the last
+            # _TRANSCRIPT_LIVE_TAIL_ROWS of the live tmux screen as the "live"
+            # tail. Scrolling up on the phone then walks the whole chat log;
+            # the bottom stays live. The change-detection below still works:
+            # the history block is byte-identical from the mtime cache on a
+            # steady state (cheap diff, no re-parse), and only the tmux tail
+            # varies poll-to-poll. No transcript → `lines` is the plain tmux
+            # mirror, exactly as before (zero regression).
+            if _TRANSCRIPT_SCROLLBACK_ENABLED:
+                if transcript_path is None and time.monotonic() >= transcript_retry_at:
+                    transcript_path = find_transcript_path(session)
+                    transcript_retry_at = time.monotonic() + 5.0
+                if transcript_path:
+                    # render_transcript_cached is sync file I/O — run it off the
+                    # event loop so the 2 Hz poll stays responsive under many
+                    # concurrent subscribers.
+                    history = await asyncio.to_thread(
+                        render_transcript_cached,
+                        transcript_path,
+                        assistant=transcript_assistant,
+                        max_lines=_TRANSCRIPT_MAX_LINES,
+                    )
+                    if history:
+                        tail = lines[-_TRANSCRIPT_LIVE_TAIL_ROWS:]
+                        lines = history + ["", _TRANSCRIPT_SEPARATOR, ""] + tail
+
             # NOTE: the change-detection comparison below runs on the
             # POST-TRIM `lines`. That's intentional: an intermediate state
             # whose only delta is trailing whitespace below the cursor row
             # collapses to the same trimmed snapshot and we suppress the
             # send. iOS would render the same trimmed tail anyway, so the
-            # suppression is a wire-cost optimization, not lost data. If a
-            # future consumer needs raw pane height, do the diff on the
-            # untrimmed bytes and trim only on send.
-            if last_snapshot is None or lines != last_snapshot:
-                last_snapshot = lines
+            # suppression is a wire-cost optimization, not lost data.
+            #
+            # Two-tier change detection: since the animated working line
+            # ("✻ Cogitating… (5m 42s)") now stays IN the payload, its ticking
+            # elapsed would otherwise defeat suppression and resend the whole
+            # spliced payload at 2 Hz for the entire duration of every turn
+            # (HMAC + JSON parse + SwiftUI tick on the phone, twice a second).
+            # So: compare CONTENT with the working rows stripped — a real
+            # change sends immediately; a timer-only tick resends at a relaxed
+            # cadence so the visible timer still advances without the 2 Hz cost.
+            content_key = _strip_working_status_rows(lines)
+            now_mono = time.monotonic()
+            real_change = last_content_key is None or content_key != last_content_key
+            timer_tick = (not real_change) and lines != last_raw_lines
+            if real_change or (timer_tick and now_mono - last_sent_at >= _WORKING_TICK_RESEND_SECONDS):
+                last_content_key = content_key
+                last_raw_lines = lines
+                last_sent_at = now_mono
+
+                # Outbound size guard: iOS's URLSessionWebSocketTask receive
+                # cap is 1 MiB per message. The transcript history is already
+                # byte-bounded in transcript_render, but the PLAIN tmux path
+                # (no transcript) can still capture 2000 ANSI-heavy rows whose
+                # JSON encoding (ESC → , 6 chars) could exceed the cap —
+                # which would wedge the phone in a receive-fail/reconnect
+                # loop. Drop oldest lines until comfortably under.
+                send_lines = lines
+                total = sum(len(ln) for ln in send_lines)
+                if total > _MAX_OUTBOUND_CONTENT_CHARS:
+                    budget = _MAX_OUTBOUND_CONTENT_CHARS
+                    kept: list[str] = []
+                    for ln in reversed(send_lines):
+                        budget -= len(ln)
+                        if budget <= 0:
+                            break
+                        kept.append(ln)
+                    kept.reverse()
+                    send_lines = ["… (older output trimmed) …"] + kept
+
                 try:
                     await send_signed(ws,{
                         "type": "terminal_content",
                         "session_id": session_id,
-                        "lines": lines,
+                        "lines": send_lines,
                     })
                 except Exception:
                     break
@@ -1150,6 +1273,18 @@ async def _handle_terminal_subscribe(data: dict, ws: WebSocket) -> None:
         except Exception:
             pass
         return
+
+    # NOTE: we deliberately do NOT raise this pane's tmux history-limit here.
+    # tmux fixes a pane's history_limit at CREATION time, so `set-option
+    # history-limit` on an already-running pane is a no-op for its buffer —
+    # verified: `display-message -p '#{history_limit}'` still reports 2000 right
+    # after the set, even for lines added afterward. And Claude/Codex panes
+    # render in the alternate screen with zero scrollback anyway (see
+    # _TERMINAL_CAPTURE_LINES); their deep history comes from the transcript
+    # JSONL, not this capture. So there is nothing useful to set on subscribe —
+    # a per-subscribe `set-option` subprocess would just burn a spawn for no
+    # effect. If deep tmux scrollback is ever wanted for a plain-shell pane,
+    # set history-limit when the pane is CREATED, not here.
 
     # Idempotent: if an active poll loop already exists for this
     # (session_id, ws) pair and hasn't finished, leave it running. The

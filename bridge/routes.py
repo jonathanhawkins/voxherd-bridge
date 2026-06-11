@@ -60,6 +60,32 @@ async def health_check() -> dict:
     return {"ok": True, "service": "voxherd-bridge"}
 
 
+@router.get("/api/debug/clients")
+async def debug_clients() -> dict:
+    """Diagnostic: who's connected and what terminal subscriptions exist.
+
+    ``clients`` lists each live WS by Origin ("native" = no Origin header, i.e.
+    the iOS app or macOS; an http(s) origin = a browser/Glassbox). ``terminal_subs``
+    maps session_id -> number of subscribers, so we can see whether the phone's
+    terminal_subscribe actually reached the bridge and a poll loop is running.
+    """
+    clients = []
+    for ws in list(_state.ios_connections):
+        try:
+            origin = ws.headers.get("origin")
+        except Exception:
+            origin = "err"
+        clients.append(origin if origin else "native")
+    subs = {sid: len(d) for sid, d in list(_state._terminal_subs.items())}
+    return {
+        "client_count": len(clients),
+        "clients": clients,
+        "terminal_sub_sessions": len(subs),
+        "terminal_subs": subs,
+        "inbound_stats": dict(_state.inbound_stats),
+    }
+
+
 @router.get("/api/assets/claude-pig.png")
 async def claude_pig_png() -> Response:
     """Orange Claude mascot PNG for the lens splash.
@@ -398,6 +424,20 @@ async def delete_session(session_id: str) -> dict:
         log_event("warning", "bridge", f"Deleted session: {session_id[:12]}...")
         return {"ok": True}
     return {"error": "Session not found"}
+
+
+@router.post("/api/sessions/{session_id}/name")
+async def set_session_name(session_id: str, request: Request) -> dict:
+    """Set a human display name (e.g. a swarm role) for a session."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    name = str(body.get("window_name") or "").strip()[:64]
+    ok = sessions.set_window_name(session_id, name)
+    if ok:
+        await broadcast_to_ios(_state_sync_msg())
+    return {"ok": ok}
 
 
 @router.delete("/api/sessions")

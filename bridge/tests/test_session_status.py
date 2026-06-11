@@ -19,6 +19,9 @@ from bridge.session_status import (
     extract_status_from_stream_json,
     extract_status_from_tmux,
     sticky_context_percent,
+    has_completion_line,
+    has_live_working_line,
+    has_live_background_work,
     _extract_recent_action,
     _extract_completion,
 )
@@ -191,6 +194,114 @@ class TestExtractStatusFromTmux:
         s = extract_status_from_tmux(lines)
         assert s is not None
         assert s.label == "Cogitating"
+
+
+class TestMultiWordWorkingLine:
+    """has_live_working_line() must catch a working line whose gerund is
+    followed by a DESCRIPTIVE PHRASE before the "(elapsed · tokens)" inner —
+    e.g. Claude's stop-hook status — which the single-gerund regex missed,
+    causing a busy session to read as idle (aligned-tools-2)."""
+
+    def test_stop_hook_multiword_phrase_is_active(self):
+        lines = [
+            "✽ Adding assigneeSource provenance field… "
+            "(running stop hooks… 1/3 · 2m 48s · ↓ 10.5k tokens)",
+            "❯ ",
+        ]
+        assert has_live_working_line(lines) is True
+
+    def test_multiword_phrase_without_elapsed_is_not_a_working_line(self):
+        # Safety anchor: prose with a gerund + "(...)" but NO "<digits>s" inside
+        # must not be mistaken for a working line.
+        lines = ["Refactoring the parser (see notes below) for clarity"]
+        assert has_live_working_line(lines) is False
+
+    def test_single_gerund_still_detected(self):
+        assert has_live_working_line(["✶ Grooving… (42s · ↓ 2.6k tokens)"]) is True
+
+    def test_tool_and_prose_rows_are_not_working_lines(self):
+        # Code-review regressions: the loose first cut of _WORKING_PHRASE_RE
+        # matched these (any punctuation as "spinner", any "(...Ns...)" inner),
+        # pinning sessions "working" forever. None carry a real spinner glyph
+        # AND a `·`-separated elapsed inner, so all must be rejected.
+        for line in [
+            "⏺ Updating deps (retried after 3s)",
+            "● Building image (timeout 30s)",
+            "✓ Deploying preview (took 12s)",
+            "- Fixing flaky test (was 3s, now 1s)",
+            '"Waiting on CI (usually 90s)"',
+        ]:
+            assert has_live_working_line([line]) is False, line
+
+
+class TestLiveBackgroundWork:
+    """has_live_background_work() keeps a session 'in flight' when its main
+    agent is parked at a ❯ prompt but it has background shells/monitors still
+    running — sub_agent_count only tracks Task/Explore sub-agents, not these
+    (aligned-tools-3 was idled despite a 1h monitor still running)."""
+
+    def test_shells_and_monitor_still_running(self):
+        lines = ["✻ Cogitated for 57m 56s · 2 shells, 1 monitor still running", "❯ "]
+        assert has_live_background_work(lines) is True
+
+    def test_single_monitor_still_running(self):
+        assert has_live_background_work(["· 1 monitor still running"]) is True
+
+    def test_plain_prose_still_running_is_ignored(self):
+        # No leading "<count> <unit>" → not Claude's background-task line.
+        assert has_live_background_work(["The dev server is still running on :3000"]) is False
+
+    def test_prose_with_count_but_no_separator_is_ignored(self):
+        # Code-review regression: assistant PROSE mentioning counts must not
+        # pin the session — Claude's own line always has the `·` separator
+        # ("… · 2 shells, 1 monitor still running").
+        assert has_live_background_work(["I see 2 shells still running right now"]) is False
+
+    def test_idle_pane_has_no_background_work(self):
+        assert has_live_background_work(["❯ ", "  some output", "done"]) is False
+
+
+class TestCompletionLineVsInlineSubagentSummary:
+    """has_completion_line() must NOT treat an inline sub-agent sub-task summary
+    as a finished turn. While a Task/Explore sub-agent runs, Claude prints past-
+    tense lines ("✻ Explored for 2m 10s") that match the completion regex but the
+    parent turn is still going — misreading them as "at rest" auto-idled an
+    actively-coding session (voxherd #1 showed IDLE while running an Explore
+    sub-agent)."""
+
+    def test_genuine_turn_end_completion_is_detected(self):
+        lines = [
+            "⏺ Here's the result.",
+            "✻ Crunched for 9m 27s",
+            "❯",
+        ]
+        assert has_completion_line(lines) is True
+        assert _extract_completion(lines) == ("Crunched", 567)
+
+    def test_inline_summary_with_subagent_chrome_below_is_rejected(self):
+        # The completion-shaped line sits ABOVE live sub-agent panel chrome (⎿ /
+        # ● Task(…)) — it's a mid-turn sub-task summary, not a turn end.
+        lines = [
+            "● Task(Explore bridge transcript pipeline)",
+            "✻ Explored for 2m 10s",
+            "  ⎿  32 tool uses · 49.8k tokens",
+            "  ⎿  Done",
+            "❯",
+        ]
+        assert has_completion_line(lines) is False
+        assert _extract_completion(lines) is None
+
+    def test_completion_above_finished_subagent_panel_still_detected(self):
+        # A genuine turn-end completion is the LAST content line; sub-agent chrome
+        # from earlier in the turn sits ABOVE it, so it must still be detected.
+        lines = [
+            "● Task(Explore bridge transcript pipeline)",
+            "  ⎿  Done (32 tool uses · 49.8k tokens)",
+            "✻ Worked for 14m 49s",
+            "❯",
+        ]
+        assert has_completion_line(lines) is True
+        assert _extract_completion(lines) == ("Worked", 889)
 
 
 # ---------------------------------------------------------------------------

@@ -31,6 +31,7 @@ class Session:
     assistant: str = "claude"  # claude | codex | gemini
     status: str = "idle"
     last_summary: str = ""
+    window_name: str = ""  # human display name (e.g. swarm role: planner, worker-1); overrides "project #N" in the UI
     registered_at: str = ""
     last_activity: str = ""
     tmux_target: str | None = None  # e.g. "voxherd-dev:0.0" — dispatch via send-keys
@@ -118,6 +119,7 @@ class Session:
             "assistant": self.assistant,
             "status": self.status,
             "last_summary": self.last_summary,
+            "window_name": self.window_name,
             "registered_at": self.registered_at,
             "last_activity": self.last_activity,
             "tmux_target": self.tmux_target,
@@ -167,6 +169,7 @@ class SessionManager:
                     assistant=normalize_assistant(d.get("assistant", "claude")),
                     status=d.get("status", "idle"),
                     last_summary=d.get("last_summary", ""),
+                    window_name=d.get("window_name", ""),
                     registered_at=d.get("registered_at", ""),
                     last_activity=d.get("last_activity", ""),
                     tmux_target=tmux_target,
@@ -391,6 +394,14 @@ class SessionManager:
         self._sessions[session_id] = session
         self._save()
         return session, removed
+
+    def set_window_name(self, session_id: str, name: str) -> bool:
+        s = self._sessions.get(session_id)
+        if not s:
+            return False
+        s.window_name = name
+        self._save()
+        return True
 
     def update_status(self, session_id: str, status: str, summary: str | None = None, *, activity_type: str | None = None, stop_reason: str | None = None) -> Session | None:
         """Update session status and optionally its summary. Returns None if not found."""

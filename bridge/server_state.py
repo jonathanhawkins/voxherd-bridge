@@ -64,6 +64,22 @@ server_port: int = 7777
 _terminal_subs: dict[str, dict[WebSocket, asyncio.Task]] = {}
 _terminal_subs_lock = asyncio.Lock()  # guards _terminal_subs mutations
 
+# DEBUG: counts of inbound WS messages by outcome/type (exposed via
+# /api/debug/clients) — used to diagnose whether the phone's terminal_subscribe
+# actually reaches the bridge and passes HMAC. Keys derive from client-supplied
+# `type` strings, so bound both key length and key count — a buggy/hostile
+# client must not be able to grow this dict without limit.
+inbound_stats: dict[str, int] = {}
+_INBOUND_STATS_MAX_KEYS = 64
+_INBOUND_STATS_KEY_LEN = 48
+
+
+def bump_inbound(key: str) -> None:
+    key = key[:_INBOUND_STATS_KEY_LEN]
+    if key not in inbound_stats and len(inbound_stats) >= _INBOUND_STATS_MAX_KEYS:
+        key = "other"
+    inbound_stats[key] = inbound_stats.get(key, 0) + 1
+
 # Callback set by cli.py to print events to the terminal via rich.
 # Signature: (level, project, message) where level is one of
 # "success", "warning", "error", "info".

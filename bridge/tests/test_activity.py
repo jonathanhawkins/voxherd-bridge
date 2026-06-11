@@ -339,6 +339,100 @@ class TestActivityTypeGate:
         ) is False
 
 
+class TestShouldAutoIdle:
+    """Focused unit tests for the auto-idle decision (``_should_auto_idle``).
+
+    The headline case is the idle-while-coding regression: voxherd #1 ran an
+    Explore sub-agent yet showed IDLE on the dashboard/lens, because the pane
+    read as at-rest (inline past-tense sub-task summary + the parent's working
+    line scrolled out of the capture window). A session with live sub-agents
+    must never be auto-idled regardless of how at-rest the pane looks.
+    """
+
+    def test_live_subagent_never_idles_even_when_effectively_idle(self):
+        from bridge.activity import _should_auto_idle
+        assert _should_auto_idle(
+            effective_idle=True,
+            has_live_subagents=True,
+            inactive_seconds=999.0,
+        ) is False
+
+    def test_live_subagent_never_idles_on_inactivity_timeout(self):
+        # detected stays None while a sub-agent owns the foreground, so
+        # _LAST_REAL_ACTIVITY wouldn't advance — the timeout path must also
+        # be suppressed, not just the immediate effective_idle path.
+        from bridge.activity import _should_auto_idle
+        assert _should_auto_idle(
+            effective_idle=False,
+            has_live_subagents=True,
+            inactive_seconds=999.0,
+        ) is False
+
+    def test_effectively_idle_with_no_subagents_idles_immediately(self):
+        from bridge.activity import _should_auto_idle
+        assert _should_auto_idle(
+            effective_idle=True,
+            has_live_subagents=False,
+            inactive_seconds=0.0,
+        ) is True
+
+    def test_not_at_rest_waits_for_timeout(self):
+        from bridge.activity import _should_auto_idle
+        assert _should_auto_idle(
+            effective_idle=False,
+            has_live_subagents=False,
+            inactive_seconds=1.0,
+            idle_timeout=12.0,
+        ) is False
+
+    def test_not_at_rest_idles_after_timeout(self):
+        from bridge.activity import _should_auto_idle
+        assert _should_auto_idle(
+            effective_idle=False,
+            has_live_subagents=False,
+            inactive_seconds=13.0,
+            idle_timeout=12.0,
+        ) is True
+
+
+class TestStrandedSubagentDecision:
+    """Unit tests for `_stranded_subagent_decision` — the self-heal that keeps a
+    dropped SubagentStop POST from pinning sub_agent_count > 0 forever (which, via
+    _should_auto_idle, would block the session from EVER auto-idling).
+
+    Hook tracking normally wins, but task files are independent ground truth: a
+    live Task sub-agent always has an in_progress task file. Zero in_progress for
+    N consecutive scans ⇒ the hook entries are stranded ⇒ clear them. Debounced so
+    the SubagentStart→task-file-write race and gaps between sequential agents don't
+    trigger a premature clear.
+    """
+
+    def test_task_files_confirm_live_agents_never_clears(self):
+        from bridge.activity import _stranded_subagent_decision
+        # hooks claim 2, task files confirm 1 in_progress → not stranded, reset.
+        assert _stranded_subagent_decision(2, 1, 99) == (False, 0)
+
+    def test_no_hook_entries_is_noop(self):
+        from bridge.activity import _stranded_subagent_decision
+        assert _stranded_subagent_decision(0, 0, 5) == (False, 0)
+
+    def test_single_miss_below_threshold_does_not_clear(self):
+        from bridge.activity import _stranded_subagent_decision
+        # First scan with hooks>0 but task files 0 — debounce, don't clear yet.
+        assert _stranded_subagent_decision(1, 0, 0, threshold=3) == (False, 1)
+
+    def test_reaches_threshold_clears(self):
+        from bridge.activity import _stranded_subagent_decision
+        # Third consecutive miss hits the threshold → clear the stranded entry.
+        assert _stranded_subagent_decision(1, 0, 2, threshold=3) == (True, 3)
+
+    def test_in_progress_resets_miss_counter_mid_debounce(self):
+        from bridge.activity import _stranded_subagent_decision
+        # A scan where task files show a live agent must reset the counter so a
+        # later genuine strand starts counting from zero again.
+        assert _stranded_subagent_decision(1, 2, 2, threshold=3) == (False, 0)
+
+
 @pytest.mark.asyncio
 class TestAutoIdleActivityTypeSync:
     """Regression for the 2026-05-20 sync bug: macOS bridge UI showed

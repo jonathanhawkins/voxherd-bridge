@@ -70,6 +70,31 @@ _BRAILLE_WORKING_RE = re.compile(
     r"\s*\((?P<inner>[^)]*)\)",
 )
 
+# Multi-word working line: a gerund verb followed by a DESCRIPTIVE PHRASE before
+# the "(elapsed · tokens)" inner — e.g. Claude's stop-hook status line:
+#   "✽ Adding assigneeSource provenance field… (running stop hooks… 1/3 · 2m 48s · ↓ 10.5k tokens)"
+# The single-gerund _WORKING_RE above requires the "(" right after the verb, so
+# it silently misses these — the session then reads as idle while it's actively
+# finishing.
+#
+# TIGHT on purpose (code review caught the loose version matching prose/tool
+# lines like "⏺ Updating deps (retried after 3s)" and pinning sessions
+# "working" forever):
+#   - leading glyph must be a REAL spinner frame (*, +, the ✢-❇ sparkle range,
+#     braille) — NOT `⏺`/`●`/`✓`/`-`/quotes, which lead tool/checklist/prose rows;
+#   - the gerund anchor is case-sensitive ([A-Z][a-z]+ing);
+#   - the inner must contain an elapsed token AND Claude's `·` separator (or
+#     "esc to interrupt") — prose parentheticals like "(took 12s)" or
+#     "(timeout 30s)" have no `·`.
+_WORKING_PHRASE_RE = re.compile(
+    r"^\s*[\*\+✢-❇⠀-⣿]{1,3}\s*"                  # real spinner glyph(s) only
+    r"(?P<verb>[A-Z][a-z]+ing)\b"                # gerund verb (case-sensitive)
+    r"[^()\n]*?"                                  # descriptive phrase (lazy)
+    r"\((?P<inner>"
+    r"(?=[^)]*\b\d+\s*s\b)(?=[^)]*(?:·|esc\s+to\s+interrupt))"  # elapsed AND separator
+    r"[^)]*)\)",
+)
+
 # Elapsed time inside a working-line "(...)". Claude always renders seconds,
 # with optional minutes/hours on long turns: "7s", "54s", "6m 40s", "1h 2m 3s".
 # (The old `\d+s`-only form silently failed on the minutes shape, so a turn
@@ -306,7 +331,8 @@ def _find_working_line(lines: list[str]) -> tuple[str, str, bool] | None:
             continue
         if _CAN_INTERRUPT_RE.search(stripped):
             can_interrupt = True
-        m = _WORKING_RE.match(stripped) or _BRAILLE_WORKING_RE.match(stripped)
+        m = (_WORKING_RE.match(stripped) or _BRAILLE_WORKING_RE.match(stripped)
+             or _WORKING_PHRASE_RE.match(stripped))
         if m:
             return m.group("verb"), m.group("inner"), can_interrupt
         if _is_status_bar_line(stripped):
@@ -327,6 +353,35 @@ def has_live_working_line(lines: list[str]) -> bool:
     return _find_working_line(lines) is not None
 
 
+# Background tasks Claude spawned that are STILL RUNNING, shown on its
+# completion/status line, e.g.:
+#   "✻ Cogitated for 57m 56s · 2 shells, 1 monitor still running"
+# The main agent may be parked at a ❯ prompt with a past-tense completion line,
+# but the session isn't done — those shells/monitors are live and will produce
+# output / re-invoke it. sub_agent_count only tracks Task/Explore sub-agents,
+# not these, so the poll's idle gate would otherwise auto-idle a session that's
+# clearly still working.
+# Anchored on Claude's own `·` separator immediately before the count
+# ("… · 2 shells, 1 monitor still running") so assistant PROSE that merely
+# mentions counts ("I see 2 shells still running") can't pin a session active.
+_BACKGROUND_RUNNING_RE = re.compile(
+    r"·\s*\d+\s+(?:shells?|monitors?|background\s+tasks?|bashes?|tasks?)\b"
+    r"[^\n·]*?\bstill\s+running\b",
+    re.IGNORECASE,
+)
+
+
+def has_live_background_work(lines: list[str]) -> bool:
+    """True when the pane shows Claude-spawned background tasks (shells,
+    monitors) still running. Keeps the session 'in flight' for the poll's idle
+    gate even when the main agent is parked at a prompt. Shared with
+    activity.py so the dashboard/lens don't mark a busy session idle."""
+    for line in lines:
+        if _BACKGROUND_RUNNING_RE.search(line):
+            return True
+    return False
+
+
 # Turn-COMPLETION line Claude prints when a turn finishes (past tense):
 #   "✻ Crunched for 9m 27s"   "✻ Worked for 14m 49s"   "✻ Churned for 1m 9s"
 # Anchored on the leading glyph (✻ etc.) + "<Verb> for <duration>" so prose
@@ -339,6 +394,15 @@ _COMPLETION_LINE_RE = re.compile(
 )
 _DUR_COMPONENT_RE = re.compile(r"(\d+)\s*(ms|h|m|s)\b", re.IGNORECASE)
 _DUR_UNIT_SECONDS = {"h": 3600, "m": 60, "s": 1, "ms": 0}
+
+# Sub-agent panel chrome: the "⎿" (U+23BF) tree-continuation marker that nests a
+# sub-agent's (Task/Explore) output, and the "● Task(" panel header. Used to tell
+# a turn-END completion line apart from an INLINE sub-task summary: while a sub-
+# agent runs, Claude prints past-tense lines ("✻ Explored for 2m 10s") that match
+# _COMPLETION_LINE_RE but do NOT mean the parent turn finished. The distinguishing
+# feature is sub-agent chrome at/below the completion-shaped line (a genuine turn-
+# end completion is the last content line, with only the prompt box beneath it).
+_SUBAGENT_CHROME_RE = re.compile(r"⎿|●\s*Task\(", re.IGNORECASE)
 
 
 def _parse_duration_seconds(phrase: str) -> int | None:
@@ -356,9 +420,20 @@ def _extract_completion(lines: list[str]) -> tuple[str, int | None] | None:
     """Most recent turn-completion line near the bottom as (verb, seconds),
     e.g. ("Crunched", 567) for "✻ Crunched for 9m 27s". Else None."""
     bottom = lines[-12:] if len(lines) > 12 else lines
+    # Scan bottom-up. Lines seen before the completion match are BELOW it; if any
+    # carries sub-agent panel chrome, the completion-shaped line is an inline sub-
+    # task summary printed mid-turn (the parent is still running a sub-agent), not
+    # a finished turn — reject it so the at-rest/idle gate doesn't sleep an active
+    # session (the "voxherd #1 showed IDLE while running an Explore sub-agent" bug).
+    subagent_chrome_below = False
     for raw in reversed(bottom):
-        m = _COMPLETION_LINE_RE.match(raw.strip())
+        stripped = raw.strip()
+        if _SUBAGENT_CHROME_RE.search(stripped):
+            subagent_chrome_below = True
+        m = _COMPLETION_LINE_RE.match(stripped)
         if m:
+            if subagent_chrome_below:
+                return None
             return m.group("verb").capitalize(), _parse_duration_seconds(m.group("dur"))
     return None
 

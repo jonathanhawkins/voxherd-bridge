@@ -257,6 +257,18 @@ _STICKY_HOLD_SECONDS = 5.0  # how long to hold a specific type before falling ba
 _LAST_REAL_ACTIVITY: dict[str, float] = {}
 _IDLE_TIMEOUT_SECONDS = 12.0  # mark active→idle after this many seconds with no detected activity
 
+# Consecutive task-file scans (every ~4.5s) where the HOOK path claims live
+# sub-agents but task files independently report zero in_progress, before we
+# treat the hook entries as stranded (a dropped SubagentStop POST — hooks fail
+# silently on network errors) and clear them. Without this, a stranded entry
+# pins sub_agent_count > 0 forever, and _should_auto_idle then blocks the
+# session from EVER auto-idling — the poller is the documented fallback for
+# missed hooks, so neutering it for sub-agent sessions would strand them
+# "active" at a bare prompt indefinitely. ~3 scans ≈ 13.5s grace absorbs the
+# SubagentStart→task-file write race and brief gaps between sequential agents.
+_SUBAGENT_STRANDED_THRESHOLD = 3
+_SUBAGENT_STRANDED_MISS: dict[str, int] = {}
+
 
 def _detect_activity_type(text: str) -> str | None:
     """Detect what the assistant (Claude/Codex/Gemini) is doing from terminal output.
@@ -359,6 +371,63 @@ def _should_overwrite_activity_type(
     gate directly without re-implementing the expression.
     """
     return session_status == "active" and local != current
+
+
+def _should_auto_idle(
+    *,
+    effective_idle: bool,
+    has_live_subagents: bool,
+    inactive_seconds: float,
+    idle_timeout: float = _IDLE_TIMEOUT_SECONDS,
+) -> bool:
+    """Decide whether an ``active`` session with no currently-detected activity
+    should be auto-idled.
+
+    A session running a sub-agent (Task/Explore) is NEVER idled: the parent turn
+    isn't finished even though the pane reads as at-rest. While a sub-agent owns
+    the foreground, Claude prints inline past-tense sub-task summaries
+    ("✻ Explored for 2m 10s") that look like turn-completion lines, and the
+    parent's live working line is frequently scrolled out of the ``-S -30``
+    capture window — so neither the working-line nor completion gate can tell
+    "turn done" from "sub-agent still running". ``sub_agent_count`` is tracked
+    independently (hook path + task-file scan) and is the authoritative signal.
+    This is the idle-while-coding bug where voxherd #1 ran an Explore sub-agent
+    yet showed IDLE on the dashboard/lens.
+
+    Otherwise: idle immediately when effectively idle (bare prompt / finished
+    turn, no working line), else only after ``idle_timeout`` seconds of no
+    detected activity. Extracted as a pure helper so the poll-loop decision is
+    unit-testable (mirrors ``_should_overwrite_activity_type``)."""
+    if has_live_subagents:
+        return False
+    if effective_idle:
+        return True
+    return inactive_seconds > idle_timeout
+
+
+def _stranded_subagent_decision(
+    hook_count: int,
+    task_count: int,
+    prev_misses: int,
+    threshold: int = _SUBAGENT_STRANDED_THRESHOLD,
+) -> tuple[bool, int]:
+    """Decide whether hook-tracked sub-agent entries are stranded and should be
+    cleared, given the independent task-file ``in_progress`` count.
+
+    Hook tracking (SubagentStart/Stop) is real-time and normally authoritative,
+    but a dropped SubagentStop POST strands the entry forever. Task files are an
+    independent ground truth — a live Task sub-agent always has an ``in_progress``
+    task file. So when hooks claim agents (``hook_count > 0``) but task files
+    report zero for ``threshold`` consecutive scans, the entries are stranded.
+
+    Returns ``(should_clear, new_misses)``. The consecutive-miss counter is
+    debounced to absorb the SubagentStart→task-file-write race and brief gaps
+    between sequential sub-agents — any scan with ``task_count > 0`` resets it.
+    Extracted as a pure helper so the debounce is unit-testable."""
+    if hook_count == 0 or task_count > 0:
+        return False, 0
+    new_misses = prev_misses + 1
+    return new_misses >= threshold, new_misses
 
 
 def _resolve_activity_type(session_id: str, detected: str | None, now: float) -> str:
@@ -623,6 +692,7 @@ async def _activity_poll_loop() -> None:
                         _CHOICE_MISS_COUNT.pop(sid, None)
                         _LAST_FORM_FOR_SESSION.pop(sid, None)
                         _FORM_MISS_COUNT.pop(sid, None)
+                        _SUBAGENT_STRANDED_MISS.pop(sid, None)
                         await _cancel_terminal_subs_for_session(sid, project=proj)
                         log_event("warning", proj, f"Pane gone — deregistered ({sid[:12]}...)")
                         await broadcast_to_ios({
@@ -661,6 +731,7 @@ async def _activity_poll_loop() -> None:
                         _CHOICE_MISS_COUNT.pop(sid, None)
                         _LAST_FORM_FOR_SESSION.pop(sid, None)
                         _FORM_MISS_COUNT.pop(sid, None)
+                        _SUBAGENT_STRANDED_MISS.pop(sid, None)
                         await _cancel_terminal_subs_for_session(sid, project=proj)
                         log_event("info", proj, f"{session.assistant.title()} exited — deregistered ({sid[:12]}...)")
                         await broadcast_to_ios({
@@ -713,8 +784,32 @@ async def _activity_poll_loop() -> None:
                     _pane_lines_for_state = clean.splitlines()
                     has_working_line = session_status.has_live_working_line(_pane_lines_for_state)
                     at_rest = has_idle_prompt or session_status.has_completion_line(_pane_lines_for_state)
-                    effective_idle = at_rest and not has_working_line
+                    # A session running a sub-agent (Task/Explore) is NOT at rest
+                    # even though the pane looks idle: Claude prints inline past-
+                    # tense sub-task summaries ("✻ Explored for 2m 10s") that read
+                    # as completion lines, and the parent's live working line is
+                    # often scrolled out of the -S -30 capture window, so neither
+                    # has_working_line nor the completion gate can tell "turn done"
+                    # from "sub-agent still running". sub_agent_count is tracked
+                    # independently (hook path + task-file scan) and is the
+                    # authoritative "work in flight" signal here.
+                    has_live_subagents = session.sub_agent_count > 0
+                    # Background shells/monitors Claude spawned ("· 2 shells,
+                    # 1 monitor still running" on its completion line) keep the
+                    # session in flight even when the main agent is parked at a
+                    # prompt. sub_agent_count only tracks Task/Explore sub-agents,
+                    # not these background tasks, so check the pane directly.
+                    has_background_work = session_status.has_live_background_work(_pane_lines_for_state)
+                    work_in_flight = has_live_subagents or has_background_work
+                    effective_idle = at_rest and not has_working_line and not work_in_flight
                     if session.status != "active":
+                        # Re-activation requires REAL detected activity (spinner /
+                        # tool call). Background shells alone must NOT flip an
+                        # idle session back to active — a long-lived dev server
+                        # keeps "· 1 shell still running" on the completion line
+                        # for hours and would otherwise override the Stop hook's
+                        # idle forever. work_in_flight still gates AUTO-IDLE
+                        # below (anti-flap while a turn is genuinely in flight).
                         if detected is not None and not effective_idle:
                             # Real activity in the terminal AND not effectively idle —
                             # re-activate (with cooldown to avoid flicker after stop events).
@@ -737,15 +832,12 @@ async def _activity_poll_loop() -> None:
                         # 1. Idle prompt is visible — idle immediately (no need to wait)
                         # 2. No idle prompt — wait _IDLE_TIMEOUT_SECONDS before idling
                         #    (might be between tool calls, thinking, etc.)
-                        should_idle = False
-                        if effective_idle:
-                            # Bare prompt visible, no working line, no active
-                            # tool patterns — Claude Code is waiting for input.
-                            should_idle = True
-                        else:
-                            last_real = _LAST_REAL_ACTIVITY.get(session.session_id, 0.0)
-                            if mono_now - last_real > _IDLE_TIMEOUT_SECONDS:
-                                should_idle = True
+                        last_real = _LAST_REAL_ACTIVITY.get(session.session_id, 0.0)
+                        should_idle = _should_auto_idle(
+                            effective_idle=effective_idle,
+                            has_live_subagents=work_in_flight,
+                            inactive_seconds=mono_now - last_real,
+                        )
                         if should_idle:
                             sessions.update_status(session.session_id, "idle")
                             # update_status set session.activity_type="sleeping".
@@ -1017,8 +1109,37 @@ async def _activity_poll_loop() -> None:
                         # Only use task-file data if hooks aren't providing anything.
                         hook_count = len(session.live_subagents)
                         if hook_count > 0:
-                            # Hooks are active — skip task-file overwrite
+                            # Hooks claim live sub-agents and normally win. BUT a
+                            # dropped SubagentStop POST strands the entry forever,
+                            # pinning sub_agent_count > 0 — and _should_auto_idle
+                            # then blocks this session from ever auto-idling. Cross-
+                            # check against task files (independent ground truth) and
+                            # clear the entries once they're confirmed stranded, so
+                            # the session can self-heal to idle.
+                            should_clear, misses = _stranded_subagent_decision(
+                                hook_count, task_count, _SUBAGENT_STRANDED_MISS.get(sid, 0),
+                            )
+                            if should_clear:
+                                session.live_subagents.clear()
+                                session.sub_agent_count = 0
+                                session.sub_agent_tasks = None
+                                _SUBAGENT_STRANDED_MISS.pop(sid, None)
+                                log_event("warning", session.project,
+                                          f"Cleared stranded sub-agent tracking — task files "
+                                          f"show none running ({sid[:12]}...)")
+                                await broadcast_to_ios({
+                                    "type": "sub_agent_update",
+                                    "session_id": sid,
+                                    "project": session.project,
+                                    "sub_agent_count": 0,
+                                    "sub_agent_tasks": [],
+                                })
+                            elif misses > 0:
+                                _SUBAGENT_STRANDED_MISS[sid] = misses
+                            else:
+                                _SUBAGENT_STRANDED_MISS.pop(sid, None)
                             continue
+                        _SUBAGENT_STRANDED_MISS.pop(sid, None)
                         prev_count = session.sub_agent_count
                         if task_count != prev_count or task_list != (session.sub_agent_tasks or []):
                             session.sub_agent_count = task_count
@@ -1074,6 +1195,7 @@ async def _periodic_prune() -> None:
                 _CHOICE_MISS_COUNT.pop(sid, None)
                 _LAST_FORM_FOR_SESSION.pop(sid, None)
                 _FORM_MISS_COUNT.pop(sid, None)
+                _SUBAGENT_STRANDED_MISS.pop(sid, None)
                 await _cancel_terminal_subs_for_session(sid, project=project)
                 await broadcast_to_ios({
                     "type": "session_removed",
@@ -1101,6 +1223,7 @@ async def _periodic_prune() -> None:
             _CHOICE_MISS_COUNT.pop(sid, None)
             _LAST_FORM_FOR_SESSION.pop(sid, None)
             _FORM_MISS_COUNT.pop(sid, None)
+            _SUBAGENT_STRANDED_MISS.pop(sid, None)
             await _cancel_terminal_subs_for_session(sid, project=project)
             log_event("warning", "bridge", f"Deregistered exited session: {project} ({sid[:12]}...)")
             await broadcast_to_ios({
