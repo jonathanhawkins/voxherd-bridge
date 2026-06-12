@@ -2313,6 +2313,42 @@ async def handle_voice_command(data: dict, websocket: WebSocket) -> None:
     log_event("warning", project, f"Command dispatched: {message}")
 
 
+async def _handle_dead_pane(
+    session_id: str, tmux_target: str, stderr: bytes | None
+) -> None:
+    """React to a dispatch whose tmux pane turned out to be gone.
+
+    ``tmux send-keys`` to a missing pane exits non-zero instead of raising,
+    so the dispatcher has to handle it explicitly. iOS already heard
+    "Sending to <project>" (``command_accepted`` is broadcast before this
+    task runs), and no Stop hook will fire because nothing ran — so without
+    this the session stays wedged "active" and every retry just re-announces
+    the send. Here we: log the real tmux error, drop the stale registration
+    so routing falls through to a live sibling (or cleanly reports "no
+    session"), tell iOS the command wasn't delivered, and push a fresh
+    state_sync so the dashboard/lens clear the stale card immediately. A
+    still-live session re-registers on its next SessionStart hook.
+    """
+    session = sessions.get_session(session_id)
+    project = session.project if session else "the session"
+    detail = (stderr or b"").decode("utf-8", "replace").strip()
+    log_event(
+        "error",
+        project,
+        f"tmux pane gone ({tmux_target}) — dropping stale session: "
+        f"{detail or 'no such pane'}",
+    )
+    sessions.remove_session(session_id)
+    await broadcast_to_ios({
+        "type": "error",
+        "session_id": session_id,
+        "message": f"{project}'s terminal has ended — the command wasn't delivered.",
+    })
+    # Immediate state refresh so iOS prunes the wedged "active" card instead
+    # of waiting for the next activity-poll tick.
+    await broadcast_to_ios(_state_sync_msg())
+
+
 async def _dispatch_agent(session_id: str, project_dir: str, message: str) -> None:
     """Send a command to a session's configured assistant.
 
@@ -2360,20 +2396,39 @@ async def _dispatch_agent(session_id: str, project_dir: str, message: str) -> No
             # Send the message text literally (-l prevents interpreting key names),
             # then send Enter as a separate command to submit it.
             # Must await each process to ensure ordering.
+            #
+            # CRITICAL: check each send-keys' return code. When the target
+            # pane is gone — common for a swarm whose worker/conductor tmux
+            # sessions come and go — `tmux send-keys` exits NON-ZERO
+            # ("can't find pane: …") WITHOUT raising a Python exception. The
+            # old code DEVNULL'd stderr and ignored the return code, so it
+            # logged "Sent to tmux pane" as success and the command silently
+            # vanished. Meanwhile iOS had already been told `command_accepted`
+            # and announced "Sending to <project>", and the Stop hook never
+            # fires (nothing ran) so the session stayed wedged "active" —
+            # every retry just re-announced "Sending to <project>" with no
+            # result. (This is the "stuck saying Sending to WeaveHacks4" bug.)
+            # Mirror the dead-pane handling the terminal poll loop already does.
             p1 = await asyncio.create_subprocess_exec(
                 "tmux", "send-keys", "-t", tmux_target, "-l", message,
                 stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
                 env=get_subprocess_env(),
             )
-            await asyncio.wait_for(p1.wait(), timeout=5.0)
+            _, err1 = await asyncio.wait_for(p1.communicate(), timeout=5.0)
+            if p1.returncode != 0:
+                await _handle_dead_pane(session_id, tmux_target, err1)
+                return
             p2 = await asyncio.create_subprocess_exec(
                 "tmux", "send-keys", "-t", tmux_target, "Enter",
                 stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
                 env=get_subprocess_env(),
             )
-            await asyncio.wait_for(p2.wait(), timeout=5.0)
+            _, err2 = await asyncio.wait_for(p2.communicate(), timeout=5.0)
+            if p2.returncode != 0:
+                await _handle_dead_pane(session_id, tmux_target, err2)
+                return
             log_event("info", "bridge", f"Sent to tmux pane {tmux_target}")
         except Exception as exc:
             log_event("error", "bridge", f"Failed to send to tmux: {exc}")
