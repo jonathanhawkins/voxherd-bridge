@@ -7,10 +7,13 @@ mounted on a FastAPI ``APIRouter``.
 from __future__ import annotations
 
 import asyncio
+import html as html_mod
 import json
 import os
 import re
 import socket
+
+import httpx
 
 from fastapi import APIRouter, Request
 from fastapi.responses import Response
@@ -485,24 +488,70 @@ async def get_project_subagents(project: str) -> dict:
     return {"sessions": result}
 
 
+# macOS ControlCenter answers on ports 5000/7000 as the AirPlay receiver
+# (`Server: AirTunes/...`). It looks like an open dev port but renders nothing.
+_AIRPLAY_SERVER_PREFIX = "AirTunes"
+
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+
+
+def _parse_html_title(body: str) -> str | None:
+    """Extract and normalize the <title> of an HTML document, or None."""
+    m = _TITLE_RE.search(body)
+    if not m:
+        return None
+    title = html_mod.unescape(m.group(1))
+    title = re.sub(r"\s+", " ", title).strip()
+    return title[:80] or None
+
+
+async def _probe_http(client: httpx.AsyncClient, port: int) -> dict | None:
+    """Identify what's serving an open port.
+
+    Returns a ports entry with the page ``title`` when the server speaks HTTP
+    and returns HTML, a bare entry when it doesn't (some dev tool we can't
+    classify — still worth listing), or None for the macOS AirPlay receiver.
+    """
+    entry = {"port": port, "url": f"http://localhost:{port}"}
+    try:
+        resp = await client.get(f"http://127.0.0.1:{port}/")
+    except Exception:
+        # Listening but not speaking plain HTTP (or too slow) — report as-is.
+        return entry
+    if resp.headers.get("server", "").startswith(_AIRPLAY_SERVER_PREFIX):
+        return None
+    if "html" in resp.headers.get("content-type", ""):
+        title = _parse_html_title(resp.text[:65536])
+        if title:
+            entry["title"] = title
+    return entry
+
+
 @router.get("/api/ports")
 async def scan_ports() -> dict:
-    """Scan common dev server ports and return which ones are listening."""
-    common_ports = [3000, 3001, 4000, 4200, 5000, 5173, 5174, 8000, 8080, 8888, 9000]
-    active: list[dict] = []
+    """Scan common dev server ports and return which ones are listening.
 
-    async def check_port(port: int) -> dict | None:
+    Entries carry the page ``title`` when the server returns HTML so clients
+    can label ports ("3000 · Aligned") instead of showing bare numbers.
+    """
+    common_ports = [
+        3000, 3001, 3002, 3003, 4000, 4200, 4321, 5000, 5173, 5174,
+        8000, 8080, 8081, 8787, 8788, 8888, 9000,
+    ]
+
+    async def check_port(client: httpx.AsyncClient, port: int) -> dict | None:
         try:
             _, writer = await asyncio.wait_for(
                 asyncio.open_connection("127.0.0.1", port), timeout=0.3
             )
             writer.close()
             await writer.wait_closed()
-            return {"port": port, "url": f"http://localhost:{port}"}
         except (OSError, asyncio.TimeoutError):
             return None
+        return await _probe_http(client, port)
 
-    results = await asyncio.gather(*[check_port(p) for p in common_ports])
+    async with httpx.AsyncClient(timeout=1.0, follow_redirects=True) as client:
+        results = await asyncio.gather(*[check_port(client, p) for p in common_ports])
     active = [r for r in results if r is not None]
     return {"ports": active}
 

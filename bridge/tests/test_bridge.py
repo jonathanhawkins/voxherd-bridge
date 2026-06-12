@@ -990,3 +990,70 @@ async def test_ports_endpoint(client: httpx.AsyncClient) -> None:
     data = resp.json()
     assert "ports" in data
     assert isinstance(data["ports"], list)
+
+
+def test_parse_html_title() -> None:
+    """_parse_html_title extracts, unescapes, and normalizes <title> text."""
+    from bridge.routes import _parse_html_title
+
+    assert _parse_html_title("<html><title>VoxHerd</title></html>") == "VoxHerd"
+    # Attributes, entities, and whitespace are handled
+    assert (
+        _parse_html_title('<title data-x="1">Aligned: Your company&#x27;s brain.</title>')
+        == "Aligned: Your company's brain."
+    )
+    assert _parse_html_title("<TITLE>\n  Multi\n  Line  </TITLE>") == "Multi Line"
+    # Missing or empty titles return None
+    assert _parse_html_title("<html><body>no title</body></html>") is None
+    assert _parse_html_title("<title>   </title>") is None
+    # Long titles are truncated to 80 chars
+    long = _parse_html_title(f"<title>{'x' * 200}</title>")
+    assert long is not None and len(long) == 80
+
+
+async def _serve_canned(response_bytes: bytes) -> tuple[asyncio.AbstractServer, int]:
+    """Start a localhost server that answers every connection with canned bytes."""
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            await reader.read(4096)
+            writer.write(response_bytes)
+            await writer.drain()
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    return server, port
+
+
+@pytest.mark.asyncio
+async def test_probe_http_classification() -> None:
+    """_probe_http labels HTML servers, skips AirPlay, keeps non-HTTP listeners."""
+    from bridge.routes import _probe_http
+
+    html_resp = (
+        b"HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: 33\r\n"
+        b"connection: close\r\n\r\n<html><title>My App</title></html>"
+    )
+    airplay_resp = (
+        b"HTTP/1.1 403 Forbidden\r\nserver: AirTunes/940.23.1\r\n"
+        b"content-length: 0\r\nconnection: close\r\n\r\n"
+    )
+    garbage_resp = b"\x00\x01not http at all"
+
+    async with httpx.AsyncClient(timeout=1.0) as probe_client:
+        server, port = await _serve_canned(html_resp)
+        async with server:
+            entry = await _probe_http(probe_client, port)
+        assert entry == {"port": port, "url": f"http://localhost:{port}", "title": "My App"}
+
+        server, port = await _serve_canned(airplay_resp)
+        async with server:
+            assert await _probe_http(probe_client, port) is None
+
+        server, port = await _serve_canned(garbage_resp)
+        async with server:
+            entry = await _probe_http(probe_client, port)
+        # Unclassifiable listener is still reported, just without a title
+        assert entry == {"port": port, "url": f"http://localhost:{port}"}
