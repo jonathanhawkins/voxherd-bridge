@@ -219,6 +219,10 @@ async def _drain_queued_command(session) -> None:
         "message": command,
         "activity_type": "working",
         "queued": True,
+        # queued_command is only ever set by the voice path (REST dispatches
+        # immediately), so the drain is the tail end of a spoken command —
+        # iOS announces it so the user knows their queued command went.
+        "origin": "queue",
     })
 
 

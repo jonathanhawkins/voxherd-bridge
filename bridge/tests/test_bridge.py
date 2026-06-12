@@ -650,6 +650,61 @@ async def test_rest_command_dispatch(client: httpx.AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_rest_command_broadcast_tagged_api_origin(client: httpx.AsyncClient) -> None:
+    """REST dispatches broadcast command_accepted with origin="api".
+
+    iOS only announces "Sending to <project>" for user-initiated origins
+    (voice/queue) — automation (swarm supervisors, Siri Shortcuts, scripts)
+    must be tagged "api" so a supervisor feeding N workers doesn't make the
+    phone chant the announcement once per worker.
+    """
+    await register_test_session(client, session_id="cmd-origin-1", project="myproject")
+
+    broadcasts: list[dict] = []
+
+    async def _capture(msg: dict) -> None:
+        broadcasts.append(msg)
+
+    with patch("bridge.ws_handler._dispatch_agent", new_callable=AsyncMock), \
+         patch("bridge.routes.broadcast_to_ios", new=_capture):
+        resp = await client.post(
+            "/api/command",
+            json={"project": "myproject", "message": "run the tests"},
+            headers=auth_headers(),
+        )
+        assert resp.json().get("ok") is True
+
+    accepted = next(m for m in broadcasts if m.get("type") == "command_accepted")
+    assert accepted["origin"] == "api"
+
+
+@pytest.mark.asyncio
+async def test_queued_drain_broadcast_tagged_queue_origin(client: httpx.AsyncClient) -> None:
+    """Draining a queued (voice-originated) command broadcasts origin="queue"."""
+    from bridge import activity as activity_mod
+    from bridge.server_state import sessions as session_store
+
+    await register_test_session(client, session_id="cmd-origin-2", project="myproject")
+    session = session_store.get_session("cmd-origin-2")
+    session.queued_command = "run the queued thing"
+
+    broadcasts: list[dict] = []
+
+    async def _capture(msg: dict) -> None:
+        broadcasts.append(msg)
+
+    with patch("bridge.ws_handler._dispatch_agent", new_callable=AsyncMock), \
+         patch("bridge.activity.broadcast_to_ios", new=_capture):
+        await activity_mod._drain_queued_command(session)
+        await asyncio.sleep(0.05)
+
+    accepted = next(m for m in broadcasts if m.get("type") == "command_accepted")
+    assert accepted["origin"] == "queue"
+    assert accepted["queued"] is True
+    assert session.queued_command is None
+
+
+@pytest.mark.asyncio
 async def test_rest_command_dispatch_filters_by_assistant(client: httpx.AsyncClient) -> None:
     """POST /api/command supports assistant-targeted dispatch when a project has mixed sessions."""
     await register_test_session(

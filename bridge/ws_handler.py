@@ -2309,6 +2309,11 @@ async def handle_voice_command(data: dict, websocket: WebSocket) -> None:
         "assistant": session.assistant,
         "message": message,
         "activity_type": "working",
+        # The user spoke this command — iOS announces "Sending to <project>".
+        # Automation dispatches (REST) are tagged "api" and stay silent; see
+        # routes.rest_command. A swarm feeding N workers through the REST
+        # API used to make the phone chant "Sending to X" N times over.
+        "origin": "voice",
     })
     log_event("warning", project, f"Command dispatched: {message}")
 

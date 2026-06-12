@@ -909,6 +909,11 @@ async def rest_command(body: dict) -> dict:
         "assistant": session.assistant,
         "message": message,
         "activity_type": "working",
+        # Automation path (Siri Shortcuts, swarm supervisors, scripts):
+        # iOS updates the UI but does NOT announce — Siri shows its own
+        # dialog, and a supervisor dispatching to N workers would otherwise
+        # have the phone chant "Sending to <project>" once per worker.
+        "origin": "api",
     })
     log_event("warning", session.project, f"REST command dispatched: {message}")
     return {"ok": True}
