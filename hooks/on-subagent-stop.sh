@@ -14,11 +14,11 @@ command -v jq >/dev/null 2>&1 || exit 0
 # Read all stdin into a variable first
 INPUT=$(cat)
 
-# Extract fields from SubagentStop hook JSON
-SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
-CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
-AGENT_ID=$(echo "$INPUT" | jq -r '.agent_id // empty')
-AGENT_TYPE=$(echo "$INPUT" | jq -r '.agent_type // empty')
+# Extract fields from SubagentStop hook JSON (Claude snake_case + Grok camelCase)
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // .sessionId // empty')
+CWD=$(echo "$INPUT" | jq -r '.cwd // .workspaceRoot // .workspace_root // empty')
+AGENT_ID=$(echo "$INPUT" | jq -r '.agent_id // .agentId // .subagent_id // .subagentId // empty')
+AGENT_TYPE=$(echo "$INPUT" | jq -r '.agent_type // .agentType // .subagent_type // .subagentType // empty')
 ASSISTANT=$(echo "${VOXHERD_HOOK_ASSISTANT:-claude}" | tr '[:upper:]' '[:lower:]')
 
 # Derive project name

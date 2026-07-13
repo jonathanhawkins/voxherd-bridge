@@ -13,8 +13,9 @@ command -v jq >/dev/null 2>&1 || exit 0
 
 INPUT=$(cat)
 
-SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
-CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
+# Claude snake_case + Grok camelCase
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // .sessionId // empty')
+CWD=$(echo "$INPUT" | jq -r '.cwd // .workspaceRoot // .workspace_root // empty')
 PROJECT_NAME=$(basename "$CWD")
 ASSISTANT=$(echo "${VOXHERD_HOOK_ASSISTANT:-claude}" | tr '[:upper:]' '[:lower:]')
 

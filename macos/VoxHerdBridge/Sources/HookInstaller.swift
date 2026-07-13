@@ -10,13 +10,33 @@ enum HookInstaller {
     }
 
     static var isInstalled: Bool {
-        guard let claudeSettings = try? String(
-            contentsOfFile: NSHomeDirectory() + "/.claude/settings.json",
+        let home = NSHomeDirectory()
+        // Any one of the supported assistant hook targets is enough to
+        // treat hooks as installed (Claude / Gemini settings, Grok hooks dir).
+        if let claudeSettings = try? String(
+            contentsOfFile: home + "/.claude/settings.json",
             encoding: .utf8
-        ) else {
-            return false
+        ), claudeSettings.contains(".voxherd/hooks/") {
+            return true
         }
-        return claudeSettings.contains(".voxherd/hooks/")
+        if let geminiSettings = try? String(
+            contentsOfFile: home + "/.gemini/settings.json",
+            encoding: .utf8
+        ), geminiSettings.contains(".voxherd/hooks/") {
+            return true
+        }
+        let grokHooks = home + "/.grok/hooks"
+        if let entries = try? FileManager.default.contentsOfDirectory(atPath: grokHooks) {
+            for name in entries where name.hasPrefix("voxherd-") && name.hasSuffix(".json") {
+                if let body = try? String(
+                    contentsOfFile: grokHooks + "/" + name,
+                    encoding: .utf8
+                ), body.contains(".voxherd/hooks/") || body.contains("on-stop") {
+                    return true
+                }
+            }
+        }
+        return false
     }
 
     static func install() -> Result {

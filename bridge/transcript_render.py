@@ -140,19 +140,21 @@ def _allowed_transcript_roots(assistant: str) -> list[str]:
         "claude": "~/.claude",
         "gemini": "~/.gemini",
         "codex": "~/.codex",
+        "grok": "~/.grok",
+        "composer": "~/.grok",
     }
     roots: list[str] = []
     primary = preferred.get(assistant)
     if primary:
         roots.append(os.path.realpath(os.path.expanduser(primary)))
-    for fallback in ("~/.claude", "~/.gemini", "~/.codex"):
+    for fallback in ("~/.claude", "~/.gemini", "~/.codex", "~/.grok"):
         candidate = os.path.realpath(os.path.expanduser(fallback))
         if candidate not in roots:
             roots.append(candidate)
     if _IS_WINDOWS:
         appdata = os.environ.get("APPDATA", "")
         if appdata:
-            for name in ("claude", "gemini", "codex"):
+            for name in ("claude", "gemini", "codex", "grok"):
                 candidate = os.path.realpath(os.path.join(appdata, name))
                 if candidate not in roots:
                     roots.append(candidate)

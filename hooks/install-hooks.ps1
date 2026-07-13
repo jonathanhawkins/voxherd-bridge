@@ -293,6 +293,50 @@ foreach ($agent in $TargetAgents) {
         "codex" {
             $Skipped += "codex (no native lifecycle hook API)"
         }
+        { $_ -in @("grok", "composer") } {
+            Write-Host "Updating Grok Build hooks..."
+            $hooksDir = Join-Path $env:USERPROFILE ".grok\hooks"
+            if (-not (Test-Path $hooksDir)) {
+                New-Item -ItemType Directory -Path $hooksDir -Force | Out-Null
+            }
+            # Soft-default assistant=grok so spawn can set VOXHERD_HOOK_ASSISTANT=composer.
+            $softEnv = 'if (-not $env:VOXHERD_HOOK_ASSISTANT) { $env:VOXHERD_HOOK_ASSISTANT = "grok" }'
+            $events = @{
+                "SessionStart" = "$softEnv; & '$HooksDest\on-session-start.ps1'"
+                "Stop"         = "$softEnv; python3 '$HooksDest\on-stop.py'"
+                "Notification" = "$softEnv; & '$HooksDest\on-notification.ps1'"
+                "SubagentStart" = "$softEnv; bash '$HooksDest\on-subagent-start.sh'"
+                "SubagentStop"  = "$softEnv; bash '$HooksDest\on-subagent-stop.sh'"
+            }
+            foreach ($eventName in $events.Keys) {
+                $cmd = $events[$eventName]
+                $path = Join-Path $hooksDir "voxherd-$eventName.json"
+                $psCmd = "powershell -ExecutionPolicy Bypass -Command `"$cmd`""
+                $entry = @{
+                    hooks = @{
+                        $eventName = @(
+                            @{
+                                hooks = @(
+                                    @{
+                                        type = "command"
+                                        command = $psCmd
+                                        timeout = 30
+                                    }
+                                )
+                            }
+                        )
+                    }
+                }
+                if (Test-Path $path) {
+                    $existing = Get-Content -Path $path -Raw -ErrorAction SilentlyContinue
+                    if ($existing -and $existing -match "on-stop\.|on-session-start\.|on-notification\.") {
+                        continue
+                    }
+                }
+                ($entry | ConvertTo-Json -Depth 10) | Set-Content -Path $path -Encoding UTF8
+            }
+            $Installed += "grok:$hooksDir"
+        }
         default {
             $Skipped += "$agent (unsupported)"
         }

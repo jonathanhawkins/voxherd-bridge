@@ -112,6 +112,37 @@ async def test_register_session_with_assistant(client: httpx.AsyncClient) -> Non
 
 
 @pytest.mark.asyncio
+async def test_register_session_grok_and_composer(client: httpx.AsyncClient) -> None:
+    """POST /api/sessions/register accepts Grok 4.5 and Composer assistant ids."""
+    for sid, assistant in (
+        ("assist-grok-1", "grok"),
+        ("assist-composer-1", "composer"),
+        ("assist-grok-alias-1", "grok-4.5"),
+        ("assist-composer-alias-1", "grok-composer-2.5-fast"),
+    ):
+        resp = await client.post(
+            "/api/sessions/register",
+            json={
+                "session_id": sid,
+                "project": "myproject",
+                "project_dir": _TEST_PROJECT_DIR,
+                "assistant": assistant,
+            },
+            headers=auth_headers(),
+        )
+        assert resp.status_code == 200, assistant
+        assert resp.json().get("ok") is True, assistant
+
+    list_resp = await client.get("/api/sessions", headers=auth_headers())
+    sessions = list_resp.json()
+    assert sessions["assist-grok-1"]["assistant"] == "grok"
+    assert sessions["assist-composer-1"]["assistant"] == "composer"
+    # Aliases normalize to canonical ids
+    assert sessions["assist-grok-alias-1"]["assistant"] == "grok"
+    assert sessions["assist-composer-alias-1"]["assistant"] == "composer"
+
+
+@pytest.mark.asyncio
 async def test_register_session_invalid_assistant(client: httpx.AsyncClient) -> None:
     """POST /api/sessions/register rejects unknown assistant ids."""
     resp = await client.post(

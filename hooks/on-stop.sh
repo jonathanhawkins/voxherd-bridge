@@ -17,11 +17,11 @@ fi
 # Read all stdin into a variable
 INPUT=$(cat)
 
-# Extract fields from stdin JSON
-SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
-CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
-TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcript_path // empty')
-STOP_REASON=$(echo "$INPUT" | jq -r '.stop_reason // "completed"')
+# Extract fields from stdin JSON (Claude snake_case + Grok camelCase)
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // .sessionId // empty')
+CWD=$(echo "$INPUT" | jq -r '.cwd // .workspaceRoot // .workspace_root // empty')
+TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcript_path // .transcriptPath // empty')
+STOP_REASON=$(echo "$INPUT" | jq -r '.stop_reason // .stopReason // "completed"')
 
 PROJECT_DIR="$CWD"
 PROJECT_NAME=$(basename "$PROJECT_DIR")

@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # install.sh - Install VoxHerd hooks for supported assistant CLIs.
 #
-# By default, auto-detects which CLIs (Claude, Codex, Gemini) are installed
+# By default, auto-detects which CLIs (Claude, Codex, Gemini, Grok) are installed
 # and configures hooks for all of them. Falls back to Claude if none detected.
 #
 # Usage:
 #   bash hooks/install.sh                          # auto-detect all installed CLIs
 #   HOOK_AGENTS=codex bash hooks/install.sh        # install only for Codex
 #   HOOK_AGENTS=claude,codex bash hooks/install.sh # install for specific CLIs
+#   HOOK_AGENTS=grok bash hooks/install.sh         # Grok Build (Grok 4.5 + Composer)
 #
 # Notes:
 # - Claude + Gemini use lifecycle hooks (JSON via stdin) in ~/.claude/ and ~/.gemini/.
 # - Codex uses a `notify` handler (JSON via argv) configured in ~/.codex/config.toml.
+# - Grok Build uses lifecycle hooks as JSON files under ~/.grok/hooks/*.json.
 
 set -e
 
@@ -66,6 +68,10 @@ else
   command -v claude &>/dev/null && TARGET_AGENTS+=("claude")
   command -v codex  &>/dev/null && TARGET_AGENTS+=("codex")
   command -v gemini &>/dev/null && TARGET_AGENTS+=("gemini")
+  # Grok Build CLI may live only under ~/.grok/bin (not always on PATH).
+  if command -v grok &>/dev/null || [ -x "$HOME/.grok/bin/grok" ]; then
+    TARGET_AGENTS+=("grok")
+  fi
   # If none detected, default to claude (it may be installed later)
   if [ "${#TARGET_AGENTS[@]}" -eq 0 ]; then
     TARGET_AGENTS=("claude")
@@ -225,6 +231,65 @@ TOML
   echo "$config_path"
 }
 
+write_grok_hook_file() {
+  # Write or merge a single-event hook file under ~/.grok/hooks/.
+  # Soft-default VOXHERD_HOOK_ASSISTANT so Composer spawn can override via env.
+  local event_name="$1"
+  local command="$2"
+  local marker="$3"
+  local hooks_dir="$HOME/.grok/hooks"
+  local path="$hooks_dir/voxherd-${event_name}.json"
+  mkdir -p "$hooks_dir"
+
+  local entry
+  entry="$(jq -n \
+    --arg event "$event_name" \
+    --arg cmd "$command" \
+    '{hooks: {($event): [{hooks: [{type: "command", command: $cmd, timeout: 30}]}]}}')"
+
+  if [ -f "$path" ] && jq empty "$path" 2>/dev/null; then
+    local already
+    already="$(jq --arg marker "$marker" '
+      [.hooks // {} | to_entries[] | .value[]? | .hooks[]? | .command // ""]
+      | any(contains($marker))
+    ' "$path")"
+    if [ "$already" = "true" ]; then
+      return 0
+    fi
+    # Merge our event key without clobbering other events in the same file
+    jq --argjson entry "$entry" --arg event "$event_name" '
+      .hooks = (.hooks // {})
+      | .hooks[$event] = ((.hooks[$event] // []) + ($entry.hooks[$event] // []))
+    ' "$path" > "${path}.tmp" && mv "${path}.tmp" "$path"
+  else
+    echo "$entry" | jq '.' > "$path"
+  fi
+}
+
+install_grok_hooks() {
+  # Grok Build discovers global hooks from ~/.grok/hooks/*.json
+  # (see ~/.grok/docs/user-guide/10-hooks.md). Events match Claude: SessionStart,
+  # Stop, Notification, SubagentStart, SubagentStop.
+  # Soft-default assistant=grok so VOXHERD_HOOK_ASSISTANT=composer from spawn env
+  # is preserved when present.
+  local soft_env='export VOXHERD_HOOK_ASSISTANT="${VOXHERD_HOOK_ASSISTANT:-grok}"'
+  local stop_cmd notif_cmd sess_cmd sub_start_cmd sub_stop_cmd
+
+  stop_cmd="${soft_env}; python3 \"\$HOME/.voxherd/hooks/on-stop.py\""
+  notif_cmd="${soft_env}; \"\$HOME/.voxherd/hooks/on-notification.sh\""
+  sess_cmd="${soft_env}; \"\$HOME/.voxherd/hooks/on-session-start.sh\""
+  sub_start_cmd="${soft_env}; \"\$HOME/.voxherd/hooks/on-subagent-start.sh\""
+  sub_stop_cmd="${soft_env}; \"\$HOME/.voxherd/hooks/on-subagent-stop.sh\""
+
+  write_grok_hook_file "Stop" "$stop_cmd" "on-stop.py"
+  write_grok_hook_file "Notification" "$notif_cmd" "on-notification.sh"
+  write_grok_hook_file "SessionStart" "$sess_cmd" "on-session-start.sh"
+  write_grok_hook_file "SubagentStart" "$sub_start_cmd" "on-subagent-start.sh"
+  write_grok_hook_file "SubagentStop" "$sub_stop_cmd" "on-subagent-stop.sh"
+
+  echo "$HOME/.grok/hooks/"
+}
+
 INSTALLED=()
 SKIPPED=()
 
@@ -241,6 +306,11 @@ for agent in "${TARGET_AGENTS[@]}"; do
     codex)
       echo "Updating Codex settings..."
       INSTALLED+=("codex:$(install_codex_hooks)")
+      ;;
+    grok|composer)
+      # Both Grok 4.5 and Composer use the Grok Build CLI + ~/.grok/hooks.
+      echo "Updating Grok Build hooks..."
+      INSTALLED+=("grok:$(install_grok_hooks)")
       ;;
     *)
       SKIPPED+=("$agent (unsupported)")

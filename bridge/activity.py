@@ -27,7 +27,7 @@ from bridge.server_state import (
 )
 import bridge.server_state as _state
 from bridge.validation import _ANSI_RE, _load_projects
-from bridge.assistant import infer_assistant_from_process
+from bridge.assistant import assistants_compatible, infer_assistant_from_process
 
 
 # Tracks the active numbered-choice prompt per session so the activity
@@ -720,8 +720,14 @@ async def _activity_poll_loop() -> None:
 
                     # Correct assistant field if the actual process differs
                     # (e.g. session registered as "claude" but running Codex).
+                    # Grok 4.5 and Composer share the same binary — don't thrash
+                    # between those ids.
                     detected = infer_assistant_from_process(fg_cmd)
-                    if detected and detected != session.assistant:
+                    if (
+                        detected
+                        and detected != session.assistant
+                        and not assistants_compatible(detected, session.assistant)
+                    ):
                         session.assistant = detected
 
                     if is_shell:

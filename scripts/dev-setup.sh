@@ -81,6 +81,14 @@ else
   echo "  gemini CLI OK"
 fi
 
+# grok CLI (optional — Grok Build / Composer)
+if ! command -v grok &>/dev/null && [ ! -x "$HOME/.grok/bin/grok" ]; then
+  echo "  Warning: grok CLI not found."
+  echo "  Install from https://x.ai/cli"
+else
+  echo "  grok CLI OK"
+fi
+
 # wscat (optional)
 if ! command -v wscat &>/dev/null; then
   echo "  Warning: wscat not found. Manual WebSocket testing won't be available."

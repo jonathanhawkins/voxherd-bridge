@@ -14,9 +14,9 @@ command -v jq >/dev/null 2>&1 || exit 0
 # Read all stdin into a variable first
 INPUT=$(cat)
 
-# Extract fields
-SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
-CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
+# Extract fields (Claude snake_case + Grok camelCase)
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // .sessionId // empty')
+CWD=$(echo "$INPUT" | jq -r '.cwd // .workspaceRoot // .workspace_root // empty')
 ASSISTANT=$(echo "${VOXHERD_HOOK_ASSISTANT:-claude}" | tr '[:upper:]' '[:lower:]')
 
 PROJECT_DIR="$CWD"

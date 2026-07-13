@@ -35,11 +35,12 @@ from bridge.env_utils import get_subprocess_env
 from bridge.transcript_render import find_transcript_path, render_transcript_cached
 import bridge.server_state as _state
 from bridge.assistant import (
+    apply_assistant_env,
+    build_tmux_spawn_argv,
     default_assistant,
     is_supported_assistant,
     normalize_assistant,
     resume_command_for_assistant,
-    spawn_command_for_assistant,
     supports_hooks,
 )
 
@@ -1838,6 +1839,13 @@ async def _handle_spawn_session(data: dict, ws: WebSocket) -> None:
     project_name = data.get("project", "")
     prompt = _sanitize_message(data.get("prompt", ""))
     raw_assistant = data.get("assistant")
+    # Optional cockpit overrides (Grok family): model id + reasoning effort.
+    raw_model = data.get("model")
+    raw_effort = data.get("reasoning_effort")
+    if raw_effort is None:
+        raw_effort = data.get("effort")  # cockpit alias
+    model_override = raw_model.strip() if isinstance(raw_model, str) else None
+    effort_override = raw_effort.strip() if isinstance(raw_effort, str) else None
 
     if raw_assistant is not None and not isinstance(raw_assistant, str):
         try:
@@ -1905,16 +1913,21 @@ async def _handle_spawn_session(data: dict, ws: WebSocket) -> None:
 
     try:
         # Spawn tmux session running the selected assistant.
-        env = get_subprocess_env()
-        if assistant == "claude":
-            # Set env to share task list across all Claude agents.
-            env["CLAUDE_CODE_TASK_LIST_ID"] = "voxherd"
-
-        spawn_cmd = spawn_command_for_assistant(assistant)
+        # Pane env (VOXHERD_HOOK_ASSISTANT, CLAUDE_CODE_TASK_LIST_ID) is injected
+        # via tmux -e + `env` prefix — the tmux *client* env is NOT inherited by
+        # the pane (setting env=… alone does not reach SessionStart hooks).
+        # model / reasoning_effort flow through for Grok family only.
+        tmux_argv = build_tmux_spawn_argv(
+            tmux_session,
+            project_dir,
+            assistant,
+            model=model_override,
+            reasoning_effort=effort_override,
+        )
+        env = apply_assistant_env(get_subprocess_env(), assistant)
 
         proc = await asyncio.create_subprocess_exec(
-            "tmux", "new-session", "-d", "-s", tmux_session,
-            "-c", project_dir, "--", *spawn_cmd,
+            *tmux_argv,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
             env=env,
@@ -2453,9 +2466,8 @@ async def _dispatch_agent(session_id: str, project_dir: str, message: str) -> No
                 })
                 return
 
-            env = get_subprocess_env()
-            if assistant == "claude":
-                env["CLAUDE_CODE_TASK_LIST_ID"] = "voxherd"
+            # Headless resume inherits this env (unlike tmux panes).
+            env = apply_assistant_env(get_subprocess_env(), assistant)
 
             # Pipe stdout so we can tail the stream-json event log and
             # surface live progress (current tool, token counts) into

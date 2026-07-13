@@ -36,8 +36,8 @@ try {
     exit 0
 }
 
-$SessionId = if ($hookInput.session_id) { $hookInput.session_id } else { "" }
-$Cwd = if ($hookInput.cwd) { $hookInput.cwd } else { "" }
+$SessionId = if ($hookInput.session_id) { $hookInput.session_id } elseif ($hookInput.sessionId) { $hookInput.sessionId } else { "" }
+$Cwd = if ($hookInput.cwd) { $hookInput.cwd } elseif ($hookInput.workspaceRoot) { $hookInput.workspaceRoot } else { "" }
 $ProjectName = if ($Cwd) { Split-Path -Leaf $Cwd } else { "unknown" }
 $Assistant = if ($env:VOXHERD_HOOK_ASSISTANT) { $env:VOXHERD_HOOK_ASSISTANT.ToLower() } else { "claude" }
 $Timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")

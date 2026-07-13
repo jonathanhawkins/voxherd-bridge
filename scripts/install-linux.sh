@@ -156,6 +156,12 @@ else
   warn "gemini CLI not found. Install from https://github.com/google-gemini/gemini-cli"
 fi
 
+if command -v grok &>/dev/null || [ -x "$HOME/.grok/bin/grok" ]; then
+  success "grok CLI found: $(command -v grok 2>/dev/null || echo "$HOME/.grok/bin/grok")"
+else
+  warn "grok CLI not found. Install from https://x.ai/cli"
+fi
+
 # HOOK_AGENTS can be set explicitly; otherwise install.sh auto-detects
 HOOK_AGENTS_TO_INSTALL="${HOOK_AGENTS:-}"
 

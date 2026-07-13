@@ -69,10 +69,10 @@ try {
     exit 0
 }
 
-$SessionId = if ($hookInput.session_id) { $hookInput.session_id } else { "" }
-$Cwd = if ($hookInput.cwd) { $hookInput.cwd } else { "" }
-$TranscriptPath = if ($hookInput.transcript_path) { $hookInput.transcript_path } else { "" }
-$StopReason = if ($hookInput.stop_reason) { $hookInput.stop_reason } else { "completed" }
+$SessionId = if ($hookInput.session_id) { $hookInput.session_id } elseif ($hookInput.sessionId) { $hookInput.sessionId } else { "" }
+$Cwd = if ($hookInput.cwd) { $hookInput.cwd } elseif ($hookInput.workspaceRoot) { $hookInput.workspaceRoot } else { "" }
+$TranscriptPath = if ($hookInput.transcript_path) { $hookInput.transcript_path } elseif ($hookInput.transcriptPath) { $hookInput.transcriptPath } else { "" }
+$StopReason = if ($hookInput.stop_reason) { $hookInput.stop_reason } elseif ($hookInput.stopReason) { $hookInput.stopReason } else { "completed" }
 
 $ProjectDir = $Cwd
 $ProjectName = if ($ProjectDir) { Split-Path -Leaf $ProjectDir } else { "unknown" }

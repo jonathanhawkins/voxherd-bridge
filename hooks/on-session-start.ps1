@@ -36,8 +36,8 @@ try {
     exit 0
 }
 
-$SessionId = if ($hookInput.session_id) { $hookInput.session_id } else { "" }
-$Cwd = if ($hookInput.cwd) { $hookInput.cwd } else { "" }
+$SessionId = if ($hookInput.session_id) { $hookInput.session_id } elseif ($hookInput.sessionId) { $hookInput.sessionId } else { "" }
+$Cwd = if ($hookInput.cwd) { $hookInput.cwd } elseif ($hookInput.workspaceRoot) { $hookInput.workspaceRoot } else { "" }
 
 $ProjectDir = $Cwd
 $ProjectName = if ($ProjectDir) { Split-Path -Leaf $ProjectDir } else { "unknown" }

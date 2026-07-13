@@ -78,7 +78,7 @@ struct OnboardingView: View {
 
     private var hooksStep: some View {
         StepCard(number: 1, title: "Install Claude Code hooks") {
-            Text("VoxHerd needs to know when your agents finish so it can announce results. This adds a hook entry to `~/.claude/settings.json` (also `~/.codex/` and `~/.gemini/` if those CLIs are installed).")
+            Text("VoxHerd needs to know when your agents finish so it can announce results. This adds a hook entry to `~/.claude/settings.json` (also `~/.codex/`, `~/.gemini/`, and `~/.grok/hooks/` if those CLIs are installed).")
                 .font(.callout)
                 .foregroundStyle(.secondary)
 

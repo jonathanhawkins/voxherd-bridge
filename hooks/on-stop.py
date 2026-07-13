@@ -191,10 +191,22 @@ except Exception as e:
     log(f"Failed to read stdin: {e}")
     sys.exit(0)
 
-session_id = hook_input.get("session_id", "")
-cwd = hook_input.get("cwd", "")
-transcript_path = hook_input.get("transcript_path", "")
-stop_reason = hook_input.get("stop_reason", "completed")
+def _hook_field(*keys: str, default: str = "") -> str:
+    """Read the first non-empty field (Claude snake_case or Grok camelCase)."""
+    for key in keys:
+        val = hook_input.get(key)
+        if val is None:
+            continue
+        text = str(val).strip()
+        if text:
+            return text
+    return default
+
+
+session_id = _hook_field("session_id", "sessionId")
+cwd = _hook_field("cwd", "workspaceRoot", "workspace_root")
+transcript_path = _hook_field("transcript_path", "transcriptPath")
+stop_reason = _hook_field("stop_reason", "stopReason", default="completed")
 assistant = str(os.environ.get("VOXHERD_HOOK_ASSISTANT", "claude")).strip().lower() or "claude"
 
 # VOXHERD_QUIET: this session never speaks. Skip the (slow, paid) AI summary
@@ -254,12 +266,14 @@ def _allowed_transcript_roots() -> list[str]:
         "claude": "~/.claude",
         "gemini": "~/.gemini",
         "codex": "~/.codex",
+        "grok": "~/.grok",
+        "composer": "~/.grok",
     }
     roots: list[str] = []
     primary = preferred.get(assistant)
     if primary:
         roots.append(os.path.realpath(os.path.expanduser(primary)))
-    for fallback in ("~/.claude", "~/.gemini", "~/.codex"):
+    for fallback in ("~/.claude", "~/.gemini", "~/.codex", "~/.grok"):
         candidate = os.path.realpath(os.path.expanduser(fallback))
         if candidate not in roots:
             roots.append(candidate)
@@ -267,7 +281,7 @@ def _allowed_transcript_roots() -> list[str]:
     if _IS_WINDOWS:
         appdata = os.environ.get("APPDATA", "")
         if appdata:
-            for name in ("claude", "gemini", "codex"):
+            for name in ("claude", "gemini", "codex", "grok"):
                 candidate = os.path.realpath(os.path.join(appdata, name))
                 if candidate not in roots:
                     roots.append(candidate)
