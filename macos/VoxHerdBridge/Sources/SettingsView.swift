@@ -135,6 +135,33 @@ struct SettingsView: View {
         return components.string ?? "voxherd://connect"
     }
 
+
+    /// Re-launch the bridge so a changed voice flag actually takes effect.
+    ///
+    /// Text-to-Speech is runtime state and flips on a running server through
+    /// `POST /api/tts/state`. `--listen` and `--wake-word` are not: they are
+    /// **process arguments**, read once when the bridge is spawned, and the
+    /// bridge exposes no endpoint for them. So the two toggles below wrote to
+    /// `UserDefaults` and stopped there — visually identical to the TTS toggle
+    /// beside them, and doing nothing whatsoever until someone happened to hit
+    /// Stop Bridge / Start Bridge.
+    ///
+    /// That is this project's worst failure shape: it fails by doing nothing.
+    /// The user turned both on, said "Hey Claude", and nothing was listening —
+    /// with no error anywhere to explain why, because nothing had gone wrong.
+    ///
+    /// Restarting only while running keeps the toggles usable with the bridge
+    /// stopped, where `start()` reads the fresh preferences anyway.
+    private func applyVoiceArguments() {
+        guard let pm = processManager, pm.state == .running else { return }
+        pm.restart(
+            port: preferences.bridgePort,
+            enableTTS: preferences.enableTTS,
+            enableSTT: preferences.enableSTT,
+            enableWakeWord: preferences.enableWakeWord
+        )
+    }
+
     private var voiceFeaturesSection: some View {
         Section {
             voiceToggle(
@@ -153,12 +180,24 @@ struct SettingsView: View {
             voiceToggle(
                 title: "Speech-to-Text",
                 subtitle: "Listen for voice commands after announcements",
-                isOn: $preferences.enableSTT
+                isOn: Binding(
+                    get: { preferences.enableSTT },
+                    set: { newValue in
+                        preferences.enableSTT = newValue
+                        applyVoiceArguments()
+                    }
+                )
             )
             voiceToggle(
                 title: "Wake Word",
-                subtitle: "Always-on listening for \"Hey Claude\"",
-                isOn: $preferences.enableWakeWord
+                subtitle: "Always-on listening for \"Hey agent\"",
+                isOn: Binding(
+                    get: { preferences.enableWakeWord },
+                    set: { newValue in
+                        preferences.enableWakeWord = newValue
+                        applyVoiceArguments()
+                    }
+                )
             )
 
             Label {

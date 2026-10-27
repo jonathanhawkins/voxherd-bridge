@@ -27,8 +27,25 @@ PROJECT_DIR="$CWD"
 PROJECT_NAME=$(basename "$PROJECT_DIR")
 ASSISTANT=$(echo "${VOXHERD_HOOK_ASSISTANT:-claude}" | tr '[:upper:]' '[:lower:]')
 
-# VOXHERD_QUIET: this session never speaks. Skip the (slow, paid) Haiku
-# summary entirely and tell the bridge to stay silent via skip_tts. The
+# Which model summarises this turn is an install-time decision (models.env,
+# written by hooks/install.sh). Resolve it through the shared resolver; if that
+# file is missing for any reason, fall back to the hardcoded Claude Haiku
+# default so the hook behaves exactly as it always has.
+_VH_HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+if [ -r "$_VH_HOOK_DIR/model-profile.sh" ]; then
+  # shellcheck source=model-profile.sh
+  . "$_VH_HOOK_DIR/model-profile.sh" 2>/dev/null
+fi
+if ! type voxherd_summary_argv >/dev/null 2>&1; then
+  voxherd_summary_argv() {
+    VOXHERD_SUMMARY_CLI="claude"
+    VOXHERD_SUMMARY_MODEL="claude-haiku-4-5-20251001"
+    VOXHERD_SUMMARY_ARGV=("claude" "-p" "$1" "--model" "claude-haiku-4-5-20251001")
+  }
+fi
+
+# VOXHERD_QUIET: this session never speaks. Skip the (slow, paid) summary
+# entirely and tell the bridge to stay silent via skip_tts. The
 # session still POSTs its stop event so it stays visible on the dashboard.
 QUIET=""
 case "$(printf '%s' "${VOXHERD_QUIET:-}" | tr '[:upper:]' '[:lower:]')" in
@@ -49,22 +66,24 @@ echo "  TRANSCRIPT_EXISTS=$([ -f "$TRANSCRIPT_PATH" ] && echo YES || echo NO)" >
 echo "  CLAUDE_PATH=$(which claude 2>/dev/null || echo NOT_FOUND)" >> "$DEBUG_LOG"
 echo "  ASSISTANT=$ASSISTANT" >> "$DEBUG_LOG"
 
-# Generate summary via Haiku (skipped entirely for quiet sessions)
+# Generate summary via the profile's model (skipped entirely for quiet sessions)
 SUMMARY=""
 if [ -n "$QUIET" ]; then
-  echo "  VOXHERD_QUIET set — skipping Haiku summary" >> "$DEBUG_LOG"
+  echo "  VOXHERD_QUIET set — skipping AI summary" >> "$DEBUG_LOG"
 elif [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
-  echo "  Transcript exists, attempting Haiku summary..." >> "$DEBUG_LOG"
+  voxherd_summary_argv "Summarize what was just accomplished in 1-2 sentences for a voice announcement. Be concise."
+  echo "  SUMMARY_CLI=$VOXHERD_SUMMARY_CLI SUMMARY_MODEL=$VOXHERD_SUMMARY_MODEL" >> "$DEBUG_LOG"
+  echo "  Transcript exists, attempting summary..." >> "$DEBUG_LOG"
   echo "  Transcript tail (last 5 lines):" >> "$DEBUG_LOG"
   tail -5 "$TRANSCRIPT_PATH" >> "$DEBUG_LOG" 2>&1
-  SUMMARY=$(tail -50 "$TRANSCRIPT_PATH" | timeout 15 claude -p "Summarize what was just accomplished in 1-2 sentences for a voice announcement. Be concise." --model claude-haiku-4-5-20251001 2>>"$DEBUG_LOG")
-  echo "  Haiku exit code: $?" >> "$DEBUG_LOG"
+  SUMMARY=$(tail -50 "$TRANSCRIPT_PATH" | timeout 15 "${VOXHERD_SUMMARY_ARGV[@]}" 2>>"$DEBUG_LOG")
+  echo "  Summary exit code: $?" >> "$DEBUG_LOG"
   echo "  SUMMARY=$SUMMARY" >> "$DEBUG_LOG"
 else
   echo "  SKIPPED: transcript_path empty or file not found" >> "$DEBUG_LOG"
 fi
 
-# Fallback if claude failed or returned empty
+# Fallback if the summary CLI failed or returned empty
 if [ -z "$SUMMARY" ]; then
   SUMMARY="Task completed."
   echo "  Using fallback summary" >> "$DEBUG_LOG"
@@ -110,16 +129,17 @@ if [ -n "$CURL_AUTH_FILE" ]; then
     -H "X-VoxHerd: 1" \
     --config "$CURL_AUTH_FILE" \
     -d "$PAYLOAD" 2>&1)
+  CURL_EXIT=$?
   rm -f "$CURL_AUTH_FILE"
 else
   RESPONSE=$(curl -s --max-time 5 -X POST "http://localhost:7777/api/events" \
     -H "Content-Type: application/json" \
     -H "X-VoxHerd: 1" \
     -d "$PAYLOAD" 2>&1)
+  CURL_EXIT=$?
 fi
 
 # Log errors if curl failed
-CURL_EXIT=$?
 if [ "$CURL_EXIT" -ne 0 ]; then
   echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] on-stop.sh: curl failed (exit $CURL_EXIT): $RESPONSE" >> "$HOME/.voxherd/logs/hook-errors.log"
 fi

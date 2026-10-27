@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install.sh - Install VoxHerd hooks for supported assistant CLIs.
 #
-# By default, auto-detects which CLIs (Claude, Codex, Gemini, Grok) are installed
+# By default, auto-detects which CLIs (Claude, Codex, Gemini, Grok, Antigravity) are installed
 # and configures hooks for all of them. Falls back to Claude if none detected.
 #
 # Usage:
@@ -9,11 +9,21 @@
 #   HOOK_AGENTS=codex bash hooks/install.sh        # install only for Codex
 #   HOOK_AGENTS=claude,codex bash hooks/install.sh # install for specific CLIs
 #   HOOK_AGENTS=grok bash hooks/install.sh         # Grok Build (Grok 4.5 + Composer)
+#   HOOK_AGENTS=antigravity bash hooks/install.sh  # Antigravity CLI (`agy`)
+#
+#   MODEL_PROFILE=google bash hooks/install.sh     # Gemini 3.8 Flash via agy for summaries + NLU
+#   MODEL_PROFILE=anthropic bash hooks/install.sh  # Claude Haiku (the default)
 #
 # Notes:
 # - Claude + Gemini use lifecycle hooks (JSON via stdin) in ~/.claude/ and ~/.gemini/.
 # - Codex uses a `notify` handler (JSON via argv) configured in ~/.codex/config.toml.
 # - Grok Build uses lifecycle hooks as JSON files under ~/.grok/hooks/*.json.
+# - Antigravity (`agy`) reads named hooks from ~/.gemini/config/hooks.json. It has
+#   a Stop event only -- no SessionStart -- so the bridge registers from the first Stop.
+# - MODEL_PROFILE picks the small model the bridge itself uses for stop-hook
+#   summaries and intent parsing. It is an install-time choice, not a per-request
+#   one, and it is recorded in ~/.voxherd/models.env. Omit it and nothing is
+#   written, which means the hardcoded Claude Haiku default.
 
 set -e
 
@@ -32,11 +42,16 @@ HOOK_SCRIPTS=(
   "on-subagent-start.sh"
   "on-subagent-stop.sh"
   "codex-notify.py"
+  "antigravity-hook.py"
+  "agy_transcript.py"
+  "model-profile.sh"
+  "ModelProfile.ps1"
 )
 
 VOXHERD_DIR="$HOME/.voxherd"
 HOOKS_DEST="$VOXHERD_DIR/hooks"
 LOGS_DIR="$VOXHERD_DIR/logs"
+MODELS_ENV="$VOXHERD_DIR/models.env"
 
 RAW_HOOK_AGENTS="${HOOK_AGENTS:-}"
 
@@ -68,6 +83,7 @@ else
   command -v claude &>/dev/null && TARGET_AGENTS+=("claude")
   command -v codex  &>/dev/null && TARGET_AGENTS+=("codex")
   command -v gemini &>/dev/null && TARGET_AGENTS+=("gemini")
+  command -v agy    &>/dev/null && TARGET_AGENTS+=("antigravity")
   # Grok Build CLI may live only under ~/.grok/bin (not always on PATH).
   if command -v grok &>/dev/null || [ -x "$HOME/.grok/bin/grok" ]; then
     TARGET_AGENTS+=("grok")
@@ -92,6 +108,77 @@ for script in "${HOOK_SCRIPTS[@]}"; do
   chmod +x "$HOOKS_DEST/$script"
   echo "  Installed: $script"
 done
+
+# The Python hook shares bridge/model_profile.py rather than carrying its own
+# copy of the resolver. Drop it next to on-stop.py so the installed hook can
+# import it. Best-effort: if it is not on disk (e.g. running from a hooks-only
+# distribution), on-stop.py falls back to the hardcoded Claude Haiku default.
+for candidate in \
+  "$SCRIPT_DIR/../bridge/model_profile.py" \
+  "$SCRIPT_DIR/model_profile.py"
+do
+  if [ -f "$candidate" ]; then
+    cp "$candidate" "$HOOKS_DEST/model_profile.py"
+    echo "  Installed: model_profile.py"
+    break
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# Model profile — which small model does summaries and intent parsing
+# ---------------------------------------------------------------------------
+#
+# Mirrors PROFILES in bridge/model_profile.py. Keep the two in step.
+# Only written when MODEL_PROFILE is set: a plain install leaves no models.env,
+# which resolves to the hardcoded Claude Haiku default and is byte-for-byte
+# today's behaviour.
+
+write_models_env() {
+  local profile="$1"
+  local summary_cli summary_model nlu_cli nlu_model
+
+  case "$profile" in
+    google)
+      # agy, not gemini: Gemini CLI no longer signs in with a personal Google
+      # account (retired 2026-06-18). See PROFILES in bridge/model_profile.py.
+      summary_cli="agy";     summary_model="gemini-3.8-flash-low"
+      nlu_cli="agy";         nlu_model="gemini-3.8-flash-low"
+      ;;
+    anthropic)
+      summary_cli="claude";  summary_model="claude-haiku-4-5-20251001"
+      nlu_cli="claude";      nlu_model="claude-haiku-4-5-20251001"
+      ;;
+    *)
+      echo "  Warning: unknown MODEL_PROFILE '$profile' — using 'anthropic'."
+      profile="anthropic"
+      summary_cli="claude";  summary_model="claude-haiku-4-5-20251001"
+      nlu_cli="claude";      nlu_model="claude-haiku-4-5-20251001"
+      ;;
+  esac
+
+  cat > "$MODELS_ENV" <<ENVFILE
+# VoxHerd model profile — written by hooks/install.sh (MODEL_PROFILE=$profile).
+# The small model used for stop-hook summaries and intent parsing. Resolved at
+# install time, never per request. Environment variables of the same name
+# override these for a single session.
+VOXHERD_SUMMARY_CLI=$summary_cli
+VOXHERD_SUMMARY_MODEL=$summary_model
+VOXHERD_NLU_CLI=$nlu_cli
+VOXHERD_NLU_MODEL=$nlu_model
+ENVFILE
+  chmod 600 "$MODELS_ENV"
+  echo "  Model profile: $profile -> $MODELS_ENV"
+}
+
+if [ -n "${MODEL_PROFILE:-}" ]; then
+  echo "Writing model profile..."
+  write_models_env "$(printf "%s" "$MODEL_PROFILE" | tr '[:upper:]' '[:lower:]')"
+elif [ -f "$MODELS_ENV" ]; then
+  echo "Model profile: keeping existing $MODELS_ENV"
+  echo "  (re-run with MODEL_PROFILE=google or MODEL_PROFILE=anthropic to change it)"
+else
+  echo "Model profile: anthropic (default — claude-haiku-4-5-20251001, no models.env written)"
+fi
 
 merge_hook() {
   local settings="$1"
@@ -290,6 +377,31 @@ install_grok_hooks() {
   echo "$HOME/.grok/hooks/"
 }
 
+install_antigravity_hooks() {
+  # agy reads named hooks from ~/.gemini/config/hooks.json -- the file its /hooks
+  # command and its backend share (agy 1.2.10 changelog). Each top-level key is a
+  # hook name, so ours is "voxherd" and is replaced on reinstall; other hooks in
+  # the file are never touched. Stop fires when the agent loop ends a turn. The
+  # handler answers `{}` at once and summarises in the background, because agy
+  # runs hooks synchronously; the timeout only bounds something going wrong.
+  local path="$HOME/.gemini/config/hooks.json"
+  local entry current
+  entry='{"Stop": [{"type": "command", "command": "python3 $HOME/.voxherd/hooks/antigravity-hook.py", "timeout": 10}]}'
+  mkdir -p "$(dirname "$path")"
+  current='{}'
+  # agy leaves empty config files behind (mcp_config.json is 0 bytes); an
+  # empty or blank hooks.json is a file with no hooks yet, not an error.
+  if [ -f "$path" ] && [ -n "$(tr -d '[:space:]' < "$path")" ]; then
+    current="$(cat "$path")"
+    if ! echo "$current" | jq -e 'type == "object"' >/dev/null 2>&1; then
+      echo "Error: $path is not a JSON object. Please fix it and re-run." >&2
+      exit 1
+    fi
+  fi
+  write_settings "$path" "$(echo "$current" | jq --argjson entry "$entry" '.voxherd = $entry')"
+  echo "$path"
+}
+
 INSTALLED=()
 SKIPPED=()
 
@@ -311,6 +423,10 @@ for agent in "${TARGET_AGENTS[@]}"; do
       # Both Grok 4.5 and Composer use the Grok Build CLI + ~/.grok/hooks.
       echo "Updating Grok Build hooks..."
       INSTALLED+=("grok:$(install_grok_hooks)")
+      ;;
+    antigravity|agy)
+      echo "Updating Antigravity hooks..."
+      INSTALLED+=("antigravity:$(install_antigravity_hooks)")
       ;;
     *)
       SKIPPED+=("$agent (unsupported)")

@@ -60,7 +60,7 @@ trap cleanup EXIT
 CURL_AUTH_FILE=""
 TOKEN_FILE="$HOME/.voxherd/auth_token"
 if [ -f "$TOKEN_FILE" ]; then
-  AUTH_TOKEN=$(cat "$TOKEN_FILE" 2>/dev/null)
+  AUTH_TOKEN=$(cat "$TOKEN_FILE" 2>/dev/null | tr -d '[:space:]')
   if [ -n "$AUTH_TOKEN" ]; then
     CURL_AUTH_FILE=$(mktemp /tmp/vh-curl-XXXXXX)
     printf 'header = "Authorization: Bearer %s"\n' "$AUTH_TOKEN" > "$CURL_AUTH_FILE"
@@ -77,6 +77,7 @@ if [ -n "$CURL_AUTH_FILE" ]; then
     --config "$CURL_AUTH_FILE" \
     -d "$PAYLOAD" \
     "http://localhost:7777/api/events" >/dev/null 2>&1
+  CURL_EXIT=$?
   rm -f "$CURL_AUTH_FILE"
 else
   curl -s --max-time 3 \
@@ -85,9 +86,9 @@ else
     -H "X-VoxHerd: 1" \
     -d "$PAYLOAD" \
     "http://localhost:7777/api/events" >/dev/null 2>&1
+  CURL_EXIT=$?
 fi
 
-CURL_EXIT=$?
 if [ "$CURL_EXIT" -ne 0 ]; then
   echo "[$TIMESTAMP] on-subagent-start: curl failed (exit $CURL_EXIT)" >> "$LOG_FILE"
 fi

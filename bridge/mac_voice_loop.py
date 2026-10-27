@@ -3,7 +3,7 @@
 Two listening modes:
 1. **Listen-after-speak** — after every TTS announcement, listens for a
    follow-up voice command.
-2. **Wake word** (``--wake-word``) — continuously listens for "Hey Claude"
+2. **Wake word** (``--wake-word``) — continuously listens for "Hey agent"
    (or similar trigger phrases), then processes the rest as a command.
 
 Parses transcriptions using regex-based intent matching (ported from
@@ -28,15 +28,35 @@ from bridge.session_manager import SessionManager
 # Wake word config
 # ---------------------------------------------------------------------------
 
-# Trigger phrases — matched case-insensitively at the start of transcription.
-# The wake word prefix is stripped before processing the command.
+# Trigger phrases — matched case-insensitively at the start of transcription,
+# as whole words ("hey agents" is not one), with whatever punctuation the
+# recogniser puts between them ("Hey, agent."). The wake word prefix is
+# stripped before processing the command.
+#
+# "Hey agent" names none of the assistants; the sentence, then focus, picks the
+# session. "Hey Claude" was the phrase before it and still works. The first
+# entry is the one the clients quote. Kept in step with android/core's
+# VoiceIntent.WAKE_PHRASES and iOS's WakePhrase (test_wake_phrase.py).
 WAKE_PHRASES = [
+    "hey agent",
+    "okay agent",
+    "ok agent",
     "hey claude",
     "hey clod",      # common misrecognition
     "a claude",       # common misrecognition
     "hey cloud",      # common misrecognition
     "okay claude",
     "ok claude",
+    "hey clawed",     # misrecognitions seen on iOS
+    "hey claud",
+]
+
+_WAKE_PATTERNS = [
+    re.compile(
+        r"\s*" + r"[\s,.!?]+".join(map(re.escape, phrase.split())) + r"(?!\w)[\s,.!?:;]*",
+        re.IGNORECASE,
+    )
+    for phrase in WAKE_PHRASES
 ]
 
 # How long each wake-word listen window lasts (seconds).
@@ -56,11 +76,10 @@ def _strip_wake_word(text: str) -> str | None:
 
     Returns empty string if the utterance is ONLY the wake word.
     """
-    lowered = text.lower().strip()
-    for phrase in WAKE_PHRASES:
-        if lowered.startswith(phrase):
-            remainder = text[len(phrase):].strip().lstrip(",").strip()
-            return remainder
+    for pattern in _WAKE_PATTERNS:
+        match = pattern.match(text)
+        if match:
+            return text[match.end():].strip()
     return None
 
 
@@ -73,7 +92,7 @@ def _strip_wake_word(text: str) -> str | None:
 class ParsedIntent:
     """Result of parsing a voice transcription."""
 
-    action: str  # status, tell, switch, approve, deny, what_did, pause, resume, bare
+    action: str  # status, tell, switch, approve, deny, what_did, pause, resume, display, deck, bare
     project: str | None = None
     message: str | None = None
     agent_number: int | None = None  # explicit agent number for multi-agent routing
@@ -84,6 +103,21 @@ class ParsedIntent:
 # ---------------------------------------------------------------------------
 
 _STATUS = re.compile(r"^(status|what'?s running)$", re.IGNORECASE)
+# Display mode. Phrased loosely because this is said while squinting at a
+# washed-out panel in daylight, not typed: "go light", "light mode",
+# "switch to dark", "dark theme".
+# Deck slot presets. Said while looking at the arc, so the verbs are loose --
+# "war room", "go to focus", "show me the survey".
+_DECK = re.compile(
+    r"^(?:go to|switch to|show(?: me)?(?: the)?|use|set)?\s*"
+    r"(focus|pair|war[\s-]?room|survey|auto)"
+    r"(?:\s*(?:mode|view|layout))?$",
+    re.IGNORECASE,
+)
+_DISPLAY = re.compile(
+    r"^(?:go|switch to|use|set)?\s*(light|dark)(?:\s*(?:mode|theme))?$",
+    re.IGNORECASE,
+)
 _TELL_AGENT = re.compile(r"^tell (.+?) (?:agent |number )(\d+) to (.+)$", re.IGNORECASE)
 _TELL = re.compile(r"^tell (.+?) to (.+)$", re.IGNORECASE)
 _SWITCH = re.compile(r"^switch to (.+)$", re.IGNORECASE)
@@ -167,6 +201,20 @@ def parse_intent(
     # Status
     if _STATUS.match(stripped):
         return ParsedIntent(action="status")
+
+    # Display mode -- matched before the project patterns, since a project
+    # could plausibly be called "light" and the display command is the more
+    # likely reading of a bare "go light".
+    m = _DISPLAY.match(stripped)
+    if m:
+        return ParsedIntent(action="display", message=m.group(1).lower())
+
+    # Deck layout. Before the project patterns for the same reason: "focus"
+    # is far more likely to be the layout than a project of that name.
+    m = _DECK.match(stripped)
+    if m:
+        preset = re.sub(r"[\s_]+", "-", m.group(1).lower())
+        return ParsedIntent(action="deck", message=preset)
 
     # Tell {project} agent {N} to {message}
     m = _TELL_AGENT.match(stripped)
@@ -285,12 +333,16 @@ class MacVoiceLoop:
         sessions: SessionManager,
         dispatch: Callable[[str, str, str], Awaitable[None]],
         log: Callable[[str, str, str], None],
+        on_state: Callable[[dict], None] | None = None,
     ) -> None:
         self.tts = tts
         self.stt = stt
         self.sessions = sessions
         self._dispatch = dispatch
         self._log = log
+        # Publishes what the microphone is doing. Optional so every existing
+        # test constructing this loop keeps working unchanged.
+        self._on_state = on_state
         self._listening = False
         self._wake_word_enabled = False
         self._wake_word_task: asyncio.Task | None = None
@@ -298,6 +350,20 @@ class MacVoiceLoop:
     def wire(self) -> None:
         """Connect this loop as the TTS ``on_speech_complete`` callback."""
         self.tts.on_speech_complete = self._on_speech_complete
+
+    def _emit(self, **fields) -> None:
+        """Tell the clients what the microphone is doing.
+
+        Never allowed to raise: a broadcast failure must not stop the loop
+        listening. Losing the indicator is a worse outcome shown honestly;
+        losing the microphone because the indicator failed is absurd.
+        """
+        if self._on_state is None:
+            return
+        try:
+            self._on_state(fields)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Wake word
@@ -309,11 +375,13 @@ class MacVoiceLoop:
             return
         self._wake_word_enabled = True
         self._wake_word_task = asyncio.create_task(self._wake_word_loop())
-        self._log("success", "bridge", "Wake word listener started — say 'Hey Claude' to activate")
+        self._emit(listening=True)
+        self._log("success", "bridge", "Wake word listener started — say 'Hey agent' to activate")
 
     def stop_wake_word(self) -> None:
         """Stop the background wake-word listener."""
         self._wake_word_enabled = False
+        self._emit(listening=False, heard=None, wake=False)
         if self._wake_word_task:
             self._wake_word_task.cancel()
             self._wake_word_task = None
@@ -341,6 +409,12 @@ class MacVoiceLoop:
 
             # Check for wake word
             command = _strip_wake_word(text)
+            # Published even when this was not the wake phrase, which is the
+            # whole point: a user watching their own words appear knows the
+            # microphone, the permission and the recogniser are all fine, and
+            # that the problem is what they said. Without it, a missed wake
+            # phrase is indistinguishable from a dead microphone.
+            self._emit(listening=True, heard=text, wake=command is not None)
             if command is None:
                 # Not a wake-word utterance — ignore
                 await asyncio.sleep(WAKE_CYCLE_PAUSE)
@@ -349,7 +423,7 @@ class MacVoiceLoop:
             self._log("info", "bridge", f"Wake word detected! Command: {command}")
 
             if not command:
-                # They said "Hey Claude" but nothing else — do a full listen
+                # They said "Hey agent" but nothing else — do a full listen
                 self.tts.speak("Yes?", listen_after=True)
                 # The listen-after-speak callback will handle the rest
                 await asyncio.sleep(3)  # wait for TTS + STT cycle
@@ -405,6 +479,12 @@ class MacVoiceLoop:
         if intent.action == "status":
             await self._handle_status()
 
+        elif intent.action == "display":
+            await self._handle_display(intent.message)
+
+        elif intent.action == "deck":
+            await self._handle_deck(intent.message)
+
         elif intent.action == "switch":
             if intent.project:
                 self.sessions.set_active_project(intent.project)
@@ -437,7 +517,16 @@ class MacVoiceLoop:
                 if session and session.status == "waiting":
                     msg = "yes, proceed" if intent.action == "approve" else "no, deny"
                     self.sessions.update_status(session.session_id, "active", activity_type="working")
-                    await self._dispatch(session.session_id, session.project_dir, msg)
+                    # The one voice path that may answer a prompt: the speaker
+                    # named a project and said approve/deny, and the session is
+                    # actually waiting. The bare-"tell" path above deliberately
+                    # does not -- the mic is opened by the announcement with no
+                    # wake word, so anything audible in the room reaches it, and
+                    # "go ahead" is in the approve set.
+                    await self._dispatch(
+                        session.session_id, session.project_dir, msg,
+                        may_answer_decision=True,
+                    )
                     self._log("warning", session.project, f"Permission {intent.action}d via voice")
 
         elif intent.action == "what_did":
@@ -464,6 +553,50 @@ class MacVoiceLoop:
 
         elif intent.action == "ignore":
             self._log("info", "bridge", f"Ignored: {intent.message}")
+
+    async def _handle_deck(self, preset: str | None) -> None:
+        """Rearrange the Deck's panels.
+
+        Same shape as the theme: the words are heard by a phone or the Mac but
+        they are about the glasses, so the bridge holds the setting and pushes
+        it out, and ``state_sync`` carries it for a client that was away.
+        """
+        from bridge import server_state
+
+        if not preset or not server_state.set_client_setting("deck", preset):
+            self._log("warning", "bridge", f"Ignored deck preset {preset!r}")
+            return
+        await server_state.broadcast_to_ios({
+            "type": "client_setting",
+            "setting": "deck",
+            "value": preset,
+        })
+        self._log("success", "bridge", f"Deck layout -> {preset}")
+        self.tts.speak(f"{preset.replace('-', ' ')}.", listen_after=False)
+
+    async def _handle_display(self, mode: str | None) -> None:
+        """Switch the display clients between light and dark.
+
+        The command is said to whatever is listening -- a phone, the Mac -- but
+        it is *about* the glasses, which are a different device entirely. So the
+        bridge holds the setting and pushes it out, rather than the device that
+        heard the words trying to act on it.
+        """
+        # Lazy import: server_state imports MacVoiceLoop from this module, so a
+        # top-level import here is circular. Same pattern as the activity
+        # import inside server_state.build_state_sync.
+        from bridge import server_state
+
+        if not mode or not server_state.set_client_setting("theme", mode):
+            self._log("warning", "bridge", f"Ignored display mode {mode!r}")
+            return
+        await server_state.broadcast_to_ios({
+            "type": "client_setting",
+            "setting": "theme",
+            "value": mode,
+        })
+        self._log("success", "bridge", f"Display mode -> {mode}")
+        self.tts.speak(f"{mode} mode.", listen_after=False)
 
     async def _handle_status(self) -> None:
         """Announce status of all sessions, including sub-agent counts."""

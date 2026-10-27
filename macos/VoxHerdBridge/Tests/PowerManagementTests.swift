@@ -205,4 +205,28 @@ final class PowerManagementTests: XCTestCase {
         XCTAssertEqual(PowerManagement.appleScriptEscape("a\\b"), "a\\\\b")
         XCTAssertEqual(PowerManagement.appleScriptEscape("a\\\"b"), "a\\\\\\\"b")
     }
+
+    /// The privileged script is carried inside an AppleScript string literal
+    /// rather than written to a user-writable temp file and executed by path
+    /// (which let a same-user process swap the contents while the password
+    /// dialog was up). A literal cannot hold a raw newline or tab, so the escape
+    /// has to convert them or the whole thing is a syntax error at run time.
+    func test_appleScriptEscape_convertsNewlinesAndTabs() {
+        XCTAssertEqual(PowerManagement.appleScriptEscape("a\nb"), "a\\nb")
+        XCTAssertEqual(PowerManagement.appleScriptEscape("a\r\nb"), "a\\nb")
+        XCTAssertEqual(PowerManagement.appleScriptEscape("a\rb"), "a\\nb")
+        XCTAssertEqual(PowerManagement.appleScriptEscape("a\tb"), "a\\tb")
+    }
+
+    /// Guards the property that matters: whatever `installScript` produces must
+    /// come out of the escape with no raw newline left, because that string is
+    /// interpolated straight into `do shell script "..."`.
+    func test_escapedInstallScript_hasNoRawNewlines() {
+        let escaped = PowerManagement.appleScriptEscape(
+            PowerManagement.sudoersContent(forUser: "someone")
+        )
+        XCTAssertFalse(escaped.contains("\n"))
+        XCTAssertFalse(escaped.contains("\r"))
+        XCTAssertTrue(escaped.contains("\\n"))
+    }
 }

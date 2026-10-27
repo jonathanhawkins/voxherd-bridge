@@ -124,7 +124,10 @@ if (Test-Path $installHooks) {
     $hookFiles = @(
         "on-stop.py", "on-stop.ps1", "on-stop.sh",
         "on-session-start.ps1", "on-session-start.sh",
-        "on-notification.ps1", "on-notification.sh"
+        "on-notification.ps1", "on-notification.sh",
+        # Shared model-profile resolvers. Without these the stop hooks still
+        # run -- they fall back to the hardcoded Claude Haiku default.
+        "ModelProfile.ps1", "model-profile.sh"
     )
     foreach ($f in $hookFiles) {
         $src = Join-Path $RepoRoot "hooks\$f"

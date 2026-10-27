@@ -138,21 +138,25 @@ enum PowerManagement {
         // with VoxHerd rather than the previously focused app (LSUIElement quirk).
         NSApp.activate(ignoringOtherApps: true)
 
-        // Write the privileged script to a user-owned temp file, then run it as
-        // root via osascript. Building the script as a file (not inline in the
-        // AppleScript string) keeps the heredoc/quoting sane; only the path
-        // crosses into AppleScript, shell-quoted via `quoted form of`.
+        // The script is inlined into the AppleScript, NOT written to a file.
+        //
+        // It used to go to a temp file whose path was handed to root's /bin/sh.
+        // `do shell script ... with administrator privileges` authorizes first
+        // and root opens the path second, and that file lived in
+        // NSTemporaryDirectory() — owned and writable by the unprivileged user,
+        // for the entire duration of the password dialog (the cleanup `defer`
+        // only ran after waitUntilExit). Any process running as the user could
+        // watch for the filename, truncate it, and write its own payload while
+        // the user was already being asked to approve VoxHerd; 0o700 does not
+        // help, because the attacker *is* the owner. Root then ran their script.
+        //
+        // Inlining removes the file, so there is nothing to swap between the
+        // authorization and the execution. `do shell script` hands the string to
+        // `sh -c`, so the heredoc and `set -e` behave exactly as before.
         let scriptBody = installScript(forUser: user, enable: enabled)
-        let scriptURL = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("voxherd-walkaround-\(UUID().uuidString).sh")
-        try scriptBody.write(to: scriptURL, atomically: true, encoding: .utf8)
-        try? FileManager.default.setAttributes(
-            [.posixPermissions: 0o700], ofItemAtPath: scriptURL.path)
-        defer { try? FileManager.default.removeItem(at: scriptURL) }
-
         let appleScript =
-            "do shell script \"/bin/sh \" & quoted form of "
-            + "\"\(appleScriptEscape(scriptURL.path))\" with administrator privileges"
+            "do shell script \"\(appleScriptEscape(scriptBody))\""
+            + " with administrator privileges"
 
         log.info("Elevating to install sudoers rule and set disablesleep=\(enabled ? 1 : 0)")
 
@@ -263,8 +267,15 @@ enum PowerManagement {
     }
 
     /// Escape a string for inclusion inside an AppleScript double-quoted literal.
+    /// Newlines become `\n` because an AppleScript double-quoted literal cannot
+    /// contain a raw one — required now that the whole script, not just a path,
+    /// is carried inside the literal.
     static func appleScriptEscape(_ s: String) -> String {
         s.replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\r\n", with: "\\n")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\n")
+            .replacingOccurrences(of: "\t", with: "\\t")
     }
 }

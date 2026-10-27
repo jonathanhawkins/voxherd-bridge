@@ -49,7 +49,14 @@ class WinTTS:
         self.voice = voice
         self.rate = rate
         self.enabled = True
-        self._queue: asyncio.Queue[SpeechItem] = asyncio.Queue(maxsize=50)
+        # Created in start(), NOT here. server_state.py instantiates this
+        # class at module IMPORT, before uvicorn has built the loop it will run
+        # the server on; an asyncio.Queue made at that point can bind to a
+        # different loop, and `await queue.get()` on the worker then never sees
+        # a `put_nowait` from a request handler. That is the documented cause of
+        # silent TTS in the bundled macOS app (see "Important Constraints" in
+        # CLAUDE.md) -- mac_tts.py was converted and these twins were not.
+        self._queue: asyncio.Queue[SpeechItem] | None = None
         self._worker_task: asyncio.Task | None = None
         self._available = _check_pyttsx3()
 
@@ -70,6 +77,7 @@ class WinTTS:
     def start(self) -> None:
         """Start the background worker that drains the speech queue."""
         if self._worker_task is None:
+            self._queue = asyncio.Queue(maxsize=50)
             self._worker_task = asyncio.create_task(self._worker())
 
     def stop(self) -> None:
@@ -94,6 +102,8 @@ class WinTTS:
                 session_id=session_id,
                 listen_after=listen_after,
             )
+            if self._queue is None:
+                return
             if self._queue.full():
                 try:
                     self._queue.get_nowait()
@@ -131,6 +141,7 @@ class WinTTS:
         """Drain the queue sequentially so utterances don't overlap."""
         loop = asyncio.get_running_loop()
         while True:
+            assert self._queue is not None  # start() created it
             item = await self._queue.get()
             try:
                 # Run pyttsx3 on a thread to avoid blocking the event loop.

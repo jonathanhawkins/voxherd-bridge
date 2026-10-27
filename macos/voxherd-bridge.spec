@@ -28,6 +28,20 @@ a = Analysis(
         'bridge.bonjour',
         'bridge.tailscale',
         'bridge.env_utils',
+        'bridge.reader',
+        'bridge.focus',
+        'bridge.pairing',
+        'bridge.pane_geometry',
+        # The Reader's grammars are imported by name, so nothing finds them statically.
+        'tree_sitter',
+        'tree_sitter_python',
+        'tree_sitter_javascript',
+        'tree_sitter_typescript',
+        'tree_sitter_kotlin',
+        'tree_sitter_swift',
+        'tree_sitter_go',
+        'tree_sitter_rust',
+        'tree_sitter_java',
         'uvicorn',
         'uvicorn.logging',
         'uvicorn.loops',
@@ -67,6 +81,12 @@ a = Analysis(
         'httpcore',
         'rich',
         'zeroconf',
+        # Named rather than left to the analysis: `bridge/bonjour.py` imports
+        # it inside a function, behind a try/except that degrades to one
+        # address. A bundle that missed it would advertise a single interface
+        # and say nothing about why -- which is the bug that import exists to
+        # fix.
+        'ifaddr',
     ],
     hookspath=[],
     hooksconfig={},

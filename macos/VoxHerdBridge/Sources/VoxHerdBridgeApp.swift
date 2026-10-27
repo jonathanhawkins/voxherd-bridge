@@ -43,12 +43,40 @@ struct VoxHerdBridgeApp: App {
         }
     }
 
-    /// While Walk-Around Mode is keeping the Mac awake, the icon switches to a
-    /// distinct "walking" glyph so it can't be silently forgotten; otherwise it
-    /// reflects whether the bridge is running.
     private var menuBarIcon: String {
-        if walkAround.isActive { return "figure.walk.circle.fill" }
-        return processManager.state == .running ? "waveform.circle.fill" : "waveform.circle"
+        MenuBarIcon.name(
+            pairingWaiting: !processManager.pairingPrompts.isEmpty,
+            walkAroundActive: walkAround.isActive,
+            bridgeRunning: processManager.state == .running
+        )
+    }
+}
+
+/// Which glyph the menu bar shows, and in what order the claims on it win.
+///
+/// A computed property on the `App` struct cannot be tested — it reads three
+/// `@State` objects and an `@Observable` — and the ordering here is a real
+/// decision, so it lives out here where a test can ask about it.
+enum MenuBarIcon {
+    /// A waiting pairing request takes the icon first, then Walk-Around Mode,
+    /// then whether the bridge is running.
+    ///
+    /// Pairing outranks Walk-Around deliberately, even though Walk-Around is
+    /// the one that must not be silently forgotten — it holds `pmset
+    /// disablesleep` on. A pairing code lives for two minutes and cannot be
+    /// recovered after that, while Walk-Around's glyph comes back the moment
+    /// the code goes. And the two coincide more often than not: Walk-Around
+    /// is what you turn on to walk about with the glasses, which is exactly
+    /// when you are pairing them. Letting it win would hide the pairing icon
+    /// in the one case it is for.
+    static func name(
+        pairingWaiting: Bool,
+        walkAroundActive: Bool,
+        bridgeRunning: Bool
+    ) -> String {
+        if pairingWaiting { return "person.badge.key.fill" }
+        if walkAroundActive { return "figure.walk.circle.fill" }
+        return bridgeRunning ? "waveform.circle.fill" : "waveform.circle"
     }
 }
 

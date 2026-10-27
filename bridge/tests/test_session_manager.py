@@ -15,10 +15,12 @@ from __future__ import annotations
 import os
 from unittest.mock import patch
 
+import pytest
+
 from bridge.session_manager import SessionManager
 
 
-_TEST_PROJECT_DIR = os.path.join(os.path.expanduser("~"), ".voxherd", "test-projects", "session-mgr")
+_TEST_PROJECT_DIR = os.path.join(os.path.expanduser("~"), ".voxherd-test-projects", "session-mgr")
 os.makedirs(_TEST_PROJECT_DIR, exist_ok=True)
 
 
@@ -173,3 +175,217 @@ def test_idle_transition_resets_each_known_activity_type() -> None:
         assert session.activity_type == "sleeping", (
             f"Idle transition must reset activity_type from {label!r} to 'sleeping'"
         )
+
+
+# ---------------------------------------------------------------------------
+# Teardown: removing a session forgets everything keyed to its id.
+#
+# ``activity._forget_session_state`` was written to replace four divergent
+# copies of the same list of pops. The CALL to it then became the thing
+# repeated, and four of the eight ``remove_session`` sites did not have it, so a
+# session removed via ``DELETE /api/sessions/{id}``, the project cleanup in
+# routes, the startup prune or ``_handle_dead_pane`` left its state behind.
+#
+# A leaked ``_LAST_CHOICE_FOR_SESSION`` entry is not inert: it is what the
+# choice-commit gate compares an incoming answer against, and it is what
+# ``state_sync``'s ``active_choice_sessions`` is built from -- so clients keep
+# rendering a decision card for a session that no longer exists.
+# ---------------------------------------------------------------------------
+
+
+def _all_books() -> tuple[dict, ...]:
+    """THE book list, imported -- not a copy of it.
+
+    This used to restate the nine dicts, so the property
+    ``activity.session_books`` exists for ("a new per-session dict has one place
+    to be registered") was asserted nowhere: a tenth dict added to activity.py
+    and left out of the teardown passed every test here.
+    """
+    from bridge.activity import session_books
+
+    return session_books()
+
+
+@pytest.fixture
+def books():
+    """Seed sentinels into the live per-session dicts, and always restore.
+
+    These are module-level dicts in bridge/activity.py and bridge/server_state.py
+    -- real process state, not fixtures. Without the finally, a failing assert
+    left "sentinel" behind for every later test in the session. The blast radius
+    is currently zero (``test_state_sync_decisions.py`` has its own autouse
+    clear), but "currently zero" is not a property to rely on.
+    """
+    seeded: list[str] = []
+
+    def seed(sid: str) -> str:
+        for book in _all_books():
+            book[sid] = "sentinel"
+        seeded.append(sid)
+        return sid
+
+    try:
+        yield seed
+    finally:
+        for sid in seeded:
+            for book in _all_books():
+                book.pop(sid, None)
+
+
+def _books_holding(sid: str) -> list[int]:
+    return [i for i, book in enumerate(_all_books()) if sid in book]
+
+
+class TestRemovalForgetsSessionState:
+    def test_removing_a_session_clears_every_book(self, books):
+        mgr = _make_session_manager()
+        with patch.object(mgr, "_save", return_value=None):
+            session, _ = mgr.register_session(
+                session_id="sid-teardown", project="proj",
+                project_dir=_TEST_PROJECT_DIR, tmux_target="proj:0.0",
+            )
+        assert session is not None, "project_dir was refused"
+        books("sid-teardown")
+        assert _books_holding("sid-teardown"), "fixture did not seed"
+
+        with patch.object(mgr, "_save", return_value=None):
+            assert mgr.remove_session("sid-teardown") is True
+        assert _books_holding("sid-teardown") == []
+
+    def test_it_clears_even_when_the_session_was_already_gone(self, books):
+        """Nothing should hold state keyed to an id that names no session.
+
+        The books outlive the Session: a racing coroutine can delete it between
+        a caller's check and its removal, so a later ``remove_session``
+        returning False must still clean up.
+        """
+        mgr = _make_session_manager()
+        books("sid-never-registered")
+
+        assert mgr.remove_session("sid-never-registered") is False
+        assert _books_holding("sid-never-registered") == []
+
+    def test_it_leaves_other_sessions_alone(self, books):
+        mgr = _make_session_manager()
+        books("sid-a")
+        books("sid-b")
+        with patch.object(mgr, "_save", return_value=None):
+            mgr.remove_session("sid-a")
+        assert _books_holding("sid-a") == []
+        assert len(_books_holding("sid-b")) == len(_all_books())
+
+    async def test_pruning_a_dead_session_clears_it_too(self, books, monkeypatch):
+        """``prune_dead`` does not call ``remove_session``; it drops directly."""
+        mgr = _make_session_manager()
+        with patch.object(mgr, "_save", return_value=None):
+            session, _ = mgr.register_session(
+                session_id="sid-pruned", project="proj",
+                project_dir=_TEST_PROJECT_DIR, tmux_target="gone:0.0",
+            )
+        assert session is not None, "project_dir was refused"
+        books("sid-pruned")
+
+        async def no_pane(_target):
+            return False
+
+        monkeypatch.setattr(mgr, "_tmux_pane_exists", no_pane)
+        with patch.object(mgr, "_save", return_value=None):
+            removed = await mgr.prune_dead()
+
+        assert "sid-pruned" in [sid for sid, _ in removed]
+        assert _books_holding("sid-pruned") == []
+
+    def test_the_tmux_dedup_eviction_clears_it_too(self, books):
+        """The path that leaked, and the commonest way a session id changes.
+
+        ``register_session`` evicts whatever already held the pane. That used to
+        be a bare ``self._sessions.pop(sid)``, so all nine books kept the dead
+        id -- permanently, because the activity loop only visits REGISTERED
+        sessions and never revisits an unregistered one. ``_LAST_CHOICE_FOR_SESSION``
+        is what ``state_sync``'s ``active_choice_sessions`` is built from and
+        what clients prune stale decision cards against, so the lens kept a
+        decision card for a session that no longer existed.
+
+        Fires whenever Claude Code restarts or compacts in the same pane.
+        """
+        mgr = _make_session_manager()
+        with patch.object(mgr, "_save", return_value=None):
+            first, _ = mgr.register_session(
+                session_id="sid-old", project="proj",
+                project_dir=_TEST_PROJECT_DIR, tmux_target="samepane:0.0",
+            )
+            assert first is not None
+            books("sid-old")
+            second, evicted = mgr.register_session(
+                session_id="sid-new", project="proj",
+                project_dir=_TEST_PROJECT_DIR, tmux_target="samepane:0.0",
+            )
+
+        assert second is not None
+        assert evicted == ["sid-old"], "the pane's previous session was not evicted"
+        assert "sid-old" not in mgr.get_all_sessions()
+        assert _books_holding("sid-old") == [], "the evicted session's books leaked"
+
+    def test_the_evicted_session_is_still_handed_back_as_a_predecessor(self, books):
+        """Clearing its books must not cost the model inheritance.
+
+        ``register_session`` reads the evicted session's ``model`` so a pane
+        that re-registers without one keeps what it was running.
+        """
+        mgr = _make_session_manager()
+        with patch.object(mgr, "_save", return_value=None):
+            mgr.register_session(
+                session_id="sid-old", project="proj", project_dir=_TEST_PROJECT_DIR,
+                tmux_target="pane2:0.0", model="claude-opus-5-5",
+            )
+            new, _ = mgr.register_session(
+                session_id="sid-new", project="proj", project_dir=_TEST_PROJECT_DIR,
+                tmux_target="pane2:0.0",
+            )
+        assert new is not None
+        assert new.model == "claude-opus-5-5", "model inheritance was lost"
+
+    def test_an_evicted_sessions_stream_reader_is_cancelled(self, books):
+        """It leaked a coroutine and a subprocess pipe before ``_drop``."""
+        cancelled = []
+
+        class FakeTask:
+            def cancel(self):
+                cancelled.append(True)
+
+        mgr = _make_session_manager()
+        with patch.object(mgr, "_save", return_value=None):
+            old, _ = mgr.register_session(
+                session_id="sid-old", project="proj", project_dir=_TEST_PROJECT_DIR,
+                tmux_target="pane3:0.0",
+            )
+            assert old is not None
+            old._stream_json_task = FakeTask()
+            mgr.register_session(
+                session_id="sid-new", project="proj", project_dir=_TEST_PROJECT_DIR,
+                tmux_target="pane3:0.0",
+            )
+        assert cancelled == [True]
+
+
+class TestTheBookListIsOneList:
+    def test_the_teardown_iterates_the_shared_list(self):
+        """A tenth dict registered in ``session_books`` must be forgotten.
+
+        Proves the single-source property rather than the nine current names:
+        the test adds a book and checks teardown reaches it.
+        """
+        from bridge import activity
+
+        extra: dict = {"sid-extra": "sentinel"}
+        real = activity.session_books
+
+        def with_extra():
+            return (*real(), extra)
+
+        activity.session_books = with_extra
+        try:
+            activity._forget_session_state("sid-extra")
+        finally:
+            activity.session_books = real
+        assert extra == {}, "_forget_session_state does not use session_books()"

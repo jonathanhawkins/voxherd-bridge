@@ -270,6 +270,13 @@ class BridgeManager:
             self._start_session_polling()
             return
 
+        # Anything else that is not a log entry. A pending pairing request
+        # arrives as {"pairing": {...}} (bridge/pairing.py) and the macOS menu
+        # bar shows it as a card; this tray has no card to show it on, and
+        # without this guard it would land in the event list as a blank row.
+        if "message" not in data:
+            return
+
         # Parse as log entry
         ts = data.get("ts", "")
         level = data.get("level", "info")

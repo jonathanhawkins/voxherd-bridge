@@ -48,7 +48,11 @@ class OpenAITTS:
         self.voice = voice
         self.instruction = instruction
         self.enabled = True
-        self._queue: asyncio.Queue[SpeechItem] = asyncio.Queue(maxsize=50)
+        # Created in start(), not here: cli.py constructs this before
+        # uvicorn.run, and a Queue made outside the server's loop can bind
+        # to the wrong one (the documented silent-TTS bug). Same shape as
+        # mac_tts/linux_tts/win_tts.
+        self._queue: asyncio.Queue[SpeechItem] | None = None
         self._worker_task: asyncio.Task | None = None
         self._api_key = os.environ.get("OPENAI_API_KEY", "")
         self._available = bool(self._api_key and _PLAY_CMD)
@@ -62,6 +66,7 @@ class OpenAITTS:
     def start(self) -> None:
         """Start the background worker that drains the speech queue."""
         if self._worker_task is None:
+            self._queue = asyncio.Queue(maxsize=50)
             self._worker_task = asyncio.create_task(self._worker())
 
     def stop(self) -> None:
@@ -86,6 +91,8 @@ class OpenAITTS:
                 session_id=session_id,
                 listen_after=listen_after,
             )
+            if self._queue is None:
+                return
             if self._queue.full():
                 try:
                     self._queue.get_nowait()
@@ -104,6 +111,7 @@ class OpenAITTS:
 
         async with httpx.AsyncClient(timeout=15.0) as client:
             while True:
+                assert self._queue is not None  # start() created it
                 item = await self._queue.get()
                 tmp_path = None
                 try:

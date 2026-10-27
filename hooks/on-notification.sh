@@ -52,7 +52,7 @@ trap cleanup EXIT
 CURL_AUTH_FILE=""
 TOKEN_FILE="$HOME/.voxherd/auth_token"
 if [ -f "$TOKEN_FILE" ]; then
-  AUTH_TOKEN=$(cat "$TOKEN_FILE" 2>/dev/null)
+  AUTH_TOKEN=$(cat "$TOKEN_FILE" 2>/dev/null | tr -d '[:space:]')
   if [ -n "$AUTH_TOKEN" ]; then
     CURL_AUTH_FILE=$(mktemp /tmp/vh-curl-XXXXXX)
     printf 'header = "Authorization: Bearer %s"\n' "$AUTH_TOKEN" > "$CURL_AUTH_FILE"

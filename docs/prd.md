@@ -95,7 +95,7 @@ The bridge server is a CLI tool launched in a terminal window. It runs FastAPI i
 
 ### FR-3: iOS App -- Voice Interface
 
-**FR-3.1** STT via iOS `SFSpeechRecognizer` (on-device, free). Supports tap-to-talk and optional wake word ("Hey Claude").
+**FR-3.1** STT via iOS `SFSpeechRecognizer` (on-device, free). Supports tap-to-talk and optional wake word ("Hey agent"; "Hey Claude" also works).
 
 **FR-3.2** TTS via `AVSpeechSynthesizer` (built-in) for MVP. Future: ElevenLabs for cloned voice.
 
@@ -262,10 +262,13 @@ Key behaviors demonstrated:
 ## Non-Requirements
 
 - **No web UI.** No shadcn, no Tailwind, no dashboard in the browser, no login page. The iOS app is the UI. The bridge is headless plumbing.
-- **No auth (Clerk or otherwise).** Single-user system on a private LAN/Tailnet. No login, no sessions, no tokens.
+- **No login and no third-party identity provider**, but there IS a token.
+  Single-user system, and the bridge binds every interface, so a 256-bit
+  bearer token guards every endpoint except `/health`, `/api/assets/*` and the
+  two pairing calls. See the auth note in CLAUDE.md before changing any of it.
 - **No MCP replication on iOS.** Claude Code instances already have their MCP servers (Notion, GitHub, etc.). VoxHerd only routes voice commands; the instances handle tool execution.
 - **No codebase indexing on iOS.** The phone never needs to understand or store code. It is a voice remote control.
-- **No Gemini integration.** Unlike VisionClaw, this uses Claude end-to-end. Haiku for fast intent parsing, existing Claude Code sessions for actual work.
+- ~~**No Gemini integration.**~~ **Superseded 2026-09-24.** The Google agents are first-class: Gemini CLI and Antigravity CLI (`agy`) are supported assistants, and the bridge's own summary/NLU model is an install-time profile — Gemini Flash under the `google` profile, Claude Haiku everywhere else (`bridge/model_profile.py`). The *stock* VoxHerd default is unchanged: Claude end-to-end, Haiku for intent parsing.
 
 ---
 

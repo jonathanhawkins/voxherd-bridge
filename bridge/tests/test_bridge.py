@@ -1058,7 +1058,10 @@ def test_mdns_hostname_strips_double_local() -> None:
     from bridge.routes import mdns_hostname
 
     # macOS gethostname() already returns the .local FQDN — must not double up.
-    assert mdns_hostname("Jonathans-MacBook-Pro.local") == "Jonathans-MacBook-Pro.local"
+    # A generic name on purpose: this asserts "already an FQDN, leave it alone",
+    # which the real machine's name does not exercise any better, and bridge/ is
+    # published to the public repo.
+    assert mdns_hostname("SomeMac-MacBook-Pro.local") == "SomeMac-MacBook-Pro.local"
     # Bare hostname gets exactly one .local appended.
     assert mdns_hostname("macbook") == "macbook.local"
     # Already-doubled / trailing-dot / case variants all collapse to one.

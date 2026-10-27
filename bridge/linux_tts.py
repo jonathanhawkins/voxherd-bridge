@@ -13,6 +13,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from bridge.env_utils import get_subprocess_env
+from bridge.tts_budget import utterance_timeout
 
 
 @dataclass
@@ -41,7 +42,14 @@ class LinuxTTS:
         self.voice = voice
         self.rate = rate
         self.enabled = True
-        self._queue: asyncio.Queue[SpeechItem] = asyncio.Queue(maxsize=50)
+        # Created in start(), NOT here. server_state.py instantiates this
+        # class at module IMPORT, before uvicorn has built the loop it will run
+        # the server on; an asyncio.Queue made at that point can bind to a
+        # different loop, and `await queue.get()` on the worker then never sees
+        # a `put_nowait` from a request handler. That is the documented cause of
+        # silent TTS in the bundled macOS app (see "Important Constraints" in
+        # CLAUDE.md) -- mac_tts.py was converted and these twins were not.
+        self._queue: asyncio.Queue[SpeechItem] | None = None
         self._worker_task: asyncio.Task | None = None
         self._binary, self._engine = _find_tts_binary()
 
@@ -57,6 +65,7 @@ class LinuxTTS:
     def start(self) -> None:
         """Start the background worker that drains the speech queue."""
         if self._worker_task is None:
+            self._queue = asyncio.Queue(maxsize=50)
             self._worker_task = asyncio.create_task(self._worker())
 
     def stop(self) -> None:
@@ -81,6 +90,8 @@ class LinuxTTS:
                 session_id=session_id,
                 listen_after=listen_after,
             )
+            if self._queue is None:
+                return
             if self._queue.full():
                 try:
                     self._queue.get_nowait()
@@ -90,29 +101,62 @@ class LinuxTTS:
 
     def _build_cmd(self, text: str) -> list[str]:
         """Build the command line for the detected TTS engine."""
+        # "--" before the text, as in mac_tts: espeak reads a dash-leading
+        # argument as a flag, and `-w<file>` writes a WAV to an arbitrary path.
         if self._engine == "espeak-ng":
-            return [self._binary, "-v", self.voice, "-s", str(self.rate), text]
+            return [self._binary, "-v", self.voice, "-s", str(self.rate), "--", text]
         elif self._engine == "espeak":
-            return [self._binary, "-v", self.voice, "-s", str(self.rate), text]
+            return [self._binary, "-v", self.voice, "-s", str(self.rate), "--", text]
         elif self._engine == "piper-tts":
-            # piper reads from stdin
+            # piper reads its text from stdin.
+            #
+            # KNOWN GAP, pre-existing and not fixed here: `--output-raw` writes
+            # raw PCM to stdout for piping into a player (`aplay`), and the
+            # worker sends stdout to DEVNULL -- so the audio is discarded. There
+            # is no `-m <model>` either, which piper requires. So on a host with
+            # piper and no espeak-ng, `_find_tts_binary` picks piper,
+            # `available` reports True, every announcement is queued and logged
+            # as spoken, and nobody hears anything.
+            #
+            # Fixing it is a design choice (pipe into a player and own that
+            # dependency, or drop piper from detection so `available` is honest)
+            # rather than a patch, which is why it is written down instead.
             return [self._binary, "--output-raw"]
         return []
 
     async def _worker(self) -> None:
         """Drain the queue sequentially so utterances don't overlap."""
         while True:
+            assert self._queue is not None  # start() created it
             item = await self._queue.get()
             try:
                 if self._engine in ("espeak-ng", "espeak"):
                     cmd = self._build_cmd(item.text)
                     proc = await asyncio.create_subprocess_exec(
                         *cmd,
+                        # espeak with no text left to speak reads stdin forever,
+                        # and this queue drains one item at a time: inheriting
+                        # the bridge's stdin wedged every later announcement.
+                        # `--` in _build_cmd stops the text being taken as a
+                        # flag; this closes the other door. Linux is a shipped
+                        # systemd deployment, where stdin is whatever the
+                        # service inherited.
+                        stdin=asyncio.subprocess.DEVNULL,
                         stdout=asyncio.subprocess.DEVNULL,
                         stderr=asyncio.subprocess.DEVNULL,
                         env=get_subprocess_env(),
                     )
-                    await proc.wait()
+                    # Bounded, for the same reason: an unbounded wait here is
+                    # one hung process away from permanent silence.
+                    budget = utterance_timeout(item.text)
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=budget)
+                    except (TimeoutError, asyncio.TimeoutError):
+                        try:
+                            proc.kill()
+                        except (ProcessLookupError, OSError):
+                            pass
+                        await proc.wait()
                 elif self._engine == "piper-tts":
                     # piper reads text from stdin, outputs audio
                     proc = await asyncio.create_subprocess_exec(
@@ -122,7 +166,19 @@ class LinuxTTS:
                         stderr=asyncio.subprocess.DEVNULL,
                         env=get_subprocess_env(),
                     )
-                    await proc.communicate(input=item.text.encode())
+                    # piper is handed its text on stdin, so it cannot wedge
+                    # reading the bridge's -- but it can still fail to exit.
+                    budget = utterance_timeout(item.text)
+                    try:
+                        await asyncio.wait_for(
+                            proc.communicate(input=item.text.encode()), timeout=budget
+                        )
+                    except (TimeoutError, asyncio.TimeoutError):
+                        try:
+                            proc.kill()
+                        except (ProcessLookupError, OSError):
+                            pass
+                        await proc.wait()
 
                 # Fire callback after speech completes.
                 if self.on_speech_complete and item.listen_after:

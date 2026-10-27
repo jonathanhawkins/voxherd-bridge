@@ -12,6 +12,7 @@ settings:
     DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
     INFOPLIST_KEY_LSUIElement: true
     INFOPLIST_KEY_NSMicrophoneUsageDescription: "VoxHerd needs microphone access for voice commands and speech-to-text."
+    INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: "VoxHerd transcribes your spoken commands so it can route them to the right coding agent."
     ENABLE_HARDENED_RUNTIME: true
     # Surfaced in Get Info / About panel so the running build is identifiable.
     # The release workflow can override MARKETING_VERSION via -setbuildsetting.

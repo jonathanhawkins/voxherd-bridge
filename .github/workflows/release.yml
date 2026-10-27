@@ -61,11 +61,20 @@ jobs:
           xcodegen generate
           cd ..
 
+          # The same settings as macos/build-app.sh. Without them the app
+          # reported project.yml's 0.1.0-dev whatever the tag said, carried
+          # coverage instrumentation naming every source path, and kept its
+          # debug map; DEPLOYMENT_POSTPROCESSING strips it, after the dSYM is
+          # written (uploaded below as a workflow artifact, not released).
           xcodebuild \
             -project VoxHerdBridge/VoxHerdBridge.xcodeproj \
             -scheme VoxHerdBridge \
             -configuration Release \
             -derivedDataPath /tmp/vh-macos-build \
+            MARKETING_VERSION="${{ steps.version.outputs.version }}" \
+            CLANG_COVERAGE_MAPPING=NO \
+            ENABLE_CODE_COVERAGE=NO \
+            DEPLOYMENT_POSTPROCESSING=YES \
             CODE_SIGN_IDENTITY="-" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
@@ -159,7 +168,162 @@ jobs:
       - name: Ad-hoc sign (unsigned build)
         if: env.HAS_APPLE_CERT != 'true'
         run: |
-          codesign --force --deep --sign - macos/dist/VoxHerdBridge.app
+          APP="macos/dist/VoxHerdBridge.app"
+          RESOURCES="$APP/Contents/Resources"
+          ENTITLEMENTS="macos/VoxHerdBridge/VoxHerdBridge.entitlements"
+
+          # Was `codesign --force --deep --sign - "$APP"`, which signed the
+          # outer bundle (and `--deep` is deprecated and does not apply these
+          # options the way per-binary signing does). Two problems with that:
+          # no `--options runtime`, so dyld honours DYLD_INSERT_LIBRARIES; and
+          # the embedded PyInstaller binary is a separate Mach-O launched as its
+          # own process, so it keeps its own signature regardless of the outer
+          # seal. That process spawns `claude` and holds the network listener.
+          # Verified by experiment on a bundle signed the old way: a constructor
+          # in an arbitrary dylib ran inside the embedded bridge, while the same
+          # injection against the hardened outer app was refused.
+          #
+          # The embedded PyInstaller pieces get their own entitlements: the
+          # hardened runtime enables library validation, an ad-hoc signature has
+          # no Team ID, and the bundled CPython framework is then refused at
+          # dlopen ("mapping process and mapped file (non-platform) have
+          # different Team IDs"). The certificate path above does not need this
+          # because every piece there shares one Team ID. It does not reopen the
+          # injection hole -- DYLD_INSERT_LIBRARIES needs a different
+          # entitlement, which is not granted.
+          INNER_ENTITLEMENTS="macos/VoxHerdBridge/voxherd-bridge.entitlements"
+          # Checked explicitly. The three loops below silence codesign's stderr
+          # and `|| true` (a PyInstaller tree holds files codesign cannot sign),
+          # so a MISSING entitlements file would skip ~120 dylibs with no
+          # diagnostic at all and only surface at the un-silenced call further
+          # down, pointing nowhere near the cause.
+          if [ ! -f "$INNER_ENTITLEMENTS" ]; then
+            echo "::error::$INNER_ENTITLEMENTS is missing from the checkout."
+            echo "It is referenced by both this workflow and macos/build-app.sh."
+            exit 1
+          fi
+
+          # Same inside-out order as the certificate path above.
+          find "$RESOURCES/voxherd-bridge" -type f \( -name "*.dylib" -o -name "*.so" \) | while read -r lib; do
+            codesign --force --options runtime --sign - --entitlements "$INNER_ENTITLEMENTS" "$lib" 2>/dev/null || true
+          done
+
+          find "$RESOURCES/voxherd-bridge" -type d -name "*.framework" | while read -r fw; do
+            codesign --force --options runtime --sign - --entitlements "$INNER_ENTITLEMENTS" "$fw" 2>/dev/null || true
+          done
+
+          find "$RESOURCES/voxherd-bridge" -type f -perm +111 ! -name "*.dylib" ! -name "*.so" | while read -r bin; do
+            codesign --force --options runtime --sign - --entitlements "$INNER_ENTITLEMENTS" "$bin" 2>/dev/null || true
+          done
+
+          codesign --force --options runtime --sign - \
+            --entitlements "$INNER_ENTITLEMENTS" "$RESOURCES/voxherd-bridge/voxherd-bridge"
+
+          codesign --force --options runtime --sign - --entitlements "$ENTITLEMENTS" "$APP"
+
+      - name: Verify the bridge binary runs
+        run: |
+          # A bundle can verify perfectly and be unable to start: library
+          # validation refuses the bundled CPython framework when the Team IDs
+          # do not match, and nothing about the signature says so. Catch it here
+          # rather than in a published DMG.
+          BRIDGE="macos/dist/VoxHerdBridge.app/Contents/Resources/voxherd-bridge/voxherd-bridge"
+          # Bounded: `$(... --help)` blocks forever if the binary starts but
+          # hangs, and a gate meant to catch "cannot start" must not hang CI
+          # instead of failing it. macOS runners have no `timeout(1)`.
+          HELP_FILE="$(mktemp)"
+          "$BRIDGE" --help >"$HELP_FILE" 2>&1 &
+          HELP_PID=$!
+          for _ in $(seq 1 100); do
+            kill -0 "$HELP_PID" 2>/dev/null || break
+            sleep 0.2
+          done
+          if kill -0 "$HELP_PID" 2>/dev/null; then
+            kill -9 "$HELP_PID" 2>/dev/null || true
+            echo "::error::the bridge binary started but did not exit within 20s"
+            head -5 "$HELP_FILE"
+            exit 1
+          fi
+          HELP_RC=0
+          wait "$HELP_PID" || HELP_RC=$?
+          out=$(cat "$HELP_FILE")
+          # Measured: a failed dlopen of the bundled CPython exits 255, so this
+          # is the branch that catches it. The rest are backstops.
+          if [ "$HELP_RC" -ne 0 ]; then
+            echo "::error::the signed bridge binary failed to run"
+            echo "$out" | head -5
+            exit 1
+          fi
+          case "$out" in
+            *"Failed to load Python shared library"*|*"[PYI-"*)
+              echo "::error::the signed bridge binary could not load CPython"
+              echo "$out" | head -5; exit 1 ;;
+          esac
+          # Deliberately not "usage: voxherd-bridge": that exact string depends
+          # on argparse deriving prog from argv[0], which only happens because
+          # `--help` falls into the old-style-invocation branch in
+          # bridge/cli.py. The real parser is prog="voxherd".
+          case "$out" in
+            *"usage:"*) echo "bridge binary starts cleanly" ;;
+            *) echo "::error::bridge ran but printed no usage"; echo "$out" | head -5; exit 1 ;;
+          esac
+
+      - name: Verify hardened runtime
+        run: |
+          # Both paths, because an --options runtime that failed to apply reads
+          # identically to one that worked -- which is how the ad-hoc path
+          # shipped unhardened for as long as it did.
+          APP="macos/dist/VoxHerdBridge.app"
+          RESOURCES="$APP/Contents/Resources"
+          BRIDGE="$RESOURCES/voxherd-bridge/voxherd-bridge"
+          status=0
+          ok=0
+          missing=0
+          check() {
+            local flags
+            flags=$( { codesign -d --verbose "$1" 2>&1 || true; } | sed -n 's/.*flags=\([^ ]*\).*/\1/p')
+            if [[ "$flags" != *runtime* ]]; then
+              echo "::error::hardened runtime missing on $1 (flags=${flags:-none})"
+              missing=$((missing + 1))
+              return
+            fi
+            ok=$((ok + 1))
+            [ -n "${2:-}" ] && echo "$(basename "$1"): $flags"
+            return 0
+          }
+
+          check "$APP" show
+          check "$BRIDGE" show
+
+          # Every nested image too, not just the two top-level ones. The signing
+          # loops silence codesign and `|| true`, so a dylib whose re-sign
+          # failed is otherwise invisible -- and on the certificate path library
+          # validation stays ON, so it is refused at its first dlopen. For the
+          # tree-sitter grammars that is the first /api/file request, long after
+          # the DMG was notarized and published.
+          nested=()
+          while IFS= read -r image; do
+            nested+=("$image")
+          done < <(find "$RESOURCES/voxherd-bridge" \
+                       \( -type f \( -name "*.dylib" -o -name "*.so" \) \) -o \
+                       \( -type f -perm +111 ! -name "*.dylib" ! -name "*.so" \) 2>/dev/null)
+          for image in ${nested[@]+"${nested[@]}"}; do
+            check "$image"
+          done
+          echo "$ok signed images hardened, $missing missing"
+          [ "$missing" -gt 0 ] && status=1
+
+          # Xcode 15+ emits a separate VoxHerdBridge.debug.dylib for Debug
+          # builds, which is how this bug class first appeared (the app died at
+          # launch with a Team-ID error). A Release build should never produce
+          # one; if it does, the app will not start.
+          if find "$APP" -name "*.debug.dylib" | grep -q .; then
+            echo "::error::$APP contains a debug dylib"
+            find "$APP" -name "*.debug.dylib"
+            status=1
+          fi
+
+          exit $status
 
       - name: Create DMG
         run: |
@@ -213,6 +377,15 @@ jobs:
           name: macos-dmg
           path: macos/dist/VoxHerdBridge-*.dmg
           if-no-files-found: error
+
+      # Symbols for crash reports from this exact build (the shipped binary is
+      # stripped). An artifact of the run, never a release asset.
+      - name: Upload macOS dSYM
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dsym
+          path: /tmp/vh-macos-build/Build/Products/Release/VoxHerdBridge.app.dSYM
+          if-no-files-found: warn
 
   # ---------------------------------------------------------------------------
   # Linux: Package bridge + hooks + systemd service into tarball

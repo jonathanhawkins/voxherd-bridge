@@ -34,6 +34,14 @@ struct StatusBarView: View {
                 .padding(.top, 12)
                 .padding(.bottom, 8)
 
+            // A waiting pairing request goes above everything, because it is
+            // the only thing here with a deadline.
+            if !processManager.pairingPrompts.isEmpty {
+                pairingSection
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 10)
+            }
+
             Divider()
 
             // Sessions
@@ -77,6 +85,16 @@ struct StatusBarView: View {
             Text(statusText)
                 .font(.caption)
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - Pairing
+
+    private var pairingSection: some View {
+        VStack(spacing: 6) {
+            ForEach(processManager.pairingPrompts) { prompt in
+                PairingCard(prompt: prompt)
+            }
         }
     }
 
@@ -257,6 +275,101 @@ struct StatusBarView: View {
         }
         .controlSize(.small)
         .help(preferences.enableTTS ? "Mute announcements" : "Unmute announcements")
+    }
+}
+
+// MARK: - PairingCard
+
+/// A pairing request, for as long as its code is good for.
+///
+/// Everything on this card is here because the wearer cannot get it anywhere
+/// else. The code, because a headset does not use its cameras and so cannot
+/// scan the QR the iPhone scans. The asking address, because it is the only
+/// part of the request a stranger could not choose — a card naming only the
+/// device looks identical whether the request came from the wearer's own
+/// headset or from someone else on the network, which is what would make a
+/// relay invisible (see `notification()` in `bridge/pairing.py`). The
+/// countdown, because the code dies in two minutes whether or not anyone is
+/// looking at it.
+private struct PairingCard: View {
+    let prompt: PairingPrompt
+
+    var body: some View {
+        // The clock drives the countdown, not the model: a card that
+        // re-published itself every second to tick would redraw the whole
+        // popover with it.
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            let remaining = prompt.secondsRemaining(at: context.date)
+
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(spacing: 5) {
+                    Image(systemName: "person.badge.key.fill")
+                        .font(.system(size: 10))
+                    Text("Pairing request")
+                        .font(.system(.caption, weight: .semibold))
+
+                    Spacer()
+
+                    Text(prompt.countdown(at: context.date))
+                        .font(.system(.caption2, design: .monospaced))
+                        .monospacedDigit()
+                        .foregroundStyle(remaining <= 20 ? Color.orange : Color.secondary)
+                }
+                .foregroundStyle(.primary)
+
+                Text(prompt.code)
+                    .font(.system(size: 30, weight: .semibold, design: .monospaced))
+                    .kerning(2)
+                    .frame(maxWidth: .infinity)
+                    .textSelection(.enabled)
+                    .accessibilityLabel(spelledOut(prompt.code))
+
+                ProgressView(value: Double(remaining), total: prompt.lifetime)
+                    .progressViewStyle(.linear)
+                    .tint(remaining <= 20 ? .orange : .accentColor)
+
+                // The device name is a stranger's string; the address is not.
+                HStack(spacing: 4) {
+                    Text(prompt.device)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Text("asked from \(prompt.host)")
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+
+                if prompt.attempts > 0 {
+                    HStack(spacing: 4) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 9))
+                        Text(prompt.attempts == 1
+                             ? "1 wrong code tried"
+                             : "\(prompt.attempts) wrong codes tried")
+                            .font(.caption2)
+                    }
+                    .foregroundStyle(.orange)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 9)
+            .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 7))
+            .overlay(
+                RoundedRectangle(cornerRadius: 7)
+                    .strokeBorder(Color.accentColor.opacity(0.35), lineWidth: 1)
+            )
+        }
+    }
+
+    /// "471 902" as "4 7 1, 9 0 2", so VoiceOver reads digits rather than
+    /// "four hundred and seventy-one".
+    private func spelledOut(_ code: String) -> String {
+        code.split(separator: " ")
+            .map { $0.map(String.init).joined(separator: " ") }
+            .joined(separator: ", ")
     }
 }
 

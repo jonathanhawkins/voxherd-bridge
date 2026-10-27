@@ -34,7 +34,7 @@ If you run multiple AI coding sessions across different projects, you know the p
 
 ```bash
 cd bridge
-python3 -m venv .venv
+python3.11 -m venv .venv    # 3.11+ required; do not use bare `python3`
 source .venv/bin/activate      # Linux/macOS
 # .venv\Scripts\activate       # Windows
 pip install -r requirements.txt
@@ -126,7 +126,7 @@ wscat -c ws://localhost:7777/ws/ios
 | DELETE | `/api/sessions/{session_id}` | Remove a session |
 | POST | `/api/events` | Hook events (stop, notification, subagent) |
 | POST | `/api/command` | Dispatch command to a project (REST) |
-| POST | `/api/intent/parse` | Parse voice transcription via Haiku |
+| POST | `/api/intent/parse` | Parse voice transcription via the profile's NLU model |
 | POST | `/api/tts` | Speak text via platform TTS |
 | GET | `/api/projects` | List known projects |
 | GET | `/api/connection-info` | Pairing info (URL, QR) |

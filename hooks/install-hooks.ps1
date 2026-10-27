@@ -3,10 +3,15 @@
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File hooks\install-hooks.ps1
 #   $env:HOOK_AGENTS="claude,gemini"; powershell -ExecutionPolicy Bypass -File hooks\install-hooks.ps1
+#   $env:MODEL_PROFILE="google"; powershell -ExecutionPolicy Bypass -File hooks\install-hooks.ps1
 #
 # Notes:
 # - Claude + Gemini support lifecycle hooks and are configured here.
 # - Codex currently has no native lifecycle hooks; dispatch is supported by the bridge.
+# - MODEL_PROFILE picks the small model the bridge itself uses for stop-hook
+#   summaries and intent parsing. It is an install-time choice, not a per-request
+#   one, and it is recorded in %APPDATA%\VoxHerd\models.env. Omit it and nothing
+#   is written, which means the hardcoded Claude Haiku default.
 
 $ErrorActionPreference = "Stop"
 
@@ -26,11 +31,14 @@ $HookScripts = @(
     "on-notification.sh"
     "on-subagent-start.sh"
     "on-subagent-stop.sh"
+    "ModelProfile.ps1"
+    "model-profile.sh"
 )
 
 $VoxHerdDir = Join-Path $env:APPDATA "VoxHerd"
 $HooksDest = Join-Path $VoxHerdDir "hooks"
 $LogsDir = Join-Path $VoxHerdDir "logs"
+$ModelsEnv = Join-Path $VoxHerdDir "models.env"
 
 # Parse target agents from environment
 $RawAgents = if ($env:HOOK_AGENTS) { $env:HOOK_AGENTS } else { "claude" }
@@ -57,6 +65,75 @@ foreach ($script in $HookScripts) {
     }
     Copy-Item -Path $src -Destination (Join-Path $HooksDest $script) -Force
     Write-Host "  Installed: $script"
+}
+
+# The Python hook shares bridge\model_profile.py rather than carrying its own
+# copy of the resolver. Drop it next to on-stop.py so the installed hook can
+# import it. Best-effort: if it is not on disk, on-stop.py falls back to the
+# hardcoded Claude Haiku default.
+foreach ($candidate in @(
+    (Join-Path (Split-Path -Parent $ScriptDir) "bridge\model_profile.py"),
+    (Join-Path $ScriptDir "model_profile.py")
+)) {
+    if (Test-Path $candidate -PathType Leaf) {
+        Copy-Item -Path $candidate -Destination (Join-Path $HooksDest "model_profile.py") -Force
+        Write-Host "  Installed: model_profile.py"
+        break
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Model profile — which small model does summaries and intent parsing
+# ---------------------------------------------------------------------------
+#
+# Mirrors PROFILES in bridge\model_profile.py. Keep the two in step.
+# Only written when MODEL_PROFILE is set: a plain install leaves no models.env,
+# which resolves to the hardcoded Claude Haiku default.
+
+function Write-ModelsEnv {
+    param([string]$Profile)
+
+    switch ($Profile) {
+        "google" {
+            # agy, not gemini: Gemini CLI no longer signs in with a personal Google
+            # account (retired 2026-06-18). See PROFILES in bridge\model_profile.py.
+            $summaryCli = "agy"; $summaryModel = "gemini-3.8-flash-low"
+            $nluCli = "agy";     $nluModel = "gemini-3.8-flash-low"
+        }
+        "anthropic" {
+            $summaryCli = "claude"; $summaryModel = "claude-haiku-4-5-20251001"
+            $nluCli = "claude";     $nluModel = "claude-haiku-4-5-20251001"
+        }
+        default {
+            Write-Host "  Warning: unknown MODEL_PROFILE '$Profile' -- using 'anthropic'."
+            $Profile = "anthropic"
+            $summaryCli = "claude"; $summaryModel = "claude-haiku-4-5-20251001"
+            $nluCli = "claude";     $nluModel = "claude-haiku-4-5-20251001"
+        }
+    }
+
+    $body = @(
+        "# VoxHerd model profile -- written by hooks\install-hooks.ps1 (MODEL_PROFILE=$Profile)."
+        "# The small model used for stop-hook summaries and intent parsing. Resolved at"
+        "# install time, never per request. Environment variables of the same name"
+        "# override these for a single session."
+        "VOXHERD_SUMMARY_CLI=$summaryCli"
+        "VOXHERD_SUMMARY_MODEL=$summaryModel"
+        "VOXHERD_NLU_CLI=$nluCli"
+        "VOXHERD_NLU_MODEL=$nluModel"
+    )
+    Set-Content -Path $ModelsEnv -Value $body -Encoding UTF8
+    Write-Host "  Model profile: $Profile -> $ModelsEnv"
+}
+
+if ($env:MODEL_PROFILE) {
+    Write-Host "Writing model profile..."
+    Write-ModelsEnv -Profile $env:MODEL_PROFILE.Trim().ToLower()
+} elseif (Test-Path $ModelsEnv -PathType Leaf) {
+    Write-Host "Model profile: keeping existing $ModelsEnv"
+    Write-Host "  (re-run with MODEL_PROFILE=google or MODEL_PROFILE=anthropic to change it)"
+} else {
+    Write-Host "Model profile: anthropic (default -- claude-haiku-4-5-20251001, no models.env written)"
 }
 
 # ---------------------------------------------------------------------------

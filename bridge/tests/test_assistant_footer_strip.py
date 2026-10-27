@@ -1242,3 +1242,84 @@ def test_preserves_spinner_line_without_a_time_unit() -> None:
     # Sparkle prefix but the "for" target is a noun, not a duration → keep.
     lines = ["✻ Optimized for readability and speed"]
     assert _strip_working_status_rows(lines) == lines
+
+
+# ---------------------------------------------------------------------------
+# Check-glyph context sensitivity
+#
+# `✓`/`✔` are in _TASK_CHECKBOX_CHARS because a completed TodoWrite item can
+# use them -- but so does every test runner and build tool on earth. Stripping
+# them context-free mangled output asymmetrically: `✗`/`×` are NOT in the set,
+# so the user's phone showed "✗ 2 failed" with the "✓ 41 passed" above it
+# silently removed, reading as if nothing had passed.
+#
+# The fix keeps BOX glyphs (□◻▢☐☑☒■◼▪▮) context-free -- nothing but TodoWrite
+# opens a line with those -- and requires a bare check row to be adjacent to
+# the widget before it is dropped.
+# ---------------------------------------------------------------------------
+
+
+def test_bare_check_rows_survive_without_widget_context() -> None:
+    """The headline regression: a test runner's own output."""
+    lines = ["⏺ Bash(pnpm test)", "✓ 41 passed", "✗ 2 failed"]
+    assert _strip_task_summary(lines) == lines
+
+
+def test_run_of_check_rows_survives_without_context() -> None:
+    """vitest prints one `✓` per file -- a long run, still not a widget."""
+    lines = [
+        "✓ src/scheduler/week.test.ts (3)",
+        "✓ src/router/intent.test.ts (5)",
+        "✓ src/export/label.test.ts (2)",
+    ]
+    assert _strip_task_summary(lines) == lines
+
+
+def test_check_rows_drop_when_anchored_to_a_header() -> None:
+    lines = [
+        "175 tasks (165 done, 10 open)",
+        "✓ Ship the parser",
+        "✓ Ship the tests",
+        "real content",
+    ]
+    assert _strip_task_summary(lines) == ["real content"]
+
+
+def test_check_rows_drop_when_touching_a_box_glyph_row() -> None:
+    """A mixed widget: completed items next to pending ones."""
+    lines = ["☒ done", "✓ also done", "☐ todo", "real content"]
+    assert _strip_task_summary(lines) == ["real content"]
+
+
+def test_check_row_drops_when_it_precedes_the_widget() -> None:
+    """The walk grows in both directions, not just downward."""
+    lines = ["real content", "✓ completed", "◻ pending", "more real content"]
+    assert _strip_task_summary(lines) == ["real content", "more real content"]
+
+
+def test_check_row_behind_a_tree_connector_is_a_widget_row() -> None:
+    """No test runner draws box-drawing corners around its pass lines."""
+    lines = [
+        "+ Finagling… (2m 7s · ↓ 4.9k tokens · almost done thinking with max effort)",
+        "  └ ✓ First task",
+        "    ✓ Second task",
+        "real content",
+    ]
+    assert _strip_task_summary(lines) == ["real content"]
+
+
+def test_box_glyph_rows_stay_context_free() -> None:
+    """Unchanged behaviour: a stranded widget row goes wherever it sits."""
+    lines = ["real", "◻ stranded widget row", "more real"]
+    assert _strip_task_summary(lines) == ["real", "more real"]
+
+
+def test_predicate_still_reports_bare_check_rows_as_possible_widget_rows() -> None:
+    """`_is_task_summary_row` stays the context-free union.
+
+    It answers "could this be a widget row?"; `_strip_task_summary` answers
+    "is it one, here?". Callers with a single line in hand still get the old
+    answer.
+    """
+    assert _is_task_summary_row("✓ Done") is True
+    assert _is_task_summary_row("✗ Failed") is False

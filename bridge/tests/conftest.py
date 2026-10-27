@@ -27,6 +27,37 @@ os.environ["VOXHERD_AUTH_TOKEN"] = TEST_AUTH_TOKEN
 # 3. SessionManager._load() tries to read ~/.voxherd/sessions.json
 
 from bridge import bridge_server  # noqa: E402
+from bridge import model_profile  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def default_model_profile(monkeypatch):
+    """Pin every test to the stock Claude Haiku profile.
+
+    ``model_profile.resolve()`` reads ``~/.voxherd/models.env`` and the process
+    environment. Without this, a developer who installed the Google profile
+    would see different argv (and a different JSON envelope shape) than CI.
+    Tests that want another profile resolve one explicitly.
+    """
+    absent = os.path.join(tempfile.gettempdir(), "voxherd-tests-no-such-dir", "models.env")
+    monkeypatch.setenv("VOXHERD_MODELS_ENV", absent)
+    for env_key in model_profile.ENV_KEYS:
+        monkeypatch.delenv(env_key, raising=False)
+    model_profile.reset_active()
+    yield
+    model_profile.reset_active()
+
+
+@pytest.fixture(autouse=True)
+def isolated_pane_geometry(monkeypatch, tmp_path):
+    """Keep every test out of the developer's real pane-geometry record.
+
+    ``_acquire_geometry`` now persists what it owes a tmux window, so without
+    this a tmux-backed test would write into ``~/.voxherd/pane-geometry.json``
+    and the next real bridge start would "restore" a throwaway test window.
+    Per-test, so the record never leaks between tests either.
+    """
+    monkeypatch.setenv("VOXHERD_PANE_GEOMETRY_FILE", str(tmp_path / "pane-geometry.json"))
 
 
 def _auth_headers() -> dict[str, str]:
@@ -39,7 +70,7 @@ def _auth_headers() -> dict[str, str]:
 
 # Create a persistent temp directory for test project_dirs under $HOME
 # (the bridge validates project_dir is under user home).
-_TEST_PROJECT_DIR = os.path.join(os.path.expanduser("~"), ".voxherd", "test-projects", "myproject")
+_TEST_PROJECT_DIR = os.path.join(os.path.expanduser("~"), ".voxherd-test-projects", "myproject")
 os.makedirs(_TEST_PROJECT_DIR, exist_ok=True)
 
 
@@ -83,7 +114,11 @@ async def client():
         transport = ASGITransport(app=bridge_server.app)
         async with httpx.AsyncClient(
             transport=transport,
-            base_url="http://testserver",
+            # "localhost", not "testserver": auth_middleware pins the Host header
+            # (the X-VoxHerd CSRF defence is only sound if a rebinding
+            # attacker cannot pick the Host), so the client has to look
+            # like a real local caller.
+            base_url="http://localhost",
         ) as ac:
             yield ac
 
@@ -131,7 +166,11 @@ async def noauth_client():
         transport = ASGITransport(app=bridge_server.app)
         async with httpx.AsyncClient(
             transport=transport,
-            base_url="http://testserver",
+            # "localhost", not "testserver": auth_middleware pins the Host header
+            # (the X-VoxHerd CSRF defence is only sound if a rebinding
+            # attacker cannot pick the Host), so the client has to look
+            # like a real local caller.
+            base_url="http://localhost",
         ) as ac:
             yield ac
 

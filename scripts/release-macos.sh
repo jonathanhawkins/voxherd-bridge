@@ -79,12 +79,24 @@ if $SKIP_BUILD; then
     fi
 else
     echo "--- Step 1/3: Building and signing app ---"
-    bash "$MACOS_DIR/build-app.sh"
+    VOXHERD_VERSION="$VERSION" bash "$MACOS_DIR/build-app.sh"
+fi
+echo ""
+
+APP_PATH="$MACOS_DIR/dist/VoxHerdBridge.app"
+
+# Leak check, before a DMG or a notarization is spent on a build that names
+# the unreleased headset, this machine's paths or a key. A plain grep of the
+# bundle cannot see inside the frozen bridge's compressed modules; the check
+# reads them with PyInstaller's own readers (scripts/check-bundle-leaks.py).
+echo "--- Leak check ---"
+if ! "$PROJECT_DIR/bridge/.venv/bin/python" -I "$SCRIPT_DIR/check-bundle-leaks.py" "$APP_PATH"; then
+    echo "ERROR: the app bundle leaks (above). Fix the build; nothing was packaged or notarized."
+    exit 1
 fi
 echo ""
 
 # Read version
-APP_PATH="$MACOS_DIR/dist/VoxHerdBridge.app"
 if [ -z "$VERSION" ]; then
     VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" \
         "$APP_PATH/Contents/Info.plist" 2>/dev/null || echo "1.0.0")

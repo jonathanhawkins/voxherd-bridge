@@ -14,6 +14,9 @@ $env:VOXHERD_HOOK_RUNNING = "1"
 
 $BridgeUrl = "http://localhost:7777/api/events"
 $ConfigDir = Join-Path $env:APPDATA "VoxHerd"
+# $PSScriptRoot is set however the script was invoked (-File, & 'path', dot-source);
+# $MyInvocation is the PS2 fallback.
+$HookDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $LogDir = Join-Path $ConfigDir "logs"
 $DebugLog = Join-Path $LogDir "on-stop-debug.log"
 $ErrorLog = Join-Path $LogDir "hook-errors.log"
@@ -44,6 +47,35 @@ function Write-ErrorLog {
         $timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
         Add-Content -Path $ErrorLog -Value "[$timestamp] on-stop.ps1: $Message" -ErrorAction SilentlyContinue
     } catch {}
+}
+
+# ---------------------------------------------------------------------------
+# Model profile — which small model summarises this turn
+# ---------------------------------------------------------------------------
+#
+# Resolved at install time from models.env, not per request. If ModelProfile.ps1
+# is missing for any reason, fall back to the hardcoded Claude Haiku default —
+# a hook must never block the assistant over a missing helper.
+
+$ModelProfile = $null
+try {
+    $modelProfilePath = Join-Path $HookDir "ModelProfile.ps1"
+    if (Test-Path $modelProfilePath -PathType Leaf) {
+        . $modelProfilePath
+        $ModelProfile = Resolve-VoxHerdModelProfile
+    }
+} catch {
+    $ModelProfile = $null
+}
+if (-not $ModelProfile) {
+    $ModelProfile = [PSCustomObject]@{
+        SummaryCli       = "claude"
+        SummaryModel     = "claude-haiku-4-5-20251001"
+        SummaryCliSource = "default"
+        NluCli           = "claude"
+        NluModel         = "claude-haiku-4-5-20251001"
+        NluCliSource     = "default"
+    }
 }
 
 # Truncate debug log if over 500KB
@@ -95,31 +127,48 @@ Write-DebugLog "  TRANSCRIPT_EXISTS=$(Test-Path $TranscriptPath -ErrorAction Sil
 Write-DebugLog "  ASSISTANT=$Assistant"
 
 # ---------------------------------------------------------------------------
-# Generate summary via Haiku
+# Generate summary via the profile's model
 # ---------------------------------------------------------------------------
 
 $Summary = ""
 if ($Quiet) {
-    Write-DebugLog "  VOXHERD_QUIET set — skipping Haiku summary"
+    Write-DebugLog "  VOXHERD_QUIET set — skipping AI summary"
 } elseif ($TranscriptPath -and (Test-Path $TranscriptPath -ErrorAction SilentlyContinue)) {
-    Write-DebugLog "  Transcript exists, attempting Haiku summary..."
+    Write-DebugLog "  Transcript exists, attempting summary..."
     try {
         # Get last 50 lines of transcript
         $transcriptTail = Get-Content -Path $TranscriptPath -Tail 50 -ErrorAction Stop | Out-String
 
-        # Check if claude CLI is available
-        $claudePath = Get-Command "claude" -ErrorAction SilentlyContinue
-        if ($claudePath) {
-            Write-DebugLog "  Calling Haiku for summary..."
-            $prompt = "Summarize what was just accomplished in 1-2 sentences for a voice announcement. Be concise."
+        $prompt = "Summarize what was just accomplished in 1-2 sentences for a voice announcement. Be concise."
+
+        # Build the command from the install profile. If ModelProfile.ps1 did
+        # not load, fall back to the hardcoded Claude Haiku default.
+        if (Get-Command "Get-VoxHerdCliArgv" -ErrorAction SilentlyContinue) {
+            $argv = Get-VoxHerdCliArgv -Cli $ModelProfile.SummaryCli `
+                                       -Model $ModelProfile.SummaryModel `
+                                       -Prompt $prompt
+        } else {
+            $argv = @("claude", "-p", $prompt, "--model", "claude-haiku-4-5-20251001")
+        }
+        $summaryExe = $argv[0]
+        $summaryArgs = @()
+        for ($i = 1; $i -lt $argv.Count; $i++) {
+            $a = "$($argv[$i])"
+            if ($a -match '\s') { $summaryArgs += "`"$a`"" } else { $summaryArgs += $a }
+        }
+
+        # Check if the summary CLI is available
+        $summaryCliPath = Get-Command $summaryExe -ErrorAction SilentlyContinue
+        if ($summaryCliPath) {
+            Write-DebugLog "  Calling $summaryExe ($($ModelProfile.SummaryModel)) for summary..."
 
             # Create a temp file for piping transcript content
             $tempFile = [System.IO.Path]::GetTempFileName()
             try {
                 Set-Content -Path $tempFile -Value $transcriptTail -Encoding UTF8
                 $env:VOXHERD_HOOK_RUNNING = "1"
-                $process = Start-Process -FilePath "claude" `
-                    -ArgumentList "-p", "`"$prompt`"", "--model", "claude-haiku-4-5-20251001" `
+                $process = Start-Process -FilePath $summaryExe `
+                    -ArgumentList $summaryArgs `
                     -RedirectStandardInput $tempFile `
                     -RedirectStandardOutput "$tempFile.out" `
                     -RedirectStandardError "$tempFile.err" `
@@ -129,14 +178,14 @@ if ($Quiet) {
                 # as it blocks indefinitely and defeats the timeout
                 if (-not $process.WaitForExit(15000)) {
                     try { $process.Kill() } catch {}
-                    Write-DebugLog "  Haiku timed out"
+                    Write-DebugLog "  $summaryExe timed out"
                 } elseif ($process.ExitCode -eq 0) {
                     $Summary = (Get-Content "$tempFile.out" -Raw -ErrorAction SilentlyContinue).Trim()
-                    Write-DebugLog "  Haiku exit code: 0"
+                    Write-DebugLog "  $summaryExe exit code: 0"
                     Write-DebugLog "  SUMMARY=$Summary"
                 } else {
                     $stderr = Get-Content "$tempFile.err" -Raw -ErrorAction SilentlyContinue
-                    Write-DebugLog "  Haiku exit code: $($process.ExitCode), stderr: $stderr"
+                    Write-DebugLog "  $summaryExe exit code: $($process.ExitCode), stderr: $stderr"
                 }
             } finally {
                 Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
@@ -144,16 +193,16 @@ if ($Quiet) {
                 Remove-Item "$tempFile.err" -Force -ErrorAction SilentlyContinue
             }
         } else {
-            Write-DebugLog "  Claude CLI not found, skipping Haiku summarization"
+            Write-DebugLog "  $summaryExe CLI not found, skipping CLI summarization"
         }
     } catch {
-        Write-DebugLog "  Haiku error: $_"
+        Write-DebugLog "  Summary error: $_"
     }
 } else {
     Write-DebugLog "  SKIPPED: transcript_path empty or file not found"
 }
 
-# Fallback if claude failed or returned empty
+# Fallback if the summary CLI failed or returned empty
 if (-not $Summary) {
     $Summary = "Task completed."
     Write-DebugLog "  Using fallback summary"

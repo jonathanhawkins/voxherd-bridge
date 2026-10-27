@@ -14,6 +14,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from bridge.env_utils import get_subprocess_env
+from bridge.tts_budget import utterance_timeout
 
 log = logging.getLogger(__name__)
 
@@ -233,7 +234,14 @@ class MacTTS:
         args = ["say"]
         if self.voice and self.voice != SYSTEM_DEFAULT_VOICE:
             args += ["-v", self.voice]
-        args += ["-r", str(self.rate), text]
+        # "--" before the text. `say` uses getopt_long, so text beginning with a
+        # dash is read as a flag: `--output-file=<path>` wrote an audio file to an
+        # arbitrary path, and `--network-send=host:port` would stream the audio
+        # off the machine. Worse than either, a text argument consumed as a flag
+        # leaves `say` with nothing to speak, so it reads stdin instead and blocks
+        # forever -- and this worker drains one item at a time, so that is every
+        # future announcement silenced until the bridge restarts.
+        args += ["-r", str(self.rate), "--", text]
         return args
 
     async def _worker(self) -> None:
@@ -246,11 +254,33 @@ class MacTTS:
                 say_args = self._build_say_args(tts_text)
                 proc = await asyncio.create_subprocess_exec(
                     *say_args,
+                    stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                     env=get_subprocess_env(),
                 )
-                await proc.wait()
+                # Bounded wait. The queue drains one item at a time, so any `say`
+                # that does not finish silences every later announcement: a ~1 MB
+                # text argument is ~15 hours of speech, and a `say` with no text
+                # left to speak reads stdin forever (DEVNULL above closes that
+                # second door). Nothing logged it, and nothing recovered.
+                budget = utterance_timeout(tts_text)
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=budget)
+                except (TimeoutError, asyncio.TimeoutError):
+                    # Both aliases, matching linux_tts. They are the same class
+                    # on 3.11; on <=3.10 only the asyncio one is raised and the
+                    # bare name would fall through to the outer
+                    # `except Exception: pass`, leaving the hung `say` unkilled.
+                    log.warning(
+                        "TTS utterance exceeded its %.0fs budget for %d characters "
+                        "— stopping it so the queue keeps moving", budget, len(tts_text),
+                    )
+                    try:
+                        proc.kill()
+                    except (ProcessLookupError, OSError):
+                        pass
+                    await proc.wait()
 
                 # Fire callback after speech completes.
                 if self.on_speech_complete and item.listen_after:

@@ -46,6 +46,20 @@ STALE_SCROLLBACK_IDLE = """\
 """
 
 
+@pytest.fixture(autouse=True)
+def _no_decision_on_screen():
+    """Pin the pre-dispatch pane check to "nothing on screen".
+
+    ``handle_voice_command`` looks at the pane for a live decision before it
+    queues (see ``test_dispatch_decision_guard.py``). These tests are about
+    queue-versus-dispatch, and must not reach a real tmux to find out.
+    """
+    from bridge import ws_handler
+    with patch.object(ws_handler, "_decision_on_screen",
+                      new=AsyncMock(return_value=(None, None))):
+        yield
+
+
 def _make_session(status="active", tmux_target="myproject:0.0") -> Session:
     return Session(
         session_id="test-sess-123",

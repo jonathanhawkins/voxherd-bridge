@@ -18,6 +18,14 @@ final class BridgeProcessManager {
     var sessions: [SessionInfo] = []
     var port: Int = 7777
 
+    /// Pairing requests the bridge has waiting, oldest first. Drives the card
+    /// in the menu bar window and the menu bar icon itself, so that a wearer
+    /// can look at the Mac at any point in a request's two minutes and read
+    /// the code — which a notification banner, gone the instant you look
+    /// away, and a log line, pushed out of sight by the next ten events,
+    /// between them never managed.
+    private(set) var pairingPrompts: [PairingPrompt] = []
+
     /// Auth token loaded from ~/.voxherd/auth_token after bridge signals ready.
     private(set) var authToken: String?
 
@@ -30,6 +38,7 @@ final class BridgeProcessManager {
     private var forceKillTask: Task<Void, Never>?
     private var startupTimeoutTask: Task<Void, Never>?
     private var sessionPollTask: Task<Void, Never>?
+    private var pairingPruneTask: Task<Void, Never>?
     private var restartDelay: TimeInterval = 1.0
     private let maxEvents = 200
     /// Seconds to wait for the ready signal before treating startup as failed.
@@ -107,21 +116,35 @@ final class BridgeProcessManager {
         args.append(contentsOf: ["--port", "\(port)"])
         proc.arguments = args
 
-        // Build environment — only add system-owned directories to PATH.
-        // User-writable dirs (~/.local/bin, ~/.cargo/bin) are intentionally
-        // excluded to prevent PATH hijacking.
+        // Build the child's PATH from a fixed list, and do NOT inherit the
+        // parent's. The previous version claimed to exclude user-writable
+        // directories but never filtered anything: it appended the inherited
+        // PATH whole, and since /usr/bin and /bin are always already present
+        // they were never in `additions`, so any user-writable directory that
+        // preceded /usr/bin still preceded it. What gets resolved through this
+        // PATH is a bare `claude --dangerously-skip-permissions`, so a planted
+        // ~/.local/bin/claude ran inside the bridge's process tree with the
+        // app's microphone grant.
+        //
+        // Homebrew's prefixes are kept because the assistants and tmux live
+        // there and the bridge is unusable without them, but they are ordered
+        // AFTER the system directories: on this machine /opt/homebrew/bin is
+        // `drwxrwxr-x bone admin`, i.e. writable by the user and by any admin
+        // account, so it must not be able to shadow /usr/bin/env or /bin/sh.
         var env = ProcessInfo.processInfo.environment
-        let extraPaths = [
+        env["PATH"] = [
+            "/usr/bin", "/bin", "/usr/sbin", "/sbin",
             "/usr/local/bin",
             "/opt/homebrew/bin",
             "/opt/homebrew/sbin",
-            "/usr/bin", "/bin", "/usr/sbin", "/sbin",
-        ]
-        let currentPath = env["PATH"] ?? ""
-        let currentDirs = Set(currentPath.split(separator: ":").map(String.init))
-        let additions = extraPaths.filter { !currentDirs.contains($0) }
-        if !additions.isEmpty {
-            env["PATH"] = (additions + [currentPath]).joined(separator: ":")
+        ].joined(separator: ":")
+
+        // Loader and interpreter overrides are inherited from whatever launched
+        // the app (Finder, a shell, launchd). With the hardened runtime they
+        // would be stripped for DYLD_*, but PYTHONPATH/PYTHONHOME are not, and
+        // the bridge is a frozen Python interpreter.
+        for key in Array(env.keys) where key.hasPrefix("DYLD_") || key.hasPrefix("PYTHON") {
+            env.removeValue(forKey: key)
         }
 
         // Force unbuffered stdout so the ready signal arrives immediately via pipe
@@ -150,6 +173,8 @@ final class BridgeProcessManager {
             Task { @MainActor in
                 guard let self else { return }
                 let code = process.terminationStatus
+                // Whatever killed it, the codes it handed out died with it.
+                self.clearPairingPrompts()
                 if self.state == .running || self.state == .starting {
                     self.logger.warning("Bridge exited unexpectedly with code \(code)")
                     self.state = .error("Bridge exited (code \(code))")
@@ -174,6 +199,7 @@ final class BridgeProcessManager {
 
     func stop() {
         stopSessionPolling()
+        clearPairingPrompts()
 
         startupTimeoutTask?.cancel()
         startupTimeoutTask = nil
@@ -281,7 +307,13 @@ final class BridgeProcessManager {
         }
     }
 
-    private func processLine(_ line: String) {
+    /// One line of the bridge's stdout: a ready signal, a pairing card, or a
+    /// log entry.
+    ///
+    /// Internal rather than private so a test can push a real line through
+    /// the same decode ladder the pipe uses. Which of the three claims a line
+    /// is the thing worth testing, and it is not visible from outside.
+    func processLine(_ line: String) {
         guard let data = line.data(using: .utf8) else { return }
 
         // Check for ready signal
@@ -292,8 +324,21 @@ final class BridgeProcessManager {
             state = .running
             port = ready.port
             logger.info("Bridge ready on port \(ready.port)")
+            // A bridge that just started has an empty book of pairing
+            // requests, so anything still on screen is from the last one and
+            // its code is dead.
+            clearPairingPrompts()
             loadAuthToken()
             startSessionPolling()
+            return
+        }
+
+        // A pairing request (bridge/pairing.py). Tried before the log entry
+        // because it is neither that nor a ready signal: it arrives under its
+        // own `pairing` key, so no two of the three decoders can claim the
+        // same line.
+        if let line = try? JSONDecoder().decode(PairingLine.self, from: data) {
+            applyPairing(line.pairing)
             return
         }
 
@@ -329,6 +374,61 @@ final class BridgeProcessManager {
                 recentEvents.removeFirst(recentEvents.count - maxEvents)
             }
         }
+    }
+
+    // MARK: - Pairing
+
+    /// Fold one `{"pairing": {...}}` line into what the menu bar shows.
+    ///
+    /// The decision is `PairingPrompts.apply`'s; this only keeps the expiry
+    /// timer running for exactly as long as there is something to expire.
+    private func applyPairing(_ payload: PairingLine.Payload) {
+        pairingPrompts = PairingPrompts.apply(payload, to: pairingPrompts, now: Date())
+        // The count only. Not the code, not the asking address, and not
+        // `payload.state` either: the unified log persists to disk where any
+        // admin tool can read it, and `state` is whatever the line said, so
+        // logging it verbatim would let a line write its own text into the
+        // system log. A number is enough to tell "the app saw the line" from
+        // "it did not" — which is the only question that can be asked when
+        // nobody is looking at the menu bar.
+        logger.info("Pairing cards now showing: \(self.pairingPrompts.count)")
+        if pairingPrompts.isEmpty {
+            pairingPruneTask?.cancel()
+            pairingPruneTask = nil
+        } else if pairingPruneTask == nil {
+            startPairingPruning()
+        }
+    }
+
+    /// Drop each card as its code dies.
+    ///
+    /// This has to be ours: `bridge/pairing.py` sweeps its book only when
+    /// another pairing call arrives, so a request nobody answers is never
+    /// announced as expired, and a card that waited to be told would outlive
+    /// the code it shows. The wearer would read it off the Mac and key it in.
+    ///
+    /// One second, because that is also the countdown's resolution. The task
+    /// exists only while a card does — at most two minutes at a time.
+    private func startPairingPruning() {
+        pairingPruneTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled, let self else { break }
+                self.pairingPrompts = PairingPrompts.pruned(self.pairingPrompts, now: Date())
+                if self.pairingPrompts.isEmpty {
+                    self.pairingPruneTask = nil
+                    break
+                }
+            }
+        }
+    }
+
+    /// Take every card down. A bridge that is gone cannot honour a code it
+    /// handed out.
+    private func clearPairingPrompts() {
+        pairingPruneTask?.cancel()
+        pairingPruneTask = nil
+        pairingPrompts = []
     }
 
     // MARK: - Session Polling
@@ -534,13 +634,28 @@ final class BridgeProcessManager {
         }
     }
 
-    /// Copy the current auth token to the pasteboard.
+    /// Copy the current auth token to the pasteboard, marked as a secret.
     /// Automatically clears it after 30 seconds to limit exposure.
+    ///
+    /// `NSPasteboard.general` has no access control: any process running as the
+    /// user can read it with no prompt, and the clipboard managers that are
+    /// near-universal on developer Macs archive every change to disk, where the
+    /// 30-second clear below cannot reach it. The token authorizes
+    /// `POST /api/command`, so a copy that outlives the paste is a standing
+    /// grant of code execution.
+    ///
+    /// The two marker types are the convention clipboard managers honour to mean
+    /// "do not record this" — the same thing password managers declare. They are
+    /// advisory, which is why the auto-clear stays; pairing a headset through the
+    /// six-digit code in `bridge/pairing.py` avoids the pasteboard altogether and
+    /// is the better path where it is available.
     func copyAuthTokenToClipboard() -> Bool {
         guard let token = authToken, !token.isEmpty else { return false }
         let pasteboard = NSPasteboard.general
         let changeCount = pasteboard.changeCount
         pasteboard.clearContents()
+        pasteboard.setString("", forType: .init("org.nspasteboard.ConcealedType"))
+        pasteboard.setString("", forType: .init("org.nspasteboard.TransientType"))
         pasteboard.setString(token, forType: .string)
 
         // Auto-clear after 30 seconds if pasteboard hasn't been changed

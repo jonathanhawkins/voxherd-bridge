@@ -128,8 +128,15 @@ async def _run(data: dict, fresh_form) -> tuple[list, MagicMock]:
             continue
         rest = argv[4:]  # after tmux send-keys -t <target>
         literal = bool(rest) and rest[0] == "-l"
-        keys = rest[1:] if literal else rest
-        seqs.append((literal, keys))
+        if literal:
+            rest = rest[1:]
+        # Every send-keys call must mark end-of-options before the keys, or a
+        # payload starting with "-" is read as a tmux flag (e.g. "-N5" is the
+        # repeat count: tmux exits 0 and nothing reaches the pane). Asserted
+        # here rather than written into each expectation so that dropping the
+        # separator fails every test in this file.
+        assert rest and rest[0] == "--", f"send-keys argv missing '--': {argv!r}"
+        seqs.append((literal, rest[1:]))
     return seqs, ws
 
 

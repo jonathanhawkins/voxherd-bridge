@@ -286,3 +286,112 @@ class TestCrossLanguageVectors:
                 assert verify_message(msg) is True, (
                     f"verify_message() rejected valid signature for '{vec['name']}'"
                 )
+
+
+# ---------------------------------------------------------------------------
+# The generator and the committed fixtures must agree.
+#
+# `scripts/hmac-test-vectors.json` is what the Kotlin (`HmacVectorTest`) and
+# Swift (`HMACTests`) suites verify their canonical-JSON encoders against, and
+# `scripts/hmac-test-vectors.py` is supposed to be what produces it. They had
+# drifted: `float_wall_clock` and `float_notation_boundaries` were added to the
+# JSON by hand, so re-running the generator would have silently DELETED them --
+# and those two are the regression coverage for the one place the encoders
+# genuinely diverge (Python's `repr` vs Java's `Double.toString`, which pick
+# different notation for 1e7 <= |x| < 1e16, e.g. a wall-clock timestamp).
+#
+# Losing a vector does not fail anything: the clients would keep passing against
+# a smaller set.
+# ---------------------------------------------------------------------------
+
+
+def _require_vector_files() -> "tuple[pathlib.Path, pathlib.Path]":
+    """The generator and the fixtures, or skip.
+
+    Both are in ``scripts/sync-to-public.sh``'s EXCLUDE_PATTERNS while this test
+    file is synced (``bridge/`` is an INCLUDE_DIR), so in the public
+    ``voxherd-bridge`` repo neither exists -- and without this guard these tests
+    were four hard FileNotFoundErrors on a fresh clone of a BUSL-licensed repo.
+    ``TestCrossLanguageVectors._load_vectors`` above skips for exactly this
+    reason; this is the same guard, which the new tests were missing.
+    """
+    import pathlib
+
+    scripts = pathlib.Path(__file__).resolve().parents[2] / "scripts"
+    generator = scripts / "hmac-test-vectors.py"
+    fixtures = scripts / "hmac-test-vectors.json"
+    for path in (generator, fixtures):
+        if not path.exists():
+            pytest.skip(f"not present in this checkout: {path.name}")
+    return generator, fixtures
+
+
+def _generated_vectors() -> dict:
+    """Run the generator and parse what it prints."""
+    import json
+    import subprocess
+    import sys
+
+    generator, _ = _require_vector_files()
+    result = subprocess.run(
+        [sys.executable, str(generator)],
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    # `check=False` plus this assert: `check=True` surfaced a crashing generator
+    # as a bare CalledProcessError with the traceback swallowed.
+    assert result.returncode == 0, (
+        f"{generator.name} exited {result.returncode}:\n{result.stderr[-2000:]}"
+    )
+    return json.loads(result.stdout)
+
+
+def _committed_vectors() -> dict:
+    import json
+
+    _, fixtures = _require_vector_files()
+    return json.loads(fixtures.read_text())
+
+
+class TestTheGeneratorReproducesTheFixtures:
+    """Compared by name, not by file bytes.
+
+    The committed file escapes non-ASCII as ``\\uXXXX`` and orders the vectors
+    differently, both of which are invisible to a JSON parser -- and both client
+    suites iterate the array and look nothing up by position. So the contract is
+    the SET of vectors, not the file's formatting.
+    """
+
+    def test_no_vector_is_missing_from_either_side(self):
+        generated = {v["name"] for v in _generated_vectors()["vectors"]}
+        committed = {v["name"] for v in _committed_vectors()["vectors"]}
+        assert generated == committed, (
+            f"only generated: {sorted(generated - committed)}; "
+            f"only committed: {sorted(committed - generated)} — regenerating "
+            f"hmac-test-vectors.json would change which vectors the Kotlin and "
+            f"Swift suites check"
+        )
+
+    def test_every_vector_agrees_on_its_canonical_form_and_signature(self):
+        generated = {v["name"]: v for v in _generated_vectors()["vectors"]}
+        committed = {v["name"]: v for v in _committed_vectors()["vectors"]}
+        for name in sorted(set(generated) & set(committed)):
+            assert generated[name]["canonical_json"] == committed[name]["canonical_json"], name
+            assert generated[name]["hmac_sha256"] == committed[name]["hmac_sha256"], name
+
+    def test_the_token_matches(self):
+        assert _generated_vectors()["token"] == _committed_vectors()["token"]
+
+    def test_the_float_divergence_vectors_are_present(self):
+        """Named explicitly: these are the ones that went missing.
+
+        The Kotlin encoder reproduces Python's `repr` by hand, and 12345678.0 is
+        the value that proves it has to -- Python writes `12345678.0`, Java's
+        `Double.toString` writes `1.2345678E7`, and a mismatched canonical
+        string means a rejected HMAC on every signed frame carrying a timestamp.
+        """
+        committed = {v["name"]: v for v in _committed_vectors()["vectors"]}
+        assert "float_wall_clock" in committed
+        assert "float_notation_boundaries" in committed
+        boundaries = committed["float_notation_boundaries"]
+        assert "12345678.0" in boundaries["canonical_json"]
+        assert "1.2345678E7" not in boundaries["canonical_json"]

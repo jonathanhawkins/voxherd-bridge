@@ -181,9 +181,15 @@ def kill_session(name: str) -> bool:
 
 
 def send_keys(target: str, keys: str) -> bool:
-    """Send keys to a tmux target. Returns True if successful."""
+    """Send keys to a tmux target. Returns True if successful.
+
+    ``--`` for the same reason as every other send-keys call site: without it a
+    key argument beginning with "-" is parsed as a tmux flag. Today the only
+    caller passes the constant ``"C-c"``, so this is the gap being closed before
+    it matters rather than a live hole.
+    """
     try:
-        result = _run_tmux("send-keys", "-t", target, keys)
+        result = _run_tmux("send-keys", "-t", target, "--", keys)
         return result.returncode == 0
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return False

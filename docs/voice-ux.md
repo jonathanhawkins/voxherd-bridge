@@ -52,10 +52,46 @@ Earcons are distinct audio cues that provide immediate feedback without requirin
 | **commandSent** | 1004 | Light | Voice command acknowledged | Command received, dispatching |
 | **connected** | 1003 | Soft | Bridge or glasses connected | Connection established |
 | **disconnected** | 1006 | Soft | Bridge or glasses lost | Connection lost |
-| **wakeWordActivated** | 1057 | Light | Wake word detected ("Hey Claude") | Ready to listen |
+| **wakeWordActivated** | 1057 | Light | Wake word detected ("Hey agent") | Ready to listen |
 | **listeningReady** | 1114 | Light | STT engine ready | Speak now |
 
 Haptic feedback reinforces the audio cue when the phone is in hand. When using glasses with open-ear speakers, audio alone is sufficient.
+
+### The identity axis (Earshot, headset clients)
+
+The earcons above say *what* happened. Headset clients add a second, orthogonal axis:
+*who*. Each project has a two-note motif, played from that
+session's side just before it speaks, so its words need not begin "Homeschool says…".
+
+| Rule | Why |
+|---|---|
+| Two notes from C-major pentatonic, C5–A6 | Any pair is consonant; no motif sounds like an alarm |
+| Chosen by FNV-1a of the lower-cased project name | The same project sounds the same tomorrow; pinned bit for bit so every client matches |
+| 110 ms, 30 ms gap, 110 ms: 250 ms before speech | A motif is a lead-in, not a jingle |
+| Unique within the herd | 90 motifs collide often (`homeschool` and `quantcoach` share E5→D6); a newcomer takes its next variant, whoever was first keeps theirs |
+| Who, then what | For a question: the motif, then the knock, then the words |
+| The Anchor has none | It speaks from the front for several agents at once, and says names |
+
+### What the Anchor says (Earshot, headset clients)
+
+From four agents, or when two finish within the gather window, one front-centre voice
+speaks for all of them:
+
+> *"Eight came back. voxherd: refactored the auth middleware. android: hit a merge
+> conflict. Six more finished. quantcoach is waiting on you. Two others are still
+> running."*
+
+| Rule | Why |
+|---|---|
+| The count is the true total | Eight did come back; the wearer is told how many, then told about some of them |
+| Summaries until the word budget runs out, then counted | Reading all eight was 107 words — over forty seconds of uninterrupted speech. A budget rather than a count adapts: three terse agents fit where two verbose ones do not |
+| Never more than four voices in one breath | A swarm saying "done." apiece sails under the budget and is still a list nobody can follow |
+| A name costs what it is *said* as | `spoken()` turns every `-` into a space, so "kora-app-commerce" is three words; charging one let a digest that accounted for 24 words say 35 |
+| Agents waiting are capped like agents running | Two are named, the rest counted. It was the one clause here with no cap, and it is the loud one |
+| Never fewer than one, and never half a summary | A summary is one or two sentences that mean something together; half of one is worse than a count |
+| What is left out is recoverable | "What's quantcoach doing?" reads the summary back, so counting loses nothing |
+| An ordinal counts only along the names actually said | "The fifth one" must not reach a session the wearer was never told about |
+| Who is waiting, then who is running | Only on a real digest: tacked onto every single finish it would be the noise Earshot exists to prevent |
 
 ---
 
@@ -281,6 +317,108 @@ When routing a command, the system resolves the target project in this order:
 
 ---
 
+## Eyes-free verbs (Earshot, headset clients)
+
+With the display dormant the wearer cannot point, so the headset takes a small set of
+verbs, each after the wake phrase like any command:
+
+| Say | Hear |
+|---|---|
+| "who's waiting?" | "Two are waiting: android and quantcoach." Oldest question first |
+| "next" | The front question, read whole: a permission as "android needs you: Bash command: npm test. Approve or deny?", a choice with its options numbered as the card numbers them. Said again, the one after it — and the card moves with it, so "approve" answers what was just read |
+| "what's everyone doing?", "status" | A clause each, up to four agents. Past that, who needs you by name and the rest counted |
+| "what's android doing?" | "android has been running tests for 3 minutes." |
+| "read me the last three lines of android" | The pane's last lines — at most the eight the bridge keeps — without box-drawing, bullets or spinner frames |
+| "mute android", "unmute it" | Its words go, not its news: a finish or a failure is a chime, a question is its motif then the knock. The Rail marks it "muted" |
+| "switch to android" | Into focus. "Switch to war room" is the Deck's, "switch to dark" the theme's |
+| "tell the stuck one to …", "ask it why …" | Sent in the wearer's own words, and "Sending to quantcoach." |
+| "say that again" | The last thing said, from where it was said, with its lead-in |
+
+**Who "it" is.** The session the wearer last named or acted on, then the one last heard,
+then the one in focus — the first two only for a minute. "The second one" counts along
+the last list heard (for five minutes), else the Rail. "The stuck one" is the one whose
+last turn failed. Two candidates is a question back — "Which one? android or voxherd?" —
+never a guess, and "everyone" is "One at a time." A message said with nothing in focus
+goes to whoever just spoke, and says so. "Kill it" and "stop" still mean the session in
+focus, an action on what is in front of you, and the kill card is said out loud.
+
+**Answers are not narration.** They skip the floor the wearer is holding and the silence
+budget, and when one ends the floor is the wearer's for four seconds, so a report does not
+start talking over their reply. They are spoken only while the headset holds the speech
+floor; otherwise they appear on screen. An error about what the wearer just sent is said
+too: with the display dormant, a refusal nobody hears was never given.
+
+A verb that names something the headset does not know is not a verb: "tell the user to
+wait" and "read me the last line of the log" are instructions, and reach an agent.
+
+---
+
+## Touchpad (audio glasses)
+
+The temple pad is the only input that is not a voice on a pair of audio glasses, so it
+gets four gestures and no more — a vocabulary that grows collides with the platform's own
+reserved set.
+
+| Gesture | Does |
+|---|---|
+| Tap | Reads the front question, or the next report — the same as saying "next" |
+| Double tap | "Say that again" |
+| Swipe forward / back | The next or previous agent in the herd's order, wrapping. With nothing in focus, either way lands on the first |
+| Hold | Push-to-talk: the microphone is open only while the pad is held |
+
+**A tap never answers a question.** An acknowledging tap would be a way to approve an
+agent's permission request by brushing your own glasses. The rule is the same one that
+keeps a voice from answering without the wake phrase — nobody nearby should be able to
+approve a tool by saying "yes" — and a pad is easier to brush than a word is to say.
+
+**Each gesture becomes the verb the wearer could have said**, so routing has one path:
+there is no second answer to "which session did that mean".
+
+**A gesture with nowhere to go says so** — "No agents yet", "android is the only one".
+Silence is what a broken pad looks like, and there is no screen to say otherwise.
+
+---
+
+## Reader verbs (display clients)
+
+Tried **before** anything else while the Reader shows a file, because that is what the
+wearer is looking at. Only a few are heard at all in Review and
+Follow mode, where they mean the review's changes instead.
+
+| Say | Does |
+|---|---|
+| "open week dot ts", "read week.ts in android" | Opens it. Only something that *names* a file — an extension, a path, or the word "file" — so "open the settings and add a flag" still reaches the agent |
+| "pin this", "unpin", "let go" | Pins what the hand is over, or lets go. A pin goes with whatever is said next |
+| "next function", "previous method" | The next or previous definition, pinned and scrolled to |
+| "go to weekdays" | A definition by name. Only a name the file has: "go to the airport" is still a message |
+| "next page", "previous page", "page down" | A page of 4,000 lines, flush — no line is read twice at the seam |
+| "top of the file", "end of the file" | The top or the bottom. On a file that fits in one page — almost every file — they scroll within it rather than answering "that's the top" at someone looking at line 200 |
+| "go to line 240", "line 1500" | That line, paging to it when it is past the page on screen. A line is not a region, so it carries nothing: what is said next is not about line 240 merely because the wearer looked at it |
+| "what changed in android", "show me the diff" | Review mode. Then "next change", "keep this", "undo this", "refresh" |
+| "follow android", "what's android editing?" | Follow mode. Then "catch up", "stop following" |
+| "close the file", "done reading" | Puts it away |
+
+**Deliberately spelled out.** A bare "top", "end", "more" or "keep going" is far likelier
+to be a message for the agent — "keep going" especially — and these verbs are matched
+first, so a loose set would swallow it.
+
+**Whether there is anywhere to go is answered, not ignored**: "next page" on the last page
+says *"That's the end of the file."* A verb that silently did nothing is indistinguishable
+from one that was never heard.
+
+**Keyboard (Bluetooth, headset clients).** Shift + the navigation keys, while a file is open:
+Shift+PageUp/PageDown a page, Shift+Home/End the ends, Shift+↑/↓ the previous and next
+definition. Movement only — Enter, Space and Escape stay the terminal's, because each is a
+keystroke the wearer meant for the prompt. Nothing unshifted is ever claimed: the Reader
+sits *beside* the terminal, not over it.
+
+A pane cannot tell Shift+PageDown from PageDown — it receives `NPage` either way — so no
+terminal capability is lost, but a wearer who habitually holds Shift will find that key
+going to the Reader and must let go. A held key is consumed on every repeat and acted on
+once: acting on each would fire a 4,000-line request per repeat event.
+
+---
+
 ## Audio Session Management
 
 Audio routing depends on the device and connectivity.
@@ -367,7 +505,7 @@ Users can customize voice UX via settings:
 | Setting | Values | Default | Effect |
 |---|---|---|---|
 | TTS Voice | System voices (Siri, Alex, etc.) | Siri | Which voice reads announcements |
-| Wake Word | "Hey Claude" enable/disable | Disabled | If enabled, glasses/phone listens continuously for "Hey Claude" |
+| Wake Word | "Hey agent" enable/disable | Disabled | If enabled, glasses/phone listens continuously for "Hey agent" ("Hey Claude" also works) |
 | Earcon Volume | System sound volume | Device volume | Earcons respect system volume setting |
 | Earcon Enabled | True/False | True | Toggle all earcons on/off |
 | Bridge URL | LAN mDNS, Tailscale IP, Cloudflare | http://macbook.local:7777 | Bridge server address |

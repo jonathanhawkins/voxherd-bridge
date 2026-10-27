@@ -15,7 +15,7 @@ import time
 
 from bridge.env_utils import get_subprocess_env
 from bridge import tmux_manager
-from bridge import sub_agent_monitor
+from bridge import focus, sub_agent_monitor
 # session_status and choice_detector both import _has_idle_prompt /
 # _is_status_bar_line from THIS module, so eager top-level imports
 # would create a circular ImportError at boot. We import them lazily
@@ -100,6 +100,36 @@ def _question_form_msg(session, form) -> dict:
             for r in form.rows
             if r.kind != "meta"
         ],
+    }
+
+
+def _choice_prompt_msg(session, choice) -> dict:
+    """Build the ``choice_prompt`` WS payload for a detected choice.
+
+    One builder for the rising-edge broadcast and the connect replay in
+    ``ws_handler``: they were two literal dicts, and a field added to one
+    and not the other is exactly the version skew a reconnecting client
+    would see and nobody else would.
+
+    ``kind`` is ``"permission"`` for Claude Code's tool-permission dialog
+    (option 0 is "Yes", and one option is "No") and ``"choice"`` for every
+    other widget. Older clients ignore it and still get a working card.
+    """
+    return {
+        "type": "choice_prompt",
+        "session_id": session.session_id,
+        "project": session.project,
+        "title": choice.title,
+        "options": choice.options,
+        "signature": choice.signature,
+        # Covers the body too, so it identifies the prompt the user is reading
+        # rather than its boilerplate shell. A client may echo it back on
+        # commit; the bridge checks the same thing server-side regardless, so an
+        # older client that only knows `signature` is equally protected.
+        "commit_key": choice.commit_key,
+        "input_mode": choice.input_mode,
+        "body": choice.body,
+        "kind": choice.kind,
     }
 
 
@@ -272,6 +302,83 @@ _IDLE_TIMEOUT_SECONDS = 12.0  # mark active→idle after this many seconds with 
 # SubagentStart→task-file write race and brief gaps between sequential agents.
 _SUBAGENT_STRANDED_THRESHOLD = 3
 _SUBAGENT_STRANDED_MISS: dict[str, int] = {}
+
+
+def session_books() -> tuple[dict, ...]:
+    """Every dict in the bridge keyed by a BARE session id.
+
+    THE list, not a copy of it. ``_forget_session_state`` iterates this, and the
+    tests import it rather than restating it -- so a new per-session dict added
+    here is both forgotten and covered, and one added elsewhere is caught.
+
+    That mattered: the previous shape inlined the tuple in
+    ``_forget_session_state`` and the test hand-copied the same nine names, so
+    the "one place to register a new dict" property the function exists for was
+    asserted nowhere.
+
+    ``_dispatch_timestamps`` lives in ``server_state``, hence the local import:
+    importing it at module scope would close the activity -> server_state ->
+    activity cycle.
+
+    Deliberately NOT here: ``focus._LOCATED``, which is keyed
+    ``"<assistant>:<session_id>"`` -- a bare ``pop(sid)`` would never match it,
+    so listing it would read as covered while doing nothing. It holds one path
+    string and a timestamp per dead session and ``focus.py`` clears it on its
+    own; if that ever matters it needs a prefix sweep, not a pop.
+    """
+    from bridge.server_state import _dispatch_timestamps
+
+    return (
+        _STICKY_ACTIVITY,
+        _LAST_REAL_ACTIVITY,
+        _LAST_CHOICE_FOR_SESSION,
+        _CHOICE_MISS_COUNT,
+        _LAST_FORM_FOR_SESSION,
+        _FORM_MISS_COUNT,
+        _SUBAGENT_STRANDED_MISS,
+        _CHOICE_PARSE_FAIL,
+        _dispatch_timestamps,
+    )
+
+
+def _forget_session_state(sid: str) -> None:
+    """Drop every per-session entry this module and its neighbours keep.
+
+    One function rather than the same list of pops repeated at each teardown
+    site. There were four copies, all of them missing ``_dispatch_timestamps``
+    (written on every voice dispatch in ws_handler and popped nowhere, so it grew
+    for the life of the process).
+
+    Called from ``SessionManager._drop``, which is the single point every
+    session removal passes through -- see the note there for why that is not
+    each caller's job.
+    """
+    for book in session_books():
+        book.pop(sid, None)
+
+
+def _body_is_same_content(prev: list[str], current: list[str]) -> bool:
+    """True when *current* is more or less of the same body as *prev*.
+
+    Distinguishes the two things that make a prompt's body change:
+
+    - the capture window moved or the text streamed in, so one list is a
+      contiguous tail of the other -- the same prompt, seen differently;
+    - the dialog was replaced by another one, so the content simply differs.
+
+    Only the first may keep the cached body and avoid re-broadcasting. Treating
+    them alike is what let a permission card keep displaying the command the
+    user read while a different command was live underneath it.
+
+    An empty capture is not evidence of either, so it counts as a change: the
+    rising-edge path will re-enrich from a deeper capture, which self-corrects.
+    """
+    if not prev or not current:
+        return prev == current
+    shorter, longer = (current, prev) if len(current) <= len(prev) else (prev, current)
+    # A tail match covers a scrolled window; a head match covers a body that is
+    # still being written out below what is already on screen.
+    return longer[-len(shorter):] == shorter or longer[:len(shorter)] == shorter
 
 
 def _detect_activity_type(text: str) -> str | None:
@@ -465,6 +572,12 @@ _STATUS_BAR_RE = re.compile(
     r"auto-compact|"                 # context line: "Context left until auto-compact: 9%"
     r"\d+%\s*context\s*(?:used|left|remaining)|"  # warning row: "42% context used"
     r"shift\+tab to cycle|"          # hint line
+    # Claude Code 2.1's permission-mode footer: "⏸ manual mode on · ? for
+    # shortcuts · ← 1 agent". Anchored, so "turned dark mode on" is still words.
+    r"^\W*(?:manual|plan) mode on\b|"
+    r"^\W*accept edits on\b|"
+    r"\? for shortcuts\b|"
+    r"Claude Code v\d|"              # welcome banner: "▐▛███▛█   Claude Code v2.1.283"
     r"ctrl-g to edit in|"            # plan-mode editor hint: "ctrl-g to edit in Vim · ~/.claude/plans/..."
     r"Opus \d|Sonnet \d|Haiku \d|"   # Claude model info: "Opus 4.6 $113.77 ..."
     r"^\$\d+\.\d+\s|"               # cost at start of line
@@ -690,13 +803,6 @@ async def _activity_poll_loop() -> None:
                         # 3 consecutive failures — pane is truly gone, deregister
                         sid, proj = session.session_id, session.project
                         sessions.remove_session(sid)
-                        _STICKY_ACTIVITY.pop(sid, None)
-                        _LAST_REAL_ACTIVITY.pop(sid, None)
-                        _LAST_CHOICE_FOR_SESSION.pop(sid, None)
-                        _CHOICE_MISS_COUNT.pop(sid, None)
-                        _LAST_FORM_FOR_SESSION.pop(sid, None)
-                        _FORM_MISS_COUNT.pop(sid, None)
-                        _SUBAGENT_STRANDED_MISS.pop(sid, None)
                         await _cancel_terminal_subs_for_session(sid, project=proj)
                         log_event("warning", proj, f"Pane gone — deregistered ({sid[:12]}...)")
                         await broadcast_to_ios({
@@ -735,13 +841,6 @@ async def _activity_poll_loop() -> None:
                         # Immediately deregister so it disappears from the visualization.
                         sid, proj = session.session_id, session.project
                         sessions.remove_session(sid)
-                        _STICKY_ACTIVITY.pop(sid, None)
-                        _LAST_REAL_ACTIVITY.pop(sid, None)
-                        _LAST_CHOICE_FOR_SESSION.pop(sid, None)
-                        _CHOICE_MISS_COUNT.pop(sid, None)
-                        _LAST_FORM_FOR_SESSION.pop(sid, None)
-                        _FORM_MISS_COUNT.pop(sid, None)
-                        _SUBAGENT_STRANDED_MISS.pop(sid, None)
                         await _cancel_terminal_subs_for_session(sid, project=proj)
                         log_event("info", proj, f"{session.assistant.title()} exited — deregistered ({sid[:12]}...)")
                         await broadcast_to_ios({
@@ -956,6 +1055,16 @@ async def _activity_poll_loop() -> None:
                             **derived,
                         })
 
+                    # --- Follow mode: the file the agent is editing ---
+                    # One fstat while the transcript has not grown; each new
+                    # edit is announced once. See bridge/focus.py.
+                    if focus.followable(session.assistant):
+                        focus_msg = focus.changed(
+                            session, await asyncio.to_thread(focus.payload, session)
+                        )
+                        if focus_msg:
+                            await broadcast_to_ios(focus_msg)
+
                     # Multi-question AskUserQuestion form detection runs
                     # FIRST and takes precedence over the single-choice
                     # path. When a form is on screen (or within its cancel
@@ -987,9 +1096,32 @@ async def _activity_poll_loop() -> None:
                         # Reset miss + parse-fail trackers on any detect.
                         _CHOICE_MISS_COUNT.pop(session.session_id, None)
                         _CHOICE_PARSE_FAIL.pop(session.session_id, None)
+                        # A prompt is "new" when its title/options differ, OR
+                        # when the body is different CONTENT rather than more or
+                        # less of the same content.
+                        #
+                        # The signature alone was not enough: it covers only the
+                        # title and the option labels, which are identical
+                        # boilerplate across Claude Code's permission dialogs, so
+                        # a prompt for a DIFFERENT command did not read as new --
+                        # no fresh card, no cancellation, and the body below was
+                        # carried forward, which left the lens showing command A
+                        # while command B was live.
+                        #
+                        # But keying purely on the body is also wrong: a plan
+                        # streams in a line at a time, and re-broadcasting (plus
+                        # a deep capture) on every tick is exactly the churn the
+                        # signature was chosen to avoid. `_body_is_same_content`
+                        # draws the line between the two cases.
+                        body_continues = (
+                            prev_choice is not None
+                            and prev_choice.signature == choice.signature
+                            and _body_is_same_content(prev_choice.body, choice.body)
+                        )
                         is_new_prompt = (
                             prev_choice is None
                             or choice.signature != prev_choice.signature
+                            or not body_continues
                         )
                         # Carry the deep-captured body forward across non-edge
                         # re-detects. Each tick re-detects with only the shallow
@@ -998,11 +1130,17 @@ async def _activity_poll_loop() -> None:
                         # replay (ws_handler) reads `body` from THIS cache, so a
                         # client connecting after the first tick would otherwise
                         # replay a truncated plan.
-                        if (
-                            prev_choice is not None
-                            and prev_choice.signature == choice.signature
-                            and len(prev_choice.body) > len(choice.body)
-                        ):
+                        #
+                        # `commit_key` is deliberately NOT recomputed here. It is
+                        # fixed at detection, from the body the DETECTOR saw at
+                        # the shallow depth, and `_commit_matches_shown` compares
+                        # it against a commit-time re-detect at that same depth.
+                        # Rekeying it off the deep body made the two sides
+                        # describe different capture windows, so after the first
+                        # tick no commit could ever match and every approval —
+                        # tapped or spoken — was refused for any prompt whose
+                        # body was taller than the shallow window.
+                        if body_continues and len(prev_choice.body) > len(choice.body):
                             choice.body = prev_choice.body
                         _LAST_CHOICE_FOR_SESSION[session.session_id] = choice
                         if is_new_prompt:
@@ -1019,16 +1157,7 @@ async def _activity_poll_loop() -> None:
                                 f"Choice prompt detected — {len(choice.options)} "
                                 f"options ({choice.input_mode})"
                             )
-                            await broadcast_to_ios({
-                                "type": "choice_prompt",
-                                "session_id": session.session_id,
-                                "project": session.project,
-                                "title": choice.title,
-                                "options": choice.options,
-                                "signature": choice.signature,
-                                "input_mode": choice.input_mode,
-                                "body": choice.body,
-                            })
+                            await broadcast_to_ios(_choice_prompt_msg(session, choice))
                     elif prev_choice is not None:
                         # No choice detected this tick AND we previously
                         # emitted one. Increment the miss counter —
@@ -1077,6 +1206,20 @@ async def _activity_poll_loop() -> None:
                     raise  # let outer handler exit cleanly
                 except Exception:
                     pass
+
+            # Stall narration (VERBOSE only) is checked here, after every
+            # tick, rather than on a timer of its own: this loop is what
+            # reports a session's progress (on_activity_change above), so a
+            # check that kept running while the loop was stuck on a slow tmux
+            # call would call every working session stalled. The check is an
+            # in-memory pass over the sessions, cheap enough for every tick.
+            if _state.narration:
+                try:
+                    await _state.narration.check_stalls()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    log_event("error", "bridge", f"Stall check failed: {type(e).__name__}: {e}")
 
             # Periodically rediscover tmux sessions (~every 30s).
             # Catches sessions that started after the bridge, or that were missed
@@ -1194,18 +1337,9 @@ async def _periodic_prune() -> None:
         if removed:
             log_event("warning", "bridge", f"Pruned {len(removed)} dead session(s)")
             for sid, project in removed:
-                # ``prune_dead`` already removed the Session from the
-                # manager, but module-level per-session caches still
-                # carry the stale key. Pop them here so we don't leak
-                # entries — same cleanup pattern as the exit/pane-gone
-                # paths above in `_activity_poll_loop`.
-                _STICKY_ACTIVITY.pop(sid, None)
-                _LAST_REAL_ACTIVITY.pop(sid, None)
-                _LAST_CHOICE_FOR_SESSION.pop(sid, None)
-                _CHOICE_MISS_COUNT.pop(sid, None)
-                _LAST_FORM_FOR_SESSION.pop(sid, None)
-                _FORM_MISS_COUNT.pop(sid, None)
-                _SUBAGENT_STRANDED_MISS.pop(sid, None)
+                # ``prune_dead`` forgets the per-session books itself, so there
+                # is nothing to pop here. Terminal subscriptions are not keyed
+                # in those books -- they own tasks that have to be cancelled.
                 await _cancel_terminal_subs_for_session(sid, project=project)
                 await broadcast_to_ios({
                     "type": "session_removed",
@@ -1227,13 +1361,6 @@ async def _periodic_prune() -> None:
 
         for sid, project in exited:
             sessions.remove_session(sid)
-            _STICKY_ACTIVITY.pop(sid, None)
-            _LAST_REAL_ACTIVITY.pop(sid, None)
-            _LAST_CHOICE_FOR_SESSION.pop(sid, None)
-            _CHOICE_MISS_COUNT.pop(sid, None)
-            _LAST_FORM_FOR_SESSION.pop(sid, None)
-            _FORM_MISS_COUNT.pop(sid, None)
-            _SUBAGENT_STRANDED_MISS.pop(sid, None)
             await _cancel_terminal_subs_for_session(sid, project=project)
             log_event("warning", "bridge", f"Deregistered exited session: {project} ({sid[:12]}...)")
             await broadcast_to_ios({
@@ -1324,6 +1451,12 @@ async def _discover_tmux_sessions() -> int:
                 tmux_target=tmux_target,
                 assistant=assistant,
             )
+            if session is None:
+                # The pane's cwd is not a directory the Reader may be rooted at
+                # (outside $HOME, a credential dir, $HOME itself). Skip the pane
+                # rather than registering a session whose root is refused
+                # everywhere else — register_session already logged why.
+                continue
             # Mark as active since an assistant process is running.
             sessions.update_status(temp_id, "active", activity_type="working")
         except Exception as e:

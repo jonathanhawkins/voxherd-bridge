@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		03DD796E9172EF5CD198BAB7 /* PowerManagement.swift in Sources */ = {isa = PBXBuildFile; fileRef = F02923023440D1969CAA41B5 /* PowerManagement.swift */; };
+		0E038250DA59CA34C00575C6 /* PrerequisitesTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 75C2FE24B51614A1C874FB0D /* PrerequisitesTests.swift */; };
 		11E2F97F4BA10E3B6970A52F /* NetworkInfo.swift in Sources */ = {isa = PBXBuildFile; fileRef = 68DADADA5C858D1984A7C8A1 /* NetworkInfo.swift */; };
 		196184F8F04F2C1A78075534 /* VoxHerdBridgeApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9968D8FE85F14E49FEC74864 /* VoxHerdBridgeApp.swift */; };
 		2890E0A5FCC0A75FE4FE7B7B /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B238C677328FFD3F9D6EE46A /* Assets.xcassets */; };
@@ -16,6 +17,8 @@
 		6D703B613C78E936070803C8 /* BridgeProcessManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00C10905CFA2B995F881C37 /* BridgeProcessManager.swift */; };
 		6F8B1BB97826A9A5D1B85618 /* OnboardingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3314EE4DC4A11A8512B8A39C /* OnboardingView.swift */; };
 		781F657AC1A03714579A742F /* HookInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 04E4BBB8EE432587CC8731DF /* HookInstaller.swift */; };
+		7884A682354872CAD6B998B6 /* PairingPromptTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B8651399EAF1474E8F722FB9 /* PairingPromptTests.swift */; };
+		7CDC87E34E24B21615AC81D5 /* Prerequisites.swift in Sources */ = {isa = PBXBuildFile; fileRef = F371EE315D331B90F5C0CA0F /* Prerequisites.swift */; };
 		8DE871AAE1B21993004E63C0 /* StatusBarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CC3AFBA53741B8E0A6D7829 /* StatusBarView.swift */; };
 		924A9CF1DB89ED25DCBEF012 /* WalkAroundController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 697470DB4A87E9B0B0F282CC /* WalkAroundController.swift */; };
 		ABFB8257B5E31178AD77395C /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A2F4AC295FF4C2DF5B34A97 /* SettingsView.swift */; };
@@ -44,15 +47,18 @@
 		68DADADA5C858D1984A7C8A1 /* NetworkInfo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkInfo.swift; sourceTree = "<group>"; };
 		697470DB4A87E9B0B0F282CC /* WalkAroundController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalkAroundController.swift; sourceTree = "<group>"; };
 		69EDA489DBA75DCDBFFA7611 /* LogView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogView.swift; sourceTree = "<group>"; };
+		75C2FE24B51614A1C874FB0D /* PrerequisitesTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrerequisitesTests.swift; sourceTree = "<group>"; };
 		7CC3AFBA53741B8E0A6D7829 /* StatusBarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusBarView.swift; sourceTree = "<group>"; };
 		9968D8FE85F14E49FEC74864 /* VoxHerdBridgeApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoxHerdBridgeApp.swift; sourceTree = "<group>"; };
 		A0B8813F3C9C498A6F790693 /* VoxHerdBridge.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = VoxHerdBridge.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		AC74DB2A71239D8C0FA3728F /* Preferences.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Preferences.swift; sourceTree = "<group>"; };
 		B238C677328FFD3F9D6EE46A /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		B8651399EAF1474E8F722FB9 /* PairingPromptTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingPromptTests.swift; sourceTree = "<group>"; };
 		C10B10B26B82C819602C6C3E /* PowerManagementTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PowerManagementTests.swift; sourceTree = "<group>"; };
 		D61C35261E18403BAEF71F0A /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
 		F00C10905CFA2B995F881C37 /* BridgeProcessManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeProcessManager.swift; sourceTree = "<group>"; };
 		F02923023440D1969CAA41B5 /* PowerManagement.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PowerManagement.swift; sourceTree = "<group>"; };
+		F371EE315D331B90F5C0CA0F /* Prerequisites.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Prerequisites.swift; sourceTree = "<group>"; };
 		F75D5541D7F990E5BE9DA197 /* QRCodeGenerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QRCodeGenerator.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -78,7 +84,9 @@
 		695FDD0C00101210580247DE /* Tests */ = {
 			isa = PBXGroup;
 			children = (
+				B8651399EAF1474E8F722FB9 /* PairingPromptTests.swift */,
 				C10B10B26B82C819602C6C3E /* PowerManagementTests.swift */,
+				75C2FE24B51614A1C874FB0D /* PrerequisitesTests.swift */,
 				49BAA32B44504C296E374381 /* SessionSortTests.swift */,
 			);
 			path = Tests;
@@ -96,6 +104,7 @@
 				3314EE4DC4A11A8512B8A39C /* OnboardingView.swift */,
 				F02923023440D1969CAA41B5 /* PowerManagement.swift */,
 				AC74DB2A71239D8C0FA3728F /* Preferences.swift */,
+				F371EE315D331B90F5C0CA0F /* Prerequisites.swift */,
 				F75D5541D7F990E5BE9DA197 /* QRCodeGenerator.swift */,
 				4A2F4AC295FF4C2DF5B34A97 /* SettingsView.swift */,
 				7CC3AFBA53741B8E0A6D7829 /* StatusBarView.swift */,
@@ -205,6 +214,7 @@
 				6F8B1BB97826A9A5D1B85618 /* OnboardingView.swift in Sources */,
 				03DD796E9172EF5CD198BAB7 /* PowerManagement.swift in Sources */,
 				C35C848F851AB460492D2B56 /* Preferences.swift in Sources */,
+				7CDC87E34E24B21615AC81D5 /* Prerequisites.swift in Sources */,
 				EB01F929F10E7D488DEC8870 /* QRCodeGenerator.swift in Sources */,
 				ABFB8257B5E31178AD77395C /* SettingsView.swift in Sources */,
 				8DE871AAE1B21993004E63C0 /* StatusBarView.swift in Sources */,
@@ -217,7 +227,9 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				7884A682354872CAD6B998B6 /* PairingPromptTests.swift in Sources */,
 				EAC47CD264BF329F44EE62C3 /* PowerManagementTests.swift in Sources */,
+				0E038250DA59CA34C00575C6 /* PrerequisitesTests.swift in Sources */,
 				BC42E5EDADF5FB97D9E38854 /* SessionSortTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -291,6 +303,7 @@
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				INFOPLIST_KEY_LSUIElement = YES;
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "VoxHerd needs microphone access for voice commands and speech-to-text.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "VoxHerd transcribes your spoken commands so it can route them to the right coding agent.";
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = "0.1.0-dev";
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
@@ -356,6 +369,7 @@
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				INFOPLIST_KEY_LSUIElement = YES;
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "VoxHerd needs microphone access for voice commands and speech-to-text.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "VoxHerd transcribes your spoken commands so it can route them to the right coding agent.";
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = "0.1.0-dev";
 				MTL_ENABLE_DEBUG_INFO = NO;

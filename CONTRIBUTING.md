@@ -22,7 +22,7 @@ docs/            API reference, PRD, voice UX docs
 
 ```bash
 cd bridge
-python3 -m venv .venv
+python3.11 -m venv .venv    # 3.11+ required; do not use bare `python3`
 source .venv/bin/activate    # Linux/macOS
 # .venv\Scripts\activate     # Windows
 pip install -r requirements.txt

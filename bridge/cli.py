@@ -28,6 +28,8 @@ from rich.panel import Panel
 from rich.text import Text
 
 from bridge import bridge_server
+from bridge import pairing
+from bridge import server_state
 from bridge.bridge_server import app
 from bridge.tailscale import detect_tailscale
 
@@ -214,7 +216,7 @@ def print_banner(
     else:
         listen_line = "STT [dim]off[/dim] (use --listen to enable)"
     if wake_word:
-        wake_line = "Wake word [green]ON[/green] -- say [bold]'Hey Claude'[/bold] to activate"
+        wake_line = "Wake word [green]ON[/green] -- say [bold]'Hey agent'[/bold] to activate"
     else:
         wake_line = "Wake word [dim]off[/dim] (use --wake-word to enable)"
 
@@ -263,7 +265,7 @@ def _add_bridge_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--listen", action="store_true", help="Enable Mac STT (listen after TTS; macOS only)")
     parser.add_argument("--no-listen-after", action="store_true", help="Disable auto-listen after TTS (use with --listen to keep wake word only)")
     parser.add_argument("--listen-timeout", type=int, default=8, help="STT silence timeout in seconds (default: 8)")
-    parser.add_argument("--wake-word", action="store_true", help="Enable 'Hey Claude' wake word detection (macOS only; always-on mic)")
+    parser.add_argument("--wake-word", action="store_true", help="Enable 'Hey agent' wake word detection (macOS only; always-on mic)")
     parser.add_argument("--headless", action="store_true", help="Disable Rich display; emit JSON lines to stdout instead")
     parser.add_argument("--openai-tts", action="store_true", help="Use OpenAI TTS (gpt-4o-mini-tts, Nova voice) instead of platform TTS; requires OPENAI_API_KEY")
     parser.add_argument("--tls", action="store_true", help="Enable TLS (self-signed cert; serves wss:// and https://)")
@@ -274,13 +276,34 @@ def _add_bridge_args(parser: argparse.ArgumentParser) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _apply_runtime_flags(args: argparse.Namespace) -> None:
+    """Publish the CLI's flags where the server actually reads them.
+
+    These must land on ``bridge.server_state`` itself, **not** on
+    ``bridge_server``. ``bridge_server`` does ``from bridge.server_state import
+    wake_word_enabled``, which binds a *copy* of the bool, so assigning
+    ``bridge_server.wake_word_enabled`` rebinds only that copy while
+    ``_init_voice_loop`` reads ``_state.wake_word_enabled`` and goes on seeing
+    the default. ``--wake-word`` was therefore accepted, printed as "on", and
+    never started the listener.
+
+    ``mac_stt`` is an *object*, so the import shares the instance and mutating
+    an attribute carries — which is why listen-after-TTS worked throughout and
+    made the wake word look like a microphone problem rather than a binding one.
+    """
+    server_state.server_port = args.port
+    server_state.mac_stt.enabled = args.listen
+    server_state.mac_stt.timeout = args.listen_timeout
+    server_state.wake_word_enabled = args.wake_word
+    server_state.listen_after_enabled = args.listen and not args.no_listen_after
+
+
 def _run_bridge_directly(args: argparse.Namespace) -> None:
     """Run the bridge server directly in the current process.
 
     This is the internal command used when the bridge is started inside
     a tmux session. Users should prefer 'start' which manages tmux.
     """
-    bridge_server.server_port = args.port
     _is_mac = sys.platform == "darwin"
 
     # Configure TTS (macOS 'say', Linux 'espeak-ng', or OpenAI).
@@ -318,10 +341,7 @@ def _run_bridge_directly(args: argparse.Namespace) -> None:
     if args.listen and not _is_mac:
         console.print("[yellow]Warning: --listen requires macOS (Swift STT binary). Ignoring on this platform.[/yellow]")
         args.listen = False
-    bridge_server.mac_stt.enabled = args.listen
-    bridge_server.mac_stt.timeout = args.listen_timeout
-    bridge_server.wake_word_enabled = args.wake_word
-    bridge_server.listen_after_enabled = args.listen and not args.no_listen_after
+    _apply_runtime_flags(args)
 
     headless = getattr(args, "headless", False)
     use_tls = getattr(args, "tls", False)
@@ -347,6 +367,16 @@ def _run_bridge_directly(args: argparse.Namespace) -> None:
             sys.stdout.flush()
 
         bridge_server._state.set_log_handler(_json_log_event)
+
+        # A pending pairing request on the same pipe, under its own key so the
+        # host app can tell it from a log line and from the ready signal. Only
+        # headless gets this: a bridge running in a terminal prints the code
+        # where the user is already looking, and there is no app to show a card.
+        def _json_pairing_event(event: dict) -> None:
+            sys.stdout.write(json.dumps({"pairing": event}) + "\n")
+            sys.stdout.flush()
+
+        pairing.set_watcher(_json_pairing_event)
 
         def _handle_sigint(sig: int, frame: object) -> None:
             sys.exit(0)

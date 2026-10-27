@@ -44,6 +44,20 @@ def _proc(returncode: int, stderr: bytes = b""):
 
 
 @pytest.fixture(autouse=True)
+def _no_decision_on_screen():
+    """Pin the pre-send pane check to "nothing on screen".
+
+    ``_dispatch_agent`` captures the pane before typing (see
+    ``test_dispatch_decision_guard.py``). That capture is a subprocess too,
+    so without this it would consume the first mocked process and the
+    ordered ``[ok, dead]`` sequence below would test the wrong send-keys.
+    """
+    with patch.object(ws_handler, "_decision_on_screen",
+                      new=AsyncMock(return_value=(None, None))):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_registry():
     """Keep the global session registry clean and avoid disk writes."""
     saved = sessions._sessions.copy()

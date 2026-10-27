@@ -11,8 +11,10 @@ import asyncio
 import hashlib
 import hmac
 import json
+import os
 import sys
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -61,7 +63,65 @@ _ios_lock = asyncio.Lock()  # guards ios_connections during broadcast/add/remove
 server_port: int = 7777
 
 # Terminal subscriptions: maps session_id -> dict of {websocket: asyncio.Task}
-_terminal_subs: dict[str, dict[WebSocket, asyncio.Task]] = {}
+@dataclass
+class TerminalSub:
+    """A live terminal subscription: the poll task and the mode it runs in.
+
+    ``mode`` is kept alongside the task so a re-subscribe can tell a genuine
+    duplicate (no-op, keeps the in-flight snapshot) from a mode switch, which
+    has to restart the loop. Clients on one session may hold different modes:
+    a headset reads ``ansi`` while the phone reads ``filtered`` off the same pane.
+    """
+
+    task: asyncio.Task
+    mode: str = "filtered"
+
+
+@dataclass
+class GeometryLease:
+    """One client's claim on a tmux window's dimensions.
+
+    Only ``ansi`` subscribers take a lease, and only one client holds it per
+    session at a time -- the headset sizes the pane to its panel so the TUI
+    reflows, while the phone and the lens render whatever size they are given
+    and never resize anything.
+
+    The ``prev_*`` fields are what release puts back. ``prev_window_size`` is
+    the raw ``window-size`` window option, which is ``""`` when the window was
+    inheriting the global value: tmux's ``resize-window`` silently sets that
+    option to ``manual`` as a side effect, so restoring the dimensions without
+    also restoring the option would leave the pane pinned and no longer
+    tracking the terminal the user actually has open.
+    """
+
+    ws: WebSocket
+    cols: int
+    rows: int
+    prev_cols: int
+    prev_rows: int
+    prev_window_size: str
+    # When this lease was taken. Handover between clients is gated on age:
+    # see _acquire_geometry for why liveness cannot be asked directly.
+    acquired_at: float = 0.0
+
+
+_terminal_subs: dict[str, dict[WebSocket, TerminalSub]] = {}
+# session_id -> the single live geometry lease for that session.
+_terminal_geometry: dict[str, GeometryLease] = {}
+
+# Set by ws_handler at import time. Called when subscriptions are torn down
+# from inside this module, so a lease never outlives the subscription that
+# took it -- the pruned-session path matters because the pane survives a
+# re-registration under a new session_id.
+_geometry_release_hook: Callable[[str, WebSocket], Awaitable[None]] | None = None
+
+
+def set_geometry_release_hook(
+    hook: Callable[[str, WebSocket], Awaitable[None]] | None,
+) -> None:
+    """Register the callback used to drop geometry leases on teardown."""
+    global _geometry_release_hook
+    _geometry_release_hook = hook
 _terminal_subs_lock = asyncio.Lock()  # guards _terminal_subs mutations
 
 # DEBUG: counts of inbound WS messages by outcome/type (exposed via
@@ -136,6 +196,8 @@ headless_port: int = 0
 _prune_task: asyncio.Task | None = None
 _activity_poll_task: asyncio.Task | None = None
 _bonjour_task: asyncio.Task | None = None
+#: The timer that re-announces Bonjour when this machine's address moves.
+_bonjour_refresh_task = None
 
 # Sticky activity state: tracks the last "specific" (non-thinking) activity
 # type per session so we don't flicker to thinking between tool calls.
@@ -233,7 +295,194 @@ def _state_sync_msg() -> dict:
         "last_announced_session_id": sessions.last_announced_session_id,
         "active_choice_sessions": active_choice_sessions,
         "active_form_sessions": active_form_sessions,
+        # Carried here, not only broadcast on change: a client that was away
+        # when the theme changed would otherwise come back on the wrong one
+        # and stay there. state_sync is the authority; the broadcast is just
+        # the fast path. Same reasoning as active_choice_sessions.
+        "client_settings": dict(client_settings),
+        # Same authority argument: a client that connects after the mic
+        # started has missed every voice_state broadcast, and would show
+        # a dead microphone while one is plainly listening.
+        "voice_state": dict(voice_state),
+        # Whether a headset holds the speech floor. A headset speaks only when
+        # this says it does, so one too old to know stays quiet rather than
+        # doubling every summary.
+        "speech_floor": speech_floor_state(),
     }
+
+
+
+# ---------------------------------------------------------------------------
+# Speech floor
+# ---------------------------------------------------------------------------
+
+# Narration is spoken on the Mac and broadcast to every client, and every phone
+# speaks it too. A headset speaking through Earshot takes the floor instead:
+# while it holds it, the Mac and the phones stay quiet and the headset says it.
+#
+# The floor is a lease. The headset renews it every 20 s; unrenewed, it lapses
+# and everyone else talks again. It is also released the moment its holder's
+# socket closes -- but a force-stopped client can leave a half-open socket that
+# never closes, so the lapse is what actually guarantees it. A floor held for a
+# headset that died would be silence that looks exactly like nothing happening.
+SPEECH_FLOOR_TTL_S = 60.0
+
+_speech_floor_until: float | None = None
+_speech_floor_holder: object | None = None
+
+
+def claim_speech_floor(claim: bool, holder: object | None = None, now: float | None = None) -> bool:
+    """Take or renew the floor for *holder*, or let it go.
+
+    Returns True when that changed whether it is held -- the only time other
+    clients need telling. A renewal changes nothing.
+    """
+    global _speech_floor_until, _speech_floor_holder
+    import time as _time
+    now = _time.monotonic() if now is None else now
+    was = speech_floor_held(now)
+    if claim:
+        _speech_floor_until = now + SPEECH_FLOOR_TTL_S
+        _speech_floor_holder = holder
+    else:
+        _speech_floor_until = None
+        _speech_floor_holder = None
+    return was != claim
+
+
+def release_speech_floor_of(holder: object) -> bool:
+    """Its holder went away: release at once. Returns True if it held the floor."""
+    if holder is None or _speech_floor_holder is not holder or not speech_floor_held():
+        return False
+    return claim_speech_floor(False)
+
+
+def speech_floor_held(now: float | None = None) -> bool:
+    """Whether a headset holds the floor, so narration is its to speak."""
+    import time as _time
+    now = _time.monotonic() if now is None else now
+    return _speech_floor_until is not None and now < _speech_floor_until
+
+
+def speech_floor_state(now: float | None = None) -> dict:
+    """The floor as ``state_sync`` carries it."""
+    import time as _time
+    now = _time.monotonic() if now is None else now
+    held = speech_floor_held(now)
+    return {
+        "held": held,
+        "expires_in": round(_speech_floor_until - now, 1) if held and _speech_floor_until else 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Microphone state
+# ---------------------------------------------------------------------------
+
+# What the microphone is doing, for clients that do not have one.
+#
+# The headset and the glasses have no microphone of their own -- it is the Mac's,
+# often across the room -- so from the headset there is no difference between
+# "nothing is listening", "listening and hearing nothing", and "heard you and
+# did not recognise it". All three shipped at once and every one of them looked
+# like silence, which is why they took a day to tell apart.
+#
+# ``heard`` deliberately carries the transcript even when it was *not* a wake
+# phrase. That is the diagnostic that matters: seeing your own words come back
+# proves the microphone, the permission and the recogniser all work, and moves
+# the question to the phrasing.
+voice_state: dict = {
+    "listening": False,
+    "heard": None,
+    "wake": False,
+    "at": None,
+}
+
+
+def set_voice_state(**fields) -> dict:
+    """Update the mic state and return the message to broadcast."""
+    import time as _time
+    voice_state.update(fields)
+    voice_state["at"] = _time.time()
+    return {"type": "voice_state", **voice_state}
+
+
+# ---------------------------------------------------------------------------
+# Client-directed settings
+# ---------------------------------------------------------------------------
+
+# Settings the bridge holds on behalf of its display clients, so that a voice
+# command reaches whichever glasses are listening rather than only the device
+# that heard it. Values are validated against ALLOWED_CLIENT_SETTINGS before
+# being stored -- these go out to every client, so an unbounded string here
+# would be an unbounded string there.
+_CLIENT_SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".voxherd", "client_settings.json")
+
+_CLIENT_SETTING_DEFAULTS: dict[str, str] = {"theme": "dark", "deck": "auto"}
+
+
+def _load_client_settings() -> dict[str, str]:
+    """Read the stored settings, falling back to defaults on anything odd.
+
+    **These have to survive a bridge restart.** They did not, and the failure
+    was invisible in the worst way: rebuilding the macOS bundle reset the theme
+    to dark, ``state_sync`` is authoritative so it pushed dark to the glasses,
+    and in daylight a dark panel on an additive display is an unreadable grey
+    rectangle. It looks exactly like the app has broken, and the user reported
+    it as such.
+
+    A malformed or unreadable file degrades to the defaults rather than
+    raising: the bridge must start.
+    """
+    settings = dict(_CLIENT_SETTING_DEFAULTS)
+    try:
+        with open(_CLIENT_SETTINGS_FILE, encoding="utf-8") as fh:
+            stored = json.load(fh)
+        if isinstance(stored, dict):
+            for name, value in stored.items():
+                allowed = ALLOWED_CLIENT_SETTINGS.get(name)
+                # Validate on the way *in* as well as on the way out: a file
+                # edited by hand must not be able to put an arbitrary string
+                # on four devices.
+                if allowed and isinstance(value, str) and value in allowed:
+                    settings[name] = value
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        log_event("warning", "bridge", f"Client settings unreadable, using defaults: {exc}")
+    return settings
+
+
+def _save_client_settings() -> None:
+    """Persist the settings. Never raises -- a failed save must not break a command."""
+    try:
+        os.makedirs(os.path.dirname(_CLIENT_SETTINGS_FILE), exist_ok=True)
+        tmp = _CLIENT_SETTINGS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(client_settings, fh)
+        os.replace(tmp, _CLIENT_SETTINGS_FILE)
+    except Exception as exc:
+        log_event("warning", "bridge", f"Could not save client settings: {exc}")
+
+ALLOWED_CLIENT_SETTINGS: dict[str, frozenset[str]] = {
+    "theme": frozenset({"light", "dark"}),
+    # Deck slot presets. "auto" hands layout back to
+    # the client, which then follows the session count -- one session fills the
+    # arc, a second splits it.
+    "deck": frozenset({"auto", "focus", "pair", "war-room", "survey"}),
+}
+
+client_settings: dict[str, str] = _load_client_settings()
+
+
+def set_client_setting(name: str, value: str) -> bool:
+    """Store a client setting, returning False when it is not one we allow."""
+    allowed = ALLOWED_CLIENT_SETTINGS.get(name)
+    if allowed is None or value not in allowed:
+        return False
+    client_settings[name] = value
+    _save_client_settings()
+    return True
 
 
 async def broadcast_to_ios(message: dict) -> None:
@@ -297,8 +546,13 @@ async def _cancel_terminal_subs_for_session(session_id: str, project: str = "") 
         subs = _terminal_subs.pop(session_id, None)
     if not subs:
         return
-    for ws, task in subs.items():
-        task.cancel()
+    for ws, sub in subs.items():
+        sub.task.cancel()
+        if _geometry_release_hook is not None:
+            try:
+                await _geometry_release_hook(session_id, ws)
+            except Exception:
+                pass
         try:
             await send_signed(ws, {
                 "type": "terminal_subscription_ended",
@@ -315,7 +569,7 @@ async def _cleanup_terminal_subs(ws: WebSocket) -> None:
         for session_id in list(_terminal_subs):
             subs = _terminal_subs[session_id]
             if ws in subs:
-                subs[ws].cancel()
+                subs[ws].task.cancel()
                 del subs[ws]
             if not subs:
                 del _terminal_subs[session_id]

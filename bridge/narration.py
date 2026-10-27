@@ -9,6 +9,7 @@ Key features:
 - Per-project cooldown (20s) to avoid being annoying
 - Three verbosity levels: quiet, normal, verbose
 - Errors and approvals always bypass cooldown
+- Stalls (verbose only): a working session with no new activity for 60s
 """
 
 from __future__ import annotations
@@ -52,8 +53,14 @@ class _PendingCompletion:
 @dataclass
 class _ProjectState:
     last_narration_time: float = 0.0
-    last_activity_change: float = field(default_factory=time.monotonic)
-    stall_warned: bool = False
+
+
+@dataclass
+class _StallClock:
+    """How long one working session has gone without showing progress."""
+    turn: float | None   # the session's _activity_started_at: a new turn is a new clock
+    since: float         # the last progress seen: the turn starting, or an activity change
+    warned: bool = False
 
 
 class NarrationEngine:
@@ -67,6 +74,7 @@ class NarrationEngine:
         sessions: Any,
         stt: Any = None,
         listen_after_enabled: bool = False,
+        floor_held: Callable[[], bool] = lambda: False,
     ):
         self.tts = tts
         self.broadcast_fn = broadcast_fn
@@ -74,6 +82,8 @@ class NarrationEngine:
         self.sessions = sessions
         self.stt = stt
         self.listen_after_enabled = listen_after_enabled
+        # A headset holding the speech floor says it all itself (see _emit).
+        self.floor_held = floor_held
 
         self.verbosity = Verbosity.NORMAL
         self._cooldown = 20.0        # seconds between narrations per project
@@ -81,6 +91,7 @@ class NarrationEngine:
         self._stall_threshold = 60.0 # seconds of no activity = stalled
 
         self._project_state: dict[str, _ProjectState] = {}
+        self._stall_clocks: dict[str, _StallClock] = {}  # by session id
         self._pending_completions: list[_PendingCompletion] = []
         self._batch_timer: asyncio.TimerHandle | None = None
 
@@ -163,41 +174,62 @@ class NarrationEngine:
         project: str,
         old_type: str,
         new_type: str,
+        now: float | None = None,
     ) -> None:
-        """Track activity changes. Only announces stalls in VERBOSE mode."""
-        ps = self._get_project_state(project)
-        ps.last_activity_change = time.monotonic()
-        ps.stall_warned = False
+        """A session's activity changed. That is progress: its stall clock
+        starts over, and a stall can be announced again."""
+        clock = self._stall_clocks.get(session_id)
+        if clock is not None:
+            clock.since = time.monotonic() if now is None else now
+            clock.warned = False
 
-        # Stall detection only in VERBOSE mode
-        if self.verbosity != Verbosity.VERBOSE:
-            return
+    async def check_stalls(self, now: float | None = None) -> None:
+        """Announce, once, each working session that has shown no progress for
+        ``_stall_threshold`` seconds. Only in VERBOSE mode.
 
-        # We don't actively poll here — stall detection happens in check_stalls()
+        Called after every activity poll, which is what reports progress
+        (``on_activity_change``). A clock is per session and per turn: a new
+        command never inherits the silence of the last one, and one agent's
+        progress never vouches for another on the same project. Only sessions
+        with a tmux pane are watched -- nothing else is polled, so their
+        silence means nothing.
 
-    async def check_stalls(self) -> None:
-        """Check for stalled sessions. Call periodically from activity poll loop."""
-        if self.verbosity != Verbosity.VERBOSE:
-            return
+        The clocks run whatever the verbosity, so switching to VERBOSE hears
+        at once about a session that has been stuck for a while.
+        """
+        now = time.monotonic() if now is None else now
+        working = {
+            sid: s for sid, s in self.sessions.get_all_sessions().items()
+            if s.status == "active" and s.tmux_target
+        }
+        # Stopped, waiting on the user, or gone: nothing to stall on, so no
+        # clock to keep. (Coming back is a new turn, and a new clock, anyway.)
+        for sid in self._stall_clocks.keys() - working.keys():
+            del self._stall_clocks[sid]
 
-        now = time.monotonic()
-        for session in list(self.sessions.get_all_sessions().values()):
-            if session.status != "active":
+        for sid, session in working.items():
+            clock = self._stall_clocks.get(sid)
+            if clock is None or clock.turn != session._activity_started_at:
+                self._stall_clocks[sid] = _StallClock(turn=session._activity_started_at, since=now)
                 continue
-            ps = self._get_project_state(session.project)
-            if ps.stall_warned:
+            if clock.warned or now - clock.since < self._stall_threshold:
                 continue
-            if now - ps.last_activity_change > self._stall_threshold:
-                ps.stall_warned = True
-                tts_text = f"{session.project} appears stalled."
-                await self._emit(NarrationEvent(
-                    event_type="stalled",
-                    project=session.project,
-                    session_id=session.session_id,
-                    summary="No activity detected",
-                    tts_text=tts_text,
-                    agent_number=getattr(session, 'agent_number', 1),
-                ))
+            if self.verbosity != Verbosity.VERBOSE or session.quiet:
+                continue
+            # The project's cooldown defers a stall rather than dropping it:
+            # the stall is still there at a later check.
+            if now - self._get_project_state(session.project).last_narration_time < self._cooldown:
+                continue
+            clock.warned = True
+            prefix = self._tts_prefix(session.project, sid, session.agent_number)
+            await self._emit(NarrationEvent(
+                event_type="stalled",
+                project=session.project,
+                session_id=sid,
+                summary="No activity detected",
+                tts_text=f"{prefix} appears stalled.",
+                agent_number=session.agent_number,
+            ))
 
     def set_verbosity(self, level: Verbosity) -> None:
         """Change the narration verbosity level."""
@@ -323,6 +355,16 @@ class NarrationEngine:
 
     async def _emit(self, event: NarrationEvent) -> None:
         """Send narration to TTS and broadcast to iOS."""
+        # A headset holds the speech floor. It hears the
+        # same hook events every client gets and says them itself, through
+        # Earshot; speaking here as well, or broadcasting for the phones to
+        # speak, would make one summary three voices. The cooldown still runs,
+        # so the Mac does not catch up in a burst when the floor comes back.
+        if self.floor_held():
+            self._get_project_state(event.project).last_narration_time = time.monotonic()
+            self.log_fn("info", event.project, f"Narration left to the headset [{event.event_type}]")
+            return
+
         # TTS
         try:
             self.tts.speak(

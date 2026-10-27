@@ -69,19 +69,86 @@ _UUID_RE = re.compile(r"[0-9a-fA-F][0-9a-fA-F-]{7,63}")
 # Secret redaction (ported from hooks/on-stop.py:279-303)
 # ---------------------------------------------------------------------------
 
-_SECRET_PATTERNS = [
-    "API_KEY", "SECRET", "TOKEN", "PASSWORD", "PASSW",
-    "Bearer ", "Authorization:",
-    "sk-ant-", "sk-", "ghp_", "gho_", "xoxb-", "xoxp-",
-    "AKIA",  # AWS access key prefix
-    "-----BEGIN",  # PEM keys
-    "eyJ",  # JWT tokens (base64 of '{"')
+# Matched case-INSENSITIVELY (see _contains_secret). The list used to be
+# compared with a plain `in`, which meant only SHOUTING env-var spellings were
+# caught: `password = "..."`, `api_key = "..."`, `"client_secret": "..."` and
+# `auth_token: ...` all went through untouched. This function is the only
+# content-level gate on three egress paths -- the summary sent to a third-party
+# model, file content served to the phone and lens, and the transcript streamed
+# over the WebSocket -- so a miss here is a credential leaving the machine.
+# Shapes distinctive enough to redact on sight: a provider prefix or a key
+# block is never anything else. Matched as a case-insensitive substring.
+_SECRET_SHAPES = [
+    "ghp_", "gho_", "ghu_", "ghs_", "github_pat_",
+    "xoxb-", "xoxp-", "xapp-",
+    "akia",             # AWS access key id
+    "aiza",             # Google API key
+    "gocspx-",          # Google OAuth client secret
+    "glpat-",           # GitLab personal access token
+    "npm_",             # npm automation token
+    "sk_live_", "sk_test_", "rk_live_",   # Stripe
+    "-----begin",       # PEM block
+    "eyj",              # JWT (base64 of '{"')
+    "service_account",  # GCP service-account JSON
+    "ls0tls1",          # base64 of "-----BEGIN": a PEM block inlined in YAML/JSON
 ]
+
+# Generic *names* need the shape of an assignment to count, because as bare
+# substrings they are ordinary English: "auth" is in "authoritative", "token" is
+# in "token count", "secret" is in "secretary". Matching them loosely redacted
+# 2.1% of this repo's own source -- mostly comments -- which is both useless and
+# teaches the reader to ignore the redaction notice. Requiring `name: value` or
+# `name = value` keeps `password = "x"`, `"client_secret": "..."` and
+# `auth_token: abc` while leaving prose alone.
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"""(?ix)
+    # No leading \b: the name is usually prefixed (db_password, MY_API_KEY,
+    # gitlab_token), and "_" is a word character so \b would not match inside
+    # them. The trailing \b plus the required separator is what keeps this from
+    # firing on prose.
+    (?: api[_-]?key | apikey
+        | secret | secrets
+        | token | tokens
+        | password | passwd | passphrase
+        | credential | credentials
+        | private[_-]?key | privatekey
+        | client[_-]?secret | refresh[_-]?token | access[_-]?key
+        | session[_-]?key | auth[_-]?token | authorization
+        | key[_-]?data            # kubeconfig client-key-data
+      )
+    [A-Za-z0-9_-]*                # ...and any suffix: SECRET_VALUE, TOKEN_ID,
+                                  # PASSWORD_HASH, secret_key_base. A trailing
+                                  # \b required the word to be the LAST
+                                  # component before the separator, which let
+                                  # every prefixed spelling through -- 381 lines
+                                  # in this repo that the previous list caught.
+    ["'\s]* [:=] (?!=)            # ":" or "=", not "=="
+    \s* \S                        # ...with something after it
+    """
+)
+
+# OpenAI/Anthropic keys. A length requirement rather than a bare "sk-" prefix,
+# which matched any word ending in "sk" before a hyphen -- "task-file",
+# "disk-usage", "risk-free".
+_SK_KEY_RE = re.compile(r"(?i)\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}")
+
+# An Authorization header or a bearer token, wherever it appears.
+_BEARER_RE = re.compile(r"(?i)\b(?:bearer|authorization\s*:)\s*\S")
+
+# Only a URL carrying credentials in its userinfo part, not every URL.
+_URL_CREDENTIALS_RE = re.compile(r"://[^/\s:@]+:[^/\s@]+@")
 
 
 def _contains_secret(text: str) -> bool:
     """Return True if text appears to contain a secret/credential."""
-    return any(pattern in text for pattern in _SECRET_PATTERNS)
+    low = text.lower()
+    if any(shape in low for shape in _SECRET_SHAPES):
+        return True
+    if _SK_KEY_RE.search(text) or _SECRET_ASSIGNMENT_RE.search(text):
+        return True
+    if _BEARER_RE.search(text):
+        return True
+    return bool(_URL_CREDENTIALS_RE.search(text))
 
 
 def _redact_secrets(text: str) -> str:
@@ -219,6 +286,87 @@ def _open_transcript_fd(path: str, assistant: str) -> int | None:
             pass
         return None
     return fd
+
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
+# Read backwards in windows of this size, and give up after this many bytes.
+# The newest assistant turn is almost always in the first window; the cap only
+# matters behind a run of huge tool results.
+_MODEL_SCAN_CHUNK = 256 * 1024
+_MODEL_SCAN_MAX_BYTES = 4 * 1024 * 1024
+
+# Claude Code writes this on entries it made up itself (an API error, an
+# interrupted turn). It names no model.
+_SYNTHETIC_MODEL = "<synthetic>"
+
+
+def latest_model(session) -> str:
+    """The model on the newest main-thread assistant turn in the transcript.
+
+    From the end, because a session's model can change part way (``/model``)
+    and only the latest turn says what it runs now. Sub-agent turns are
+    skipped -- an Explore agent on Haiku does not change the session's model --
+    and so are synthetic entries. ``""`` when there is no transcript, no
+    assistant turn yet, or none within the scan budget. Never raises.
+
+    Only finds transcripts :func:`find_transcript_path` can, which today means
+    Claude Code's.
+    """
+    try:
+        path = find_transcript_path(session)
+        if not path:
+            return ""
+        assistant = (getattr(session, "assistant", "claude") or "claude").lower()
+        fd = _open_transcript_fd(path, assistant)
+        if fd is None:
+            return ""
+        with os.fdopen(fd, "rb") as f:
+            return _scan_for_model(f)
+    except Exception:
+        return ""
+
+
+def _scan_for_model(f) -> str:
+    end = os.fstat(f.fileno()).st_size
+    scanned = 0
+    carry = b""
+    while end > 0 and scanned < _MODEL_SCAN_MAX_BYTES:
+        start = max(0, end - _MODEL_SCAN_CHUNK)
+        f.seek(start)
+        chunk = f.read(end - start)
+        scanned += len(chunk)
+        end = start
+        lines = (chunk + carry).split(b"\n")
+        # Unless this window reached the start of the file, its first line
+        # began in the window before it: finish it next time round.
+        carry = lines.pop(0) if start > 0 else b""
+        for raw in reversed(lines):
+            model = _model_of(raw)
+            if model:
+                return model
+    return ""
+
+
+def _model_of(raw: bytes) -> str:
+    # Most lines are not assistant turns; don't parse what cannot match.
+    if b'"assistant"' not in raw or b'"model"' not in raw:
+        return ""
+    try:
+        entry = json.loads(raw)
+    except ValueError:
+        return ""
+    if not isinstance(entry, dict) or entry.get("type") != "assistant":
+        return ""
+    if entry.get("isSidechain"):
+        return ""
+    message = entry.get("message")
+    model = message.get("model") if isinstance(message, dict) else None
+    if not isinstance(model, str) or not model or model == _SYNTHETIC_MODEL:
+        return ""
+    return model
 
 
 # ---------------------------------------------------------------------------

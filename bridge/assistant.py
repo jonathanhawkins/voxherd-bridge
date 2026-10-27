@@ -13,6 +13,7 @@ SUPPORTED_ASSISTANTS: tuple[str, ...] = (
     "gemini",
     "grok",
     "composer",
+    "antigravity",
 )
 HOOK_CAPABLE_ASSISTANTS: tuple[str, ...] = (
     "claude",
@@ -20,6 +21,7 @@ HOOK_CAPABLE_ASSISTANTS: tuple[str, ...] = (
     "gemini",
     "grok",
     "composer",
+    "antigravity",
 )
 
 # Grok Build CLI model ids (verified via `grok models`).
@@ -41,10 +43,46 @@ _ASSISTANT_ALIASES: dict[str, str] = {
     "grok-composer": "composer",
     "grok-composer-2.5": "composer",
     "grok-composer-2.5-fast": "composer",
+    "agy": "antigravity",
+    "antigravity-cli": "antigravity",
+    "antigravity_cli": "antigravity",
+    "anti-gravity": "antigravity",
 }
 
 # Grok Build and Composer share one CLI binary (`grok` / `agent`).
 _GROK_FAMILY: frozenset[str] = frozenset({"grok", "composer"})
+
+# Antigravity CLI (`agy`) — Google's terminal agent. Google retired Jules'
+# free tiers on 2026-06-18 and pointed those users here, so this is the
+# Google agent that matters, not just Gemini CLI. Verified surface (agy
+# 1.2.10, `agy --help`):
+#
+#   spawn      agy
+#   headless   agy -p "<msg>" --output-format text|json|stream-json
+#   resume     agy -c            (most recent conversation)
+#              agy --conversation <ID>
+#   inventory  agy agents | agy models | agy plugin list | agy mcp list
+#
+# Unlike the others it fronts several providers (Gemini, Claude, GPT-OSS)
+# from one binary, so `--model` selects a provider's model rather than a
+# variant of its own.
+_ANTIGRAVITY_EFFORT_LEVELS: frozenset[str] = frozenset({"low", "medium", "high"})
+
+
+def normalize_antigravity_effort(value: str | None) -> str | None:
+    """Return a safe ``--effort`` string for ``agy``, or None.
+
+    Separate from :func:`normalize_reasoning_effort` because ``agy`` accepts
+    only low/medium/high -- it has no ``xhigh``/``max`` tier, and passing one
+    would make the CLI reject the whole launch.
+    """
+    raw = (value or "").strip().lower()
+    if not raw:
+        return None
+    aliases = {"x-high": "high", "extra-high": "high", "maximum": "high", "xhigh": "high",
+               "max": "high"}
+    raw = aliases.get(raw, raw)
+    return raw if raw in _ANTIGRAVITY_EFFORT_LEVELS else None
 
 
 def normalize_assistant(value: str | None, *, default: str = "claude") -> str:
@@ -202,7 +240,22 @@ def spawn_command_for_assistant(
             cmd.extend(["-c", f"model_reasoning_effort={effort}"])
         return cmd
     if provider == "gemini":
-        return ["gemini"]
+        cmd = ["gemini"]
+        if model:
+            cmd.extend(["-m", model])
+        return cmd
+    if provider == "antigravity":
+        # --dangerously-skip-permissions matches how we launch every other
+        # assistant (claude --dangerously-skip-permissions, grok
+        # --always-approve): VoxHerd is a voice remote, so there is nobody
+        # at a keyboard to approve a tool call mid-session.
+        cmd = ["agy", "--dangerously-skip-permissions"]
+        if model:
+            cmd.extend(["--model", model])
+        effort = normalize_antigravity_effort(reasoning_effort)
+        if effort:
+            cmd.extend(["--effort", effort])
+        return cmd
     if provider in _GROK_FAMILY:
         # --minimal: finalized blocks go into native terminal scrollback so
         # tmux history_size grows (Claude-like console scrolling). Without it
@@ -349,7 +402,25 @@ def resume_command_for_assistant(
         if effort:
             cmd.extend(["--reasoning-effort", effort])
         return cmd
-    # Gemini dispatch should use tmux send-keys for active sessions.
+    if provider == "antigravity":
+        # agy -p "<msg>" --conversation <ID> --output-format stream-json
+        return [
+            "agy",
+            "-p",
+            message,
+            "--conversation",
+            session_id,
+            "--output-format",
+            "stream-json",
+        ]
+    # Gemini: no headless resume by session id. Verified against gemini 0.61.0
+    # -- `-r/--resume` takes an INDEX or the literal "latest", not a UUID
+    # (`gemini --list-sessions` enumerates them), so there is no way to target
+    # the specific session a hook registered. `--session-id <uuid>` can ASSIGN
+    # the id at spawn, which would be the cleaner fix, but that has to be
+    # threaded through the spawn path and the hook's SessionStart registration
+    # together -- until then, Gemini dispatch goes through tmux send-keys on
+    # the live pane like any other interactive session.
     return None
 
 
@@ -366,6 +437,8 @@ def looks_like_assistant_process(assistant: str | None, fg_cmd: str) -> bool:
         return cmd == "codex" or cmd.startswith("codex-")
     if provider == "gemini":
         return cmd == "gemini" or cmd.startswith("gemini-")
+    if provider == "antigravity":
+        return cmd == "agy" or cmd.startswith(("agy-", "antigravity"))
     if provider in _GROK_FAMILY:
         # Binary is `grok`; install also links `agent` → same binary under ~/.grok/bin.
         return (
@@ -388,6 +461,10 @@ def infer_assistant_from_process(fg_cmd: str) -> str | None:
         return "codex"
     if cmd == "gemini" or cmd.startswith("gemini-"):
         return "gemini"
+    # Checked before the grok family: `agy` is its own binary and must not be
+    # confused with grok's `agent` symlink.
+    if cmd == "agy" or cmd.startswith(("agy-", "antigravity")):
+        return "antigravity"
     if (
         cmd in ("grok", "agent")
         or cmd.startswith("grok-")

@@ -16,7 +16,11 @@ from datetime import datetime, timezone
 
 from bridge.env_utils import get_subprocess_env
 from bridge.assistant import normalize_assistant
-from bridge.validation import _validate_tmux_pane_target
+from bridge.validation import (
+    _sanitize_model,
+    _validate_project_dir,
+    _validate_tmux_pane_target,
+)
 
 _PERSIST_PATH = os.path.expanduser("~/.voxherd/sessions.json")
 
@@ -29,6 +33,10 @@ class Session:
     project: str
     project_dir: str
     assistant: str = "claude"  # claude | codex | gemini
+    # The model the assistant is running, e.g. "claude-opus-5-5". A separate
+    # axis from `assistant`: one assistant runs many models (Antigravity is
+    # multi-provider; Claude Code switches with /model). "" until known.
+    model: str = ""
     status: str = "idle"
     last_summary: str = ""
     window_name: str = ""  # human display name (e.g. swarm role: planner, worker-1); overrides "project #N" in the UI
@@ -74,6 +82,9 @@ class Session:
     # truncation, mid-redraw) reuses it instead of blanking the lens
     # header chip. See ``session_status.sticky_context_percent``.
     _last_context_pct: int | None = field(default=None, repr=False)
+    # Id of the last edit broadcast as ``agent_focus`` (Follow mode), so the
+    # activity poll announces each edit once. See ``bridge/focus.py``.
+    _last_focus_id: str | None = field(default=None, repr=False)
 
     @property
     def live_subagents(self) -> dict[str, dict]:
@@ -117,6 +128,7 @@ class Session:
             "project": self.project,
             "project_dir": self.project_dir,
             "assistant": self.assistant,
+            "model": self.model,
             "status": self.status,
             "last_summary": self.last_summary,
             "window_name": self.window_name,
@@ -162,11 +174,19 @@ class SessionManager:
                 data = json.load(f)
             for sid, d in data.get("sessions", {}).items():
                 tmux_target, _ = _validate_tmux_pane_target(d.get("tmux_target"))
+                # Re-validated on the way back in, like every other field here.
+                # A root that was accepted by an older build (or edited into the
+                # file) is the Reader's root and the dispatch cwd, so restoring
+                # it unchecked would outlive the fix that refused it.
+                project_dir, dir_err = _validate_project_dir(d.get("project_dir", ""))
+                if dir_err:
+                    continue
                 self._sessions[sid] = Session(
                     session_id=d["session_id"],
                     project=d["project"],
-                    project_dir=d["project_dir"],
+                    project_dir=project_dir,
                     assistant=normalize_assistant(d.get("assistant", "claude")),
+                    model=_sanitize_model(d.get("model")),
                     status=d.get("status", "idle"),
                     last_summary=d.get("last_summary", ""),
                     window_name=d.get("window_name", ""),
@@ -252,6 +272,46 @@ class SessionManager:
         except Exception:
             return False
 
+    def _drop(self, session_id: str) -> "Session | None":
+        """Remove *session_id* from the registry and forget everything keyed to it.
+
+        THE removal primitive. Every other path goes through here, because the
+        per-session bookkeeping lives in other modules and each caller forgetting
+        it independently is a bug that has now been written five times:
+
+        * four of the eight ``remove_session`` call sites never forgot the books;
+        * ``prune_dead``'s three ``del``s bypassed the lot;
+        * and ``register_session``'s tmux-dedup eviction -- the commonest way an
+          id changes, since Claude Code restarting or compacting in the same pane
+          re-registers it -- popped the session with a bare ``pop`` and left all
+          nine books behind permanently. ``_LAST_CHOICE_FOR_SESSION`` is what
+          ``server_state._state_sync_msg`` builds ``active_choice_sessions``
+          from, and that set is documented as authoritative and is what clients
+          prune stale decision cards against. The activity loop only visits
+          registered sessions, so a dead id is never revisited: the lens kept a
+          decision card for a session that no longer existed, for the life of
+          the process.
+
+        Also cancels the stream-json reader, so an evicted session does not leak
+        a coroutine and a subprocess pipe.
+
+        NOT included: ``_cancel_terminal_subs_for_session``. That is deliberately
+        the caller's job -- it is async, it has to notify the subscriber so it can
+        re-subscribe under the replacement id, and it releases the geometry lease.
+        Three call sites do not do it; see the note in ``bridge/activity.py``.
+        """
+        from bridge.activity import _forget_session_state
+
+        session = self._sessions.pop(session_id, None)
+        _forget_session_state(session_id)
+        reader = getattr(session, "_stream_json_task", None) if session else None
+        if reader is not None and hasattr(reader, "cancel"):
+            try:
+                reader.cancel()
+            except Exception:
+                pass
+        return session
+
     async def prune_dead(self) -> list[tuple[str, str]]:
         """Remove sessions whose tmux pane no longer exists.
 
@@ -273,7 +333,7 @@ class SessionManager:
             if s.tmux_target and not await self._tmux_pane_exists(s.tmux_target):
                 if sid in self._sessions:
                     removed.append((sid, s.project))
-                    del self._sessions[sid]
+                    self._drop(sid)
 
         # 2. Remove sessions without a tmux target (can't dispatch to them)
         #    or with a bridge: target (bogus — inherited from bridge tmux env).
@@ -283,7 +343,7 @@ class SessionManager:
                 continue
             if not s.tmux_target or s.tmux_target.startswith("bridge:"):
                 removed.append((sid, s.project))
-                del self._sessions[sid]
+                self._drop(sid)
 
         # 3. Deduplicate by tmux_target — keep only the newest per pane.
         # (Project-level dedup removed: register_session() already handles
@@ -305,9 +365,10 @@ class SessionManager:
                 if sid in self._sessions:
                     print(f"[prune] Dedup: removing tmux {target} session {sid[:12]}... (keeping {sids[0][:12]}...)")
                     removed.append((sid, self._sessions[sid].project))
-                    del self._sessions[sid]
+                    self._drop(sid)
 
         if removed:
+            # ``_drop`` already forgot each one's books.
             self._save()
         return removed
 
@@ -335,7 +396,8 @@ class SessionManager:
         tmux_target: str | None = None,
         assistant: str = "claude",
         quiet: bool = False,
-    ) -> tuple[Session, list[str]]:
+        model: str = "",
+    ) -> tuple[Session | None, list[str]]:
         """Register a new session or re-register an existing one.
 
         Only deduplicates by tmux_target: if another session shares the same
@@ -343,9 +405,43 @@ class SessionManager:
         Multiple sessions for the same project directory are allowed.
 
         Returns (session, removed_ids) where removed_ids lists session IDs
-        that were evicted during deduplication.
+        that were evicted during deduplication. ``session`` is None when
+        ``project_dir`` is refused.
+
+        ``project_dir`` is validated HERE because this is the one point every
+        producer shares, and they did not all check: the REST register, the
+        ``/api/events`` auto-register, ``spawn_session`` and the persisted
+        reload each called ``_validate_project_dir`` themselves, while tmux
+        discovery took a pane's ``#{pane_current_path}`` verbatim — so an
+        assistant started with ``tmux new-session -c /etc`` gave the Reader a
+        root of ``/etc`` within 30 seconds, which is the confinement bypass the
+        other call sites exist to prevent. Validating at the choke point means a
+        sixth producer cannot reintroduce it.
         """
         removed: list[str] = []
+        # Containment only: see _validate_project_dir. A caller that also
+        # wants existence (the REST register) checks it itself.
+        clean_dir, dir_err = _validate_project_dir(
+            project_dir, require_exists=False
+        )
+        if dir_err:
+            # Imported here, not at module scope: server_state imports this
+            # module, so a top-level import would be a cycle.
+            from bridge.server_state import log_event
+
+            log_event(
+                "warning", project or "bridge",
+                f"Refused session {session_id[:12]}...: invalid project_dir: {dir_err}",
+            )
+            return None, removed
+        project_dir = clean_dir
+        assistant = normalize_assistant(assistant)
+        model = _sanitize_model(model)
+        # Same session id re-registering (a compact, a bridge restart): what
+        # it was running is the best guess at what it is running.
+        predecessors: list[Session] = [
+            s for s in (self._sessions.get(session_id),) if s is not None
+        ]
 
         # Reject the bridge's own pane as a tmux_target — this means the hook
         # detected the wrong pane (Claude Code was dispatched from the bridge session
@@ -363,7 +459,23 @@ class SessionManager:
             ]
             for sid in stale:
                 removed.append(sid)
-                del self._sessions[sid]
+                # Through ``_drop``: this pop used to leave all nine per-session
+                # books behind, and it is the path that fires whenever Claude
+                # Code re-registers the same pane under a new id.
+                evicted = self._drop(sid)
+                if evicted is not None:
+                    predecessors.append(evicted)
+
+        # A registration that does not say which model -- an older hook, or a
+        # SessionStart that leaves it out -- keeps the one this terminal was
+        # already running, rather than blanking it until the next Stop. Only
+        # from the same assistant: a pane that went from Claude to Codex did
+        # not keep its model.
+        if not model:
+            model = next(
+                (s.model for s in predecessors if s.model and s.assistant == assistant),
+                "",
+            )
 
         # Compute agent_number: max of existing same-project sessions + 1
         same_project = [
@@ -377,7 +489,8 @@ class SessionManager:
             session_id=session_id,
             project=project,
             project_dir=project_dir,
-            assistant=normalize_assistant(assistant),
+            assistant=assistant,
+            model=model,
             status="active",
             last_summary="",
             registered_at=now,
@@ -394,6 +507,20 @@ class SessionManager:
         self._sessions[session_id] = session
         self._save()
         return session, removed
+
+    def set_model(self, session_id: str, model: str) -> bool:
+        """Record the model a session is running. True when it changed.
+
+        An unknown or unrecognisable reading never clears what is known: a
+        transcript with no assistant turn yet says nothing about the model.
+        """
+        session = self._sessions.get(session_id)
+        model = _sanitize_model(model)
+        if session is None or not model or session.model == model:
+            return False
+        session.model = model
+        self._save()
+        return True
 
     def set_window_name(self, session_id: str, name: str) -> bool:
         s = self._sessions.get(session_id)
@@ -473,7 +600,15 @@ class SessionManager:
         is provided, results are filtered to that assistant id.
 
         Returns all matches, sorted by most recently active first
-        (prefer status=="active", then by last_activity descending).
+        (prefer status=="active", then by last_activity descending) -- but an
+        EXACT name match always outranks a substring one.
+
+        That last rule is the whole point. With pure containment, "voxherd"
+        matched both ``voxherd`` and ``voxherd-notes``, and the tie-break was
+        "active first, then most recent" -- so the longer, busier,
+        name-shadowing session won, and a command meant for ``voxherd`` was
+        typed into ``voxherd-notes``. Said out loud about a permission prompt,
+        that is an approval delivered to the wrong agent.
         """
         needle = project_name.lower()
         assistant_filter = (assistant or "").strip().lower()
@@ -487,6 +622,9 @@ class SessionManager:
         # Using two stable sorts: first by time desc, then by status (active=0 first).
         matches.sort(key=lambda s: s.last_activity, reverse=True)
         matches.sort(key=lambda s: 0 if s.status == "active" else 1)
+        # Applied last so it wins over both: a name the speaker said exactly is
+        # not a guess, and must not lose to a busier near-miss.
+        matches.sort(key=lambda s: 0 if s.project.lower() == needle else 1)
         return matches
 
     def get_session_by_project(
@@ -522,21 +660,27 @@ class SessionManager:
         return None
 
     def remove_session(self, session_id: str) -> bool:
-        """Remove a session. Returns True if it existed, False otherwise.
+        """Remove a session and everything keyed by its id, and persist.
 
-        Cancels the per-session stream-json reader task if one was
-        running so we don't leak a coroutine + subprocess pipe on a
-        session that's been pruned mid-dispatch.
+        Returns True if the session existed, False otherwise. The removal and
+        the bookkeeping are ``_drop``'s; this adds the save.
+
+        Forgetting the books happens for an id that named no session too:
+        nothing should hold state keyed to an id that is not a session. A stale
+        ``_LAST_CHOICE_FOR_SESSION`` entry is not merely garbage -- it is what
+        the choice-commit gate compares an answer against, and what
+        ``state_sync``'s ``active_choice_sessions`` is built from.
+
+        NOT done here: ``_cancel_terminal_subs_for_session``. It is async, it
+        has to tell the subscriber so it can re-subscribe under the replacement
+        id, and it is what releases the geometry lease -- so it stays the
+        caller's, and three callers still skip it (pre-existing; see the note in
+        ``bridge/activity.py``). Removing a session is therefore not by itself
+        total teardown.
         """
-        session = self._sessions.pop(session_id, None)
+        session = self._drop(session_id)
         if session is None:
             return False
-        reader = getattr(session, "_stream_json_task", None)
-        if reader is not None and hasattr(reader, "cancel"):
-            try:
-                reader.cancel()
-            except Exception:
-                pass
         self._save()
         return True
 

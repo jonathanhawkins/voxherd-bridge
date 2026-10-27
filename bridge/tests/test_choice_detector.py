@@ -759,7 +759,7 @@ class TestAskUserQuestionWidget:
             "Let me get your calls on the two forks that change the build:",
             "",
             "─────────────────────────────────────────",
-            "Planning: /home/user/.claude/plans/ancient-flurry.md",
+            "Planning: /Users/someone/.claude/plans/ancient-flurry.md",
             "─────────────────────────────────────────",
             "← □ Variant design   □ Win metric   ✓ Submit   →",
             "",
@@ -1191,3 +1191,189 @@ class TestPromptBodyCapture:
         p = detect_choice_prompt(lines)
         assert p is not None
         assert len(p.body) <= _MAX_BODY_LINES
+
+
+# ---------------------------------------------------------------------------
+# Claude Code's tool-permission dialog
+# ---------------------------------------------------------------------------
+#
+# Both fixtures are real captures from Claude Code 2.1.282 in a 100x32 tmux
+# pane, with the scratch path swapped for a neutral one of the same shape
+# (so option 2 still wraps at the pane edge, as it did live).
+
+_PERMISSION_BASH = [
+    " ▐▛███▛█   Claude Code v2.1.282",
+    "▝▜██████▀  Haiku 4.5 · Claude Max",
+    " ▝▝   ▝▝   /…/scratch/permprobe",
+    "",
+    "❯ Use the Bash tool to run exactly this command: touch probe-file.txt",
+    "",
+    "⏺ Bash(touch probe-file.txt)",
+    "  ⎿ \xa0Waiting…",
+    "",
+    "─" * 100,
+    " Bash command",
+    "",
+    "   touch probe-file.txt",
+    "   Create probe-file.txt",
+    "",
+    " Do you want to proceed?",
+    " ❯ 1. Yes",
+    "   2. Yes, and always allow access to /Users/dev/projects/scratch/permprobe/nested/directory/that/goe",
+    "      s/on from this project",
+    "   3. No",
+    "",
+    " Esc to cancel · Tab to amend",
+    "",
+    "",
+    "",
+]
+
+_PERMISSION_WRITE = [
+    "❯ Use the Write tool to create notes.txt containing the single word hello",
+    "",
+    "⏺ Write(notes.txt)",
+    "",
+    "─" * 100,
+    " Create file",
+    " notes.txt",
+    "╌" * 100,
+    "  1 hello",
+    "╌" * 100,
+    " Do you want to create notes.txt?",
+    " ❯ 1. Yes",
+    "   2. Yes, and switch to accept edits (auto-approve file edits and common file commands) for this",
+    "      session (shift+tab)",
+    "   3. No",
+    "",
+    " Esc to cancel · Tab to amend",
+    "",
+]
+
+
+class TestClaudePermissionPrompt:
+    """The decision an agent most often blocks on, which used to reach no
+    client as a choice: its footer is neither "Enter to select" nor the
+    plan-mode hint, so both anchors missed it."""
+
+    def test_bash_permission_is_detected(self):
+        p = detect_choice_prompt(_PERMISSION_BASH)
+        assert p is not None
+        assert p.kind == "permission"
+        assert p.input_mode == "tui_select"
+        assert p.title == "Do you want to proceed?"
+        assert p.focused_index == 0
+        assert [o.split(",")[0] for o in p.options] == ["Yes", "Yes", "No"]
+
+    def test_write_permission_is_detected(self):
+        p = detect_choice_prompt(_PERMISSION_WRITE)
+        assert p is not None
+        assert p.kind == "permission"
+        assert p.title == "Do you want to create notes.txt?"
+        assert p.options[0] == "Yes"
+        assert p.options[-1] == "No"
+
+    def test_wrapped_option_label_is_rejoined(self):
+        # The pane wrapped option 2 at its edge; the tail belongs to the
+        # label, not to a description under it.
+        p = detect_choice_prompt(_PERMISSION_WRITE)
+        assert p.options[1] == (
+            "Yes, and switch to accept edits (auto-approve file edits and "
+            "common file commands) for this session (shift+tab)"
+        )
+
+    def test_body_is_the_dialog_not_the_conversation(self):
+        # What is being asked for, and nothing from above the divider.
+        assert detect_choice_prompt(_PERMISSION_BASH).body == [
+            "Bash command", "touch probe-file.txt", "Create probe-file.txt",
+        ]
+        # The dashed frame around a file preview is decoration.
+        assert detect_choice_prompt(_PERMISSION_WRITE).body == [
+            "Create file", "notes.txt", "1 hello",
+        ]
+
+    def test_two_option_permission_is_detected(self):
+        # Claude Code drops the "always allow" row when it would grant
+        # more than was asked. Two options is still a real dialog.
+        lines = [
+            "─" * 60,
+            " Bash command",
+            "   rm -rf build/",
+            " Do you want to proceed?",
+            " ❯ 1. Yes",
+            "   2. No",
+            "",
+            " Esc to cancel · Tab to amend",
+        ]
+        p = detect_choice_prompt(lines)
+        assert p is not None
+        assert p.kind == "permission"
+        assert p.options == ["Yes", "No"]
+
+    def test_other_widgets_keep_kind_choice(self):
+        lines = [
+            "Pick a plan:",
+            ") 1. First option",
+            "  2. Second option",
+            "  3. Third option",
+            "Enter to select · Tab/Arrow keys to navigate · Esc to cancel",
+        ]
+        assert detect_choice_prompt(lines).kind == "choice"
+
+    def test_kind_excluded_from_signature(self):
+        a = ChoicePrompt(title="t", options=["Yes", "No"], kind="choice")
+        b = ChoicePrompt(title="t", options=["Yes", "No"], kind="permission")
+        assert a.signature == b.signature
+
+    def test_footer_counts_for_diagnostics(self):
+        assert has_select_footer(_PERMISSION_BASH)
+
+    def test_footer_in_prose_does_not_anchor(self):
+        # Anchored to the start of the row, like the plan-mode hint.
+        lines = [
+            "Pick one?",
+            "1. a",
+            "2. b",
+            "3. c",
+            "Press Esc to cancel · Tab to amend if you like",
+        ]
+        p = detect_choice_prompt(lines)
+        assert p is None or p.kind != "permission"
+
+
+class TestPermissionReplyIndex:
+    """Approve and deny become a real option, never typed text.
+
+    Typed, ``/deny`` + Enter picked the highlighted option — "Yes". Measured
+    against Claude Code 2.1.282, where saying deny ran the command."""
+
+    def _prompt(self):
+        return detect_choice_prompt(_PERMISSION_BASH)
+
+    def test_approvals_pick_yes(self):
+        from bridge.choice_detector import permission_reply_index
+        for reply in ("/approve", "yes, proceed", "Approve.", "go ahead", "YES"):
+            assert permission_reply_index(self._prompt(), reply) == 0, reply
+
+    def test_denials_pick_no_by_label(self):
+        from bridge.choice_detector import permission_reply_index
+        for reply in ("/deny", "no, deny", "Deny!", "no", "stop", "don't"):
+            assert permission_reply_index(self._prompt(), reply) == 2, reply
+
+    def test_no_found_by_label_when_always_allow_is_absent(self):
+        from bridge.choice_detector import permission_reply_index
+        p = ChoicePrompt(title="Do you want to proceed?", options=["Yes", "No"],
+                         input_mode="tui_select", kind="permission")
+        assert permission_reply_index(p, "/deny") == 1
+
+    def test_anything_else_is_not_a_reply(self):
+        from bridge.choice_detector import permission_reply_index
+        for reply in ("run the tests", "yes and also fix the lint", "approve it later",
+                      "not now", ""):
+            assert permission_reply_index(self._prompt(), reply) is None, reply
+
+    def test_only_permission_dialogs_have_replies(self):
+        from bridge.choice_detector import permission_reply_index
+        p = ChoicePrompt(title="Which?", options=["Yes", "No", "Maybe"],
+                         input_mode="tui_select", kind="choice")
+        assert permission_reply_index(p, "yes") is None

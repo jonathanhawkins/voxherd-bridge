@@ -19,6 +19,8 @@ Covered scenarios
 - HTTP API is reachable shortly after the ready signal.
 - Session registration round-trips through the running bridge.
 - Headless JSON-lines log format is parseable.
+- A pending pairing request arrives as a ``{"pairing": {...}}`` line, and is
+  taken back when the code is redeemed (the menu bar card's only source).
 - SIGINT triggers a shutdown (process exits, port freed).
 - ``headless_port`` module-level flag controls signal emission.
 - Ready signal is the *first* meaningful JSON line on stdout.
@@ -36,12 +38,15 @@ retry pattern.
 
 from __future__ import annotations
 
+import io
 import json
 import os
+import queue
 import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 
@@ -83,17 +88,85 @@ def _start_bridge(port: int, extra_args: list[str] | None = None,
     )
 
 
+_EOF = object()
+
+
+class _PipeReader:
+    """Reads one of a child's pipes on a daemon thread, so waits can be bounded.
+
+    ``readline()`` on a pipe returns only when a line arrives or the writer
+    closes it.  The bridge is a server: it never exits on its own and never
+    closes stdout, so a reader that checks its deadline only *between* reads
+    has no timeout at all — it waits for the next log line, however far off
+    that is.  (That is what made the ``pyinstaller`` tests take ~2.5 h: the
+    compiled binary went quiet, and the "2 s" drain sat on a blocking read
+    until some later line happened to arrive.)
+
+    Moving the blocking read onto a daemon thread and handing lines over a
+    queue makes every caller's wait bounded by its own deadline.  The thread
+    is the stream's only reader — two readers on one pipe would race for
+    lines, and for the buffer behind them.
+    """
+
+    def __init__(self, stream: io.BufferedReader) -> None:
+        self._lines: queue.Queue = queue.Queue()
+        self._at_eof = False
+        threading.Thread(target=self._pump, args=(stream,), daemon=True).start()
+
+    def _pump(self, stream: io.BufferedReader) -> None:
+        try:
+            for line in iter(stream.readline, b""):
+                self._lines.put(line)
+        except (ValueError, OSError):
+            pass  # the pipe was closed under us (_kill_bridge, or GC)
+        finally:
+            self._lines.put(_EOF)
+
+    def readline(self, deadline: float) -> bytes | None:
+        """The next line; ``b""`` once the child closed the pipe; ``None`` if
+        *deadline* passes first."""
+        if self._at_eof:
+            return b""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            item = self._lines.get(timeout=remaining)
+        except queue.Empty:
+            return None
+        if item is _EOF:
+            self._at_eof = True
+            return b""
+        return item
+
+
+def _reader(proc: subprocess.Popen, which: str = "stdout") -> _PipeReader:
+    """The one reader of *proc*'s ``stdout``/``stderr``, created on first use.
+
+    Cached on the process so that successive helpers (ready signal, then log
+    drain) hand off cleanly instead of each starting a thread on a stream the
+    other has already buffered part of.
+    """
+    attr = f"_voxherd_reader_{which}"
+    reader = getattr(proc, attr, None)
+    if reader is None:
+        reader = _PipeReader(getattr(proc, which))
+        setattr(proc, attr, reader)
+    return reader
+
+
 def _wait_for_ready(proc: subprocess.Popen, timeout: float = 5.0
                     ) -> dict[str, Any] | None:
     """Read stdout lines until the ready signal appears or *timeout* expires.
 
     Returns the parsed ready-signal dict, or ``None`` on timeout / EOF.
     """
+    reader = _reader(proc)
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        line = proc.stdout.readline()
+    while True:
+        line = reader.readline(deadline)
         if not line:
-            break  # EOF — process exited
+            break  # None — deadline passed; b"" — EOF, process exited
         text = line.decode("utf-8", errors="replace").strip()
         if not text:
             continue
@@ -148,17 +221,41 @@ def _kill_bridge(proc: subprocess.Popen, sig: int = signal.SIGINT,
 
 def _collect_stdout_lines(proc: subprocess.Popen,
                           timeout: float = 2.0) -> list[str]:
-    """Drain stdout lines until timeout or EOF."""
+    """Drain stdout lines for up to *timeout*, then return what arrived.
+
+    Returns on the deadline rather than on EOF: the bridge is a server, so
+    EOF comes only when it is killed.
+    """
+    reader = _reader(proc)
     lines: list[str] = []
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        line = proc.stdout.readline()
+    while True:
+        line = reader.readline(deadline)
         if not line:
-            break
+            break  # None — deadline passed; b"" — EOF
         text = line.decode("utf-8", errors="replace").strip()
         if text:
             lines.append(text)
     return lines
+
+
+def _drain_stderr(proc: subprocess.Popen, timeout: float = 2.0,
+                  limit: int = 500) -> str:
+    """Whatever the child has put on stderr, bounded by *timeout*.
+
+    The assertion messages below used ``proc.stderr.read()``, which waits for
+    EOF — so on a bridge that started but never announced itself they hung
+    instead of reporting, in exactly the stale-binary case they exist for.
+    """
+    reader = _reader(proc, "stderr")
+    deadline = time.monotonic() + timeout
+    chunks: list[str] = []
+    while True:
+        line = reader.readline(deadline)
+        if not line:
+            break
+        chunks.append(line.decode("utf-8", errors="replace"))
+    return "".join(chunks)[:limit]
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +307,7 @@ class TestBridgeStartup:
 
             assert ready is not None, (
                 f"No ready signal within 5 s.  "
-                f"stderr: {proc.stderr.read().decode()[:500]}"
+                f"stderr: {_drain_stderr(proc)}"
             )
             assert ready["port"] == port
             assert elapsed < 5.0, f"Ready signal took {elapsed:.1f} s"
@@ -227,11 +324,12 @@ class TestBridgeStartup:
         proc = _start_bridge(port)
         try:
             lines_before_ready = 0
+            reader = _reader(proc)
             deadline = time.monotonic() + 5.0
             found = False
 
-            while time.monotonic() < deadline:
-                line = proc.stdout.readline()
+            while True:
+                line = reader.readline(deadline)
                 if not line:
                     break
                 text = line.decode("utf-8", errors="replace").strip()
@@ -323,7 +421,7 @@ class TestBridgeHTTPAfterStartup:
     def test_session_registration_round_trip(self):
         """Register a session via POST, then see it in GET."""
         project_dir = os.path.join(
-            os.path.expanduser("~"), ".voxherd", "test-projects", "e2e-test"
+            os.path.expanduser("~"), ".voxherd-test-projects", "e2e-test"
         )
         os.makedirs(project_dir, exist_ok=True)
 
@@ -350,7 +448,7 @@ class TestBridgeHTTPAfterStartup:
     def test_events_endpoint_accepts_stop_event(self):
         """POST /api/events with a stop event should return ok."""
         project_dir = os.path.join(
-            os.path.expanduser("~"), ".voxherd", "test-projects", "e2e-stop"
+            os.path.expanduser("~"), ".voxherd-test-projects", "e2e-stop"
         )
         os.makedirs(project_dir, exist_ok=True)
 
@@ -415,7 +513,7 @@ class TestHeadlessLogFormat:
 
             # Trigger a registration to generate a log event
             project_dir = os.path.join(
-                os.path.expanduser("~"), ".voxherd", "test-projects", "log-test"
+                os.path.expanduser("~"), ".voxherd-test-projects", "log-test"
             )
             os.makedirs(project_dir, exist_ok=True)
             httpx.post(
@@ -452,7 +550,7 @@ class TestHeadlessLogFormat:
 
             # Trigger activity
             project_dir = os.path.join(
-                os.path.expanduser("~"), ".voxherd", "test-projects", "log-fields"
+                os.path.expanduser("~"), ".voxherd-test-projects", "log-fields"
             )
             os.makedirs(project_dir, exist_ok=True)
             httpx.post(
@@ -570,6 +668,99 @@ class TestBridgeShutdown:
 
 
 # ---------------------------------------------------------------------------
+# Pairing cards on the same pipe
+# ---------------------------------------------------------------------------
+
+class TestPairingReachesTheHostApp:
+    """A pending pairing request travels the pipe as ``{"pairing": {...}}``.
+
+    The six-digit code is the only way a headset pairs -- it does not use its
+    cameras -- and the notification banner that used to be the only place it
+    appeared is gone the moment you look away.  So the menu bar app shows the
+    code as a card for the two minutes it lives, and this line is where the
+    card comes from.
+
+    It is worth an end-to-end test because every way it can break is quiet.
+    The watcher is installed by one call in ``cli.py``'s headless branch; lose
+    it, or import ``pairing`` by name instead of as a module, and the bridge
+    still pairs, the banner still flashes, the log line still scrolls past --
+    and the card simply never appears.
+
+    Running this shows one real macOS notification, named ``pytest``.
+    """
+
+    @staticmethod
+    def _cards(proc: subprocess.Popen, timeout: float = 2.0) -> list[dict[str, Any]]:
+        """The pairing payloads among the next few stdout lines."""
+        cards = []
+        for line in _collect_stdout_lines(proc, timeout=timeout):
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict) and isinstance(parsed.get("pairing"), dict):
+                cards.append(parsed["pairing"])
+        return cards
+
+    def test_a_pairing_request_puts_a_card_on_stdout_and_takes_it_back(self):
+        port = _find_free_port()
+        token = "e2e-pairing-token"
+        proc = _start_bridge(port, token=token)
+        try:
+            assert _wait_for_ready(proc, timeout=5.0) is not None, \
+                f"Bridge failed to start: {_drain_stderr(proc)}"
+            _wait_for_http(port, token=token)
+
+            # No bearer token here on purpose: these two paths are how a
+            # headset gets one. The CSRF header is still required.
+            started = httpx.post(
+                f"http://127.0.0.1:{port}/api/pair/start",
+                json={"device": "pytest"},
+                headers={"X-VoxHerd": "1"},
+                timeout=3.0,
+            )
+            assert started.status_code == 200, started.text
+            request_id = started.json()["request_id"]
+
+            cards = self._cards(proc)
+            pending = [c for c in cards if c.get("request_id") == request_id]
+            assert pending, f"no pairing card on stdout; saw {cards}"
+            card = pending[-1]
+            assert card["state"] == "pending"
+            assert card["device"] == "pytest"
+            assert card["host"] == "127.0.0.1"
+            assert card["attempts"] == 0
+            assert 110 <= card["expires_in"] <= 120
+            # Spaced for reading off a screen: "471 902".
+            digits = card["code"].split(" ")
+            assert len(digits) == 2 and all(d.isdigit() for d in digits)
+            assert len("".join(digits)) == 6
+
+            # The card is the only place the code appears to the app, so it
+            # has to be the real one.
+            finished = httpx.post(
+                f"http://127.0.0.1:{port}/api/pair/finish",
+                json={"request_id": request_id, "code": "".join(digits)},
+                headers={"X-VoxHerd": "1"},
+                timeout=3.0,
+            )
+            assert finished.status_code == 200, finished.text
+            assert finished.json()["token"] == token
+
+            after = _collect_stdout_lines(proc, timeout=2.0)
+            resolved = [json.loads(line)["pairing"] for line in after
+                        if line.startswith("{") and '"pairing"' in line]
+            assert {"state": "resolved", "request_id": request_id,
+                    "reason": "paired"} in resolved, \
+                f"the card was never taken back; saw {resolved}"
+            # The code is meant to be on the Mac's screen. The token it buys
+            # is not, on any line of this pipe.
+            assert not any(token in line for line in after)
+        finally:
+            _kill_bridge(proc)
+
+
+# ---------------------------------------------------------------------------
 # headless_port Module Flag
 # ---------------------------------------------------------------------------
 
@@ -664,6 +855,7 @@ def _start_binary(port: int, token: str = "e2e-binary-token") -> subprocess.Pope
     )
 
 
+@pytest.mark.pyinstaller
 @pytest.mark.skipif(not _binary_exists(), reason="PyInstaller binary not found at macos/dist/")
 class TestPyInstallerBinary:
     """Run the same startup contract tests against the compiled binary.
@@ -672,6 +864,17 @@ class TestPyInstallerBinary:
     is stale (built from older source), these tests will FAIL even though
     the source-based tests above pass — which is exactly the divergence
     that caused the 'stuck at Starting...' bug.
+
+    **Deselected by default** (`-m "not pyinstaller"` in
+    ``bridge/pyproject.toml``'s ``addopts``), because what they assert is a
+    property of a *build*, not of the source in front of you: against a stale
+    ``macos/dist`` they fail, and the failure is about the artefact rather
+    than the change under test. Run them deliberately, after a build:
+
+        python -m pytest bridge/tests/ -m pyinstaller
+
+    A command-line ``-m`` overrides the default, so that selects them and
+    nothing else.
     """
 
     def test_binary_ready_signal_within_5_seconds(self):
@@ -688,7 +891,7 @@ class TestPyInstallerBinary:
                 f"This usually means the binary is stale — rebuild with: "
                 f"bash macos/build-bridge.sh\n"
                 f"Binary: {_BINARY_PATH}\n"
-                f"stderr: {proc.stderr.read().decode()[:500]}"
+                f"stderr: {_drain_stderr(proc)}"
             )
             assert ready["port"] == port
             assert elapsed < 5.0, (

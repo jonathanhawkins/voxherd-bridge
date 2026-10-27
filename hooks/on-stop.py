@@ -2,8 +2,9 @@
 """VoxHerd on-stop hook — generates AI summary and notifies bridge server.
 
 Reads hook JSON from stdin, parses the JSONL transcript to extract structured
-context (files changed, commands run, key actions), sends to Haiku for a
-concise voice summary, and POSTs the result to the bridge.
+context (files changed, commands run, key actions), sends it to the install
+profile's fast model for a concise voice summary, and POSTs the result to the
+bridge.
 
 Must NEVER block Claude Code — all external calls have timeouts and errors
 are swallowed.
@@ -60,9 +61,57 @@ LOG_DIR = _CONFIG_DIR / "logs"
 DEBUG_LOG = LOG_DIR / "on-stop-debug.log"
 DEBOUNCE_FILE = LOG_DIR / ".stop-debounce"
 DEBOUNCE_SECONDS = 3
-HAIKU_TIMEOUT = 25  # seconds
+SUMMARY_TIMEOUT = 25  # seconds
 
 LOG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+# ---------------------------------------------------------------------------
+# Model profile — which small model summarises this turn
+# ---------------------------------------------------------------------------
+#
+# Resolved at install time from models.env, not per request. The canonical
+# resolver is bridge/model_profile.py; install.sh drops a copy next to this
+# file in ~/.voxherd/hooks/. Import it from wherever it happens to be, and if
+# it is nowhere at all, fall back to the hardcoded Claude Haiku default — a
+# hook must never block the assistant over a missing helper.
+
+_MODEL_PROFILE = None
+try:
+    _here = Path(__file__).resolve().parent
+    for _candidate in (_here, _here.parent / "bridge", _here.parent):
+        if (_candidate / "model_profile.py").is_file():
+            if str(_candidate) not in sys.path:
+                sys.path.insert(0, str(_candidate))
+            break
+    import model_profile as _model_profile_mod  # type: ignore[import-not-found]
+
+    _MODEL_PROFILE = _model_profile_mod.resolve()
+except Exception:
+    _model_profile_mod = None
+    _MODEL_PROFILE = None
+
+_FALLBACK_SUMMARY_CLI = "claude"
+_FALLBACK_SUMMARY_MODEL = "claude-haiku-4-5-20251001"
+
+
+def summary_cli() -> str:
+    """The CLI the profile says to summarise with (``claude`` by default)."""
+    return getattr(_MODEL_PROFILE, "summary_cli", _FALLBACK_SUMMARY_CLI)
+
+
+def summary_model() -> str:
+    """The model the profile says to summarise with (Haiku by default)."""
+    return getattr(_MODEL_PROFILE, "summary_model", _FALLBACK_SUMMARY_MODEL)
+
+
+def summary_argv(prompt: str) -> list[str]:
+    """argv for the one-shot summary call, per the resolved profile."""
+    if _MODEL_PROFILE is not None:
+        try:
+            return _MODEL_PROFILE.summary_argv(prompt)
+        except Exception:
+            pass
+    return [_FALLBACK_SUMMARY_CLI, "-p", prompt, "--model", _FALLBACK_SUMMARY_MODEL]
 
 # Truncate debug log if over 500KB (keep tail)
 try:
@@ -207,6 +256,9 @@ session_id = _hook_field("session_id", "sessionId")
 cwd = _hook_field("cwd", "workspaceRoot", "workspace_root")
 transcript_path = _hook_field("transcript_path", "transcriptPath")
 stop_reason = _hook_field("stop_reason", "stopReason", default="completed")
+# Only some assistants say which model ran the turn (Antigravity does, on every
+# hook). The bridge prefers what it reads from a transcript it understands.
+model = _hook_field("model", "modelName")
 assistant = str(os.environ.get("VOXHERD_HOOK_ASSISTANT", "claude")).strip().lower() or "claude"
 
 # VOXHERD_QUIET: this session never speaks. Skip the (slow, paid) AI summary
@@ -268,6 +320,8 @@ def _allowed_transcript_roots() -> list[str]:
         "codex": "~/.codex",
         "grok": "~/.grok",
         "composer": "~/.grok",
+        # ~/.gemini/antigravity-cli/brain/<conversation-id>/.system_generated/logs/
+        "antigravity": "~/.gemini",
     }
     roots: list[str] = []
     primary = preferred.get(assistant)
@@ -290,19 +344,81 @@ def _allowed_transcript_roots() -> list[str]:
 
 # Patterns that indicate a string contains secrets — used to filter
 # content before sending to Haiku for summarization.
-_SECRET_PATTERNS = [
-    "API_KEY", "SECRET", "TOKEN", "PASSWORD", "PASSW",
-    "Bearer ", "Authorization:",
-    "sk-ant-", "sk-", "ghp_", "gho_", "xoxb-", "xoxp-",
-    "AKIA",  # AWS access key prefix
-    "-----BEGIN",  # PEM keys
-    "eyJ",  # JWT tokens (base64 of '{"')
+# Secret redaction, kept in step with bridge/transcript_render.py, which
+# carries the full rationale. Any change here belongs there too.
+# Shapes distinctive enough to redact on sight: a provider prefix or a key
+# block is never anything else. Matched as a case-insensitive substring.
+_SECRET_SHAPES = [
+    "ghp_", "gho_", "ghu_", "ghs_", "github_pat_",
+    "xoxb-", "xoxp-", "xapp-",
+    "akia",             # AWS access key id
+    "aiza",             # Google API key
+    "gocspx-",          # Google OAuth client secret
+    "glpat-",           # GitLab personal access token
+    "npm_",             # npm automation token
+    "sk_live_", "sk_test_", "rk_live_",   # Stripe
+    "-----begin",       # PEM block
+    "eyj",              # JWT (base64 of '{"')
+    "service_account",  # GCP service-account JSON
+    "ls0tls1",          # base64 of "-----BEGIN": a PEM block inlined in YAML/JSON
 ]
+
+# Generic *names* need the shape of an assignment to count, because as bare
+# substrings they are ordinary English: "auth" is in "authoritative", "token" is
+# in "token count", "secret" is in "secretary". Matching them loosely redacted
+# 2.1% of this repo's own source -- mostly comments -- which is both useless and
+# teaches the reader to ignore the redaction notice. Requiring `name: value` or
+# `name = value` keeps `password = "x"`, `"client_secret": "..."` and
+# `auth_token: abc` while leaving prose alone.
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"""(?ix)
+    # No leading \b: the name is usually prefixed (db_password, MY_API_KEY,
+    # gitlab_token), and "_" is a word character so \b would not match inside
+    # them. The trailing \b plus the required separator is what keeps this from
+    # firing on prose.
+    (?: api[_-]?key | apikey
+        | secret | secrets
+        | token | tokens
+        | password | passwd | passphrase
+        | credential | credentials
+        | private[_-]?key | privatekey
+        | client[_-]?secret | refresh[_-]?token | access[_-]?key
+        | session[_-]?key | auth[_-]?token | authorization
+        | key[_-]?data            # kubeconfig client-key-data
+      )
+    [A-Za-z0-9_-]*                # ...and any suffix: SECRET_VALUE, TOKEN_ID,
+                                  # PASSWORD_HASH, secret_key_base. A trailing
+                                  # \b required the word to be the LAST
+                                  # component before the separator, which let
+                                  # every prefixed spelling through -- 381 lines
+                                  # in this repo that the previous list caught.
+    ["'\s]* [:=] (?!=)            # ":" or "=", not "=="
+    \s* \S                        # ...with something after it
+    """
+)
+
+# OpenAI/Anthropic keys. A length requirement rather than a bare "sk-" prefix,
+# which matched any word ending in "sk" before a hyphen -- "task-file",
+# "disk-usage", "risk-free".
+_SK_KEY_RE = re.compile(r"(?i)\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}")
+
+# An Authorization header or a bearer token, wherever it appears.
+_BEARER_RE = re.compile(r"(?i)\b(?:bearer|authorization\s*:)\s*\S")
+
+# Only a URL carrying credentials in its userinfo part, not every URL.
+_URL_CREDENTIALS_RE = re.compile(r"://[^/\s:@]+:[^/\s@]+@")
 
 
 def _contains_secret(text: str) -> bool:
     """Return True if text appears to contain a secret/credential."""
-    return any(pattern in text for pattern in _SECRET_PATTERNS)
+    low = text.lower()
+    if any(shape in low for shape in _SECRET_SHAPES):
+        return True
+    if _SK_KEY_RE.search(text) or _SECRET_ASSIGNMENT_RE.search(text):
+        return True
+    if _BEARER_RE.search(text):
+        return True
+    return bool(_URL_CREDENTIALS_RE.search(text))
 
 
 def _redact_secrets(text: str) -> str:
@@ -315,6 +431,31 @@ def _redact_secrets(text: str) -> str:
         else:
             result.append(line)
     return "\n".join(result)
+
+
+def _as_claude_lines(lines: list[str]) -> list[str]:
+    """Transcript lines in Claude Code's shape, which everything below reads.
+
+    Antigravity writes one step per line instead of one message; agy_transcript
+    (installed beside this script) translates. Missing, it degrades to no
+    context -- the fallback summary -- rather than to an error.
+    """
+    if assistant != "antigravity":
+        return lines
+    try:
+        import agy_transcript  # type: ignore[import-not-found]
+    except Exception:
+        log("  agy_transcript.py missing; no context for this Antigravity turn")
+        return []
+    return agy_transcript.to_claude_lines(lines)
+
+
+# The current turn's last reply, which extract_context records for the
+# fallback summary. The context itself holds up to three replies, oldest
+# first -- right for a model, wrong for a fallback that takes the first good
+# sentence: measured on agy, whose turns have no model summary by default,
+# the second turn re-announced the first.
+_last_turn_reply = ""
 
 
 def extract_context(path: str, max_lines: int = 500) -> str:
@@ -368,6 +509,7 @@ def extract_context(path: str, max_lines: int = 500) -> str:
         except OSError:
             pass
         return ""
+    lines = _as_claude_lines(lines)
 
     # --- Pass 1: Find the FIRST user message (the original request) ---
     first_user_request = ""
@@ -492,6 +634,9 @@ def extract_context(path: str, max_lines: int = 500) -> str:
     if last_role == "assistant" and current_turn_texts:
         last_assistant_turn_texts = current_turn_texts[:]
 
+    global _last_turn_reply
+    _last_turn_reply = last_assistant_turn_texts[-1] if last_assistant_turn_texts else ""
+
     # Build structured context with labeled sections (matches other app's format).
     # Prioritize Claude's own explanations — they're the best summary material.
     parts: list[str] = []
@@ -560,6 +705,7 @@ def try_fast_summary(path: str) -> str:
             lines = f.readlines()
     except Exception:
         return ""
+    lines = _as_claude_lines(lines)
 
     # Find the index of the LAST user message in the transcript.
     # Everything after it is the current turn's assistant response.
@@ -682,12 +828,36 @@ def try_fast_summary(path: str) -> str:
 # OpenAI summary (fast alternative to Haiku)
 # ---------------------------------------------------------------------------
 
+#: Values that read as "yes" for VOXHERD_CLOUD_SUMMARY.
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _cloud_summary_opted_in() -> bool:
+    """True only when the user has explicitly asked for cloud summarisation.
+
+    The presence of OPENAI_API_KEY (or GEMINI_API_KEY / GOOGLE_API_KEY) used to
+    be the whole gate, and the cloud call was tried BEFORE the installed model
+    profile. So a developer who exported a key for some unrelated tool had an
+    excerpt of every coding session -- file paths, source lines, prompts -- sent
+    to a third party on every turn end, with nothing in the docs saying so.
+
+    It also contradicted the documented invariant that the summariser is an
+    install-time choice: an ambient environment variable silently overrode the
+    profile that `MODEL_PROFILE=... install.sh` wrote.
+
+    Opt in with VOXHERD_CLOUD_SUMMARY=1.
+    """
+    return os.environ.get("VOXHERD_CLOUD_SUMMARY", "").strip().lower() in _TRUTHY
+
+
 def generate_openai_summary(context: str, project: str) -> str:
     """Generate summary via OpenAI API (gpt-5-nano -> gpt-4o-mini fallback).
 
     Uses urllib.request (stdlib) so the hook has no external dependencies.
     Returns raw summary text or empty string on failure.
     """
+    if not _cloud_summary_opted_in():
+        return ""
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         return ""
@@ -743,6 +913,8 @@ def generate_gemini_summary(context: str, project: str) -> str:
     Uses urllib.request (stdlib). Checks GEMINI_API_KEY then GOOGLE_API_KEY.
     Returns raw summary text or empty string on failure.
     """
+    if not _cloud_summary_opted_in():
+        return ""
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not api_key:
         return ""
@@ -759,15 +931,21 @@ def generate_gemini_summary(context: str, project: str) -> str:
     try:
         url = (
             "https://generativelanguage.googleapis.com/v1beta/"
-            f"models/gemini-2.0-flash:generateContent?key={api_key}"
+            "models/gemini-2.0-flash:generateContent"
         )
         body = json.dumps({
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"maxOutputTokens": 100},
         }).encode()
 
+        # Key in a header, not `?key=`. A query string lands in the request line,
+        # in any intermediary's access log, and in whatever a future `except`
+        # decides to print about the URL; the OpenAI call next door already does
+        # it this way.
         req = urllib.request.Request(
-            url, data=body, headers={"Content-Type": "application/json"},
+            url,
+            data=body,
+            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
         )
 
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -788,6 +966,13 @@ def generate_gemini_summary(context: str, project: str) -> str:
     return ""
 
 
+def _strip_markdown(text: str) -> str:
+    """Markdown as TTS should hear it. A link keeps its words: agy writes file
+    names as "[auth.py](file:///auth.py)", which TTS would otherwise read out whole."""
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    return text.replace("*", "").replace("`", "").replace("#", "").replace('"', '')
+
+
 def _clean_summary(text: str) -> str:
     """Clean an AI-generated summary for TTS.
 
@@ -798,8 +983,7 @@ def _clean_summary(text: str) -> str:
     if not text:
         return ""
 
-    # Strip markdown artifacts
-    text = text.replace("*", "").replace("`", "").replace("#", "").replace('"', '')
+    text = _strip_markdown(text)
 
     # Strip common preamble patterns
     for prefix in ["Here's ", "Here is ", "Summary: ", "Based on ", "The summary is ",
@@ -865,9 +1049,18 @@ if not summary:
                 else:
                     log(f"  Gemini rejected by cleanup: {raw}")
 
-    # CLI fallback — only Claude has a reliable non-interactive prompt mode.
-    # Codex users are covered by OpenAI API; Gemini users by Gemini API.
-    if not summary and context and assistant == "claude" and shutil.which("claude"):
+    # CLI fallback. We only shell out to a CLI we know is present and has a
+    # reliable non-interactive prompt mode. The session's own assistant always
+    # qualifies (that is today's rule: Codex users are covered by the OpenAI
+    # API, Gemini users by the Gemini API). An explicitly installed model
+    # profile also qualifies — that is the whole point of choosing one.
+    _summary_cli = summary_cli()
+    _summary_cli_chosen = getattr(_MODEL_PROFILE, "summary_cli_configured", False)
+    _use_summary_cli = (
+        (assistant == _summary_cli or _summary_cli_chosen)
+        and bool(shutil.which(_summary_cli))
+    )
+    if not summary and context and _use_summary_cli:
         prompt = (
             "You create ultra-concise audio summaries. "
             "Format: 1 sentence what was done + 'Next:' + 1 next step. "
@@ -879,51 +1072,67 @@ if not summary:
         )
 
         try:
-            log("  Calling Haiku for summary...")
+            log(f"  Calling {_summary_cli} ({summary_model()}) for summary...")
             proc = subprocess.run(
-                ["claude", "-p", prompt, "--model", "claude-haiku-4-5-20251001"],
+                summary_argv(prompt),
                 capture_output=True,
                 text=True,
-                timeout=HAIKU_TIMEOUT,
+                timeout=SUMMARY_TIMEOUT,
                 env={**os.environ, "VOXHERD_HOOK_RUNNING": "1"},
             )
             if proc.returncode == 0 and proc.stdout.strip():
                 raw = proc.stdout.strip()
-                log(f"  Haiku raw output: {raw[:300]}")
+                log(f"  {_summary_cli} raw output: {raw[:300]}")
                 summary = _clean_summary(raw)
                 if summary:
-                    log(f"  Haiku summary: {summary}")
+                    log(f"  {_summary_cli} summary: {summary}")
                 else:
-                    log(f"  Haiku rejected by cleanup: {raw}")
+                    log(f"  {_summary_cli} rejected by cleanup: {raw}")
             else:
-                log(f"  Haiku failed: exit={proc.returncode} stderr={proc.stderr[:200]}")
+                log(f"  {_summary_cli} failed: exit={proc.returncode} stderr={proc.stderr[:200]}")
         except subprocess.TimeoutExpired:
-            log("  Haiku timed out")
+            log(f"  {_summary_cli} timed out")
         except Exception as e:
-            log(f"  Haiku error: {e}")
-    elif not summary and context and assistant == "claude":
-        log("  Claude CLI not found, skipping Haiku summarization")
+            log(f"  {_summary_cli} error: {e}")
+    elif not summary and context and (assistant == _summary_cli or _summary_cli_chosen):
+        log(f"  {_summary_cli} CLI not found, skipping CLI summarization")
     elif not summary and context:
         log(f"  No CLI fallback for {assistant} (API-based summary failed)")
     elif not summary:
         log("  No context extracted from transcript")
 
+def _summary_sentence(text: str, shorten: bool = False) -> str:
+    """The first sentence of *text* that reads as a spoken summary, or "".
+
+    With *shorten*, a text whose sentences are all too long still yields its
+    first one, cut at a word.
+    """
+    # Before splitting: the 100-character cut must not land inside a link.
+    text = _strip_markdown(text)
+    sentences = [s.strip().rstrip(".") for s in re.split(r'(?<=[.!])\s+', text.strip())]
+    for sentence in sentences:
+        if (sentence and sentence[0].isupper()
+                and 20 <= len(sentence) <= 100
+                and not sentence.endswith("?")):
+            return sentence + "."
+    first = sentences[0] if sentences else ""
+    if shorten and len(first) > 100 and first[0].isupper():
+        return first[:100].rsplit(" ", 1)[0].rstrip(",;:") + "…"
+    return ""
+
+
 if not summary:
-    # Try extracting a decent fallback from the last assistant text
-    if context:
-        for line in context.split("\n"):
+    # Fall back to the assistant's own words about *this* turn. The context
+    # also holds earlier replies, oldest first; those are read only when this
+    # turn said nothing, since announcing an earlier turn is worse than
+    # "Task completed." (measured: agy's second turn re-announced its first).
+    if _last_turn_reply:
+        summary = _summary_sentence(_last_turn_reply, shorten=True)
+    else:
+        for line in (context or "").split("\n"):
             # Look for "Agent's final statement:" section — it has the best material
             if line.startswith("Agent's final statement: ") or line.startswith("Claude's work summary: "):
-                prefix_len = line.index(": ") + 2
-                text = line[prefix_len:].strip()
-                # Grab the first sentence that looks like a summary
-                for sentence in re.split(r'(?<=[.!])\s+', text):
-                    sentence = sentence.strip().rstrip(".")
-                    if (sentence and sentence[0].isupper()
-                            and 20 <= len(sentence) <= 100
-                            and not sentence.endswith("?")):
-                        summary = sentence + "."
-                        break
+                summary = _summary_sentence(line[line.index(": ") + 2:])
                 if summary:
                     break
     if not summary:
@@ -991,7 +1200,7 @@ skip_tts = quiet or _project_has_own_stop_hook(project_dir)
 if skip_tts:
     log("  skip_tts=true (quiet session or project has own Stop hook)")
 
-payload = json.dumps({
+stop_event = {
     "event": "stop",
     "session_id": session_id,
     "project": project_name,
@@ -1003,7 +1212,10 @@ payload = json.dumps({
     "timestamp": timestamp,
     "tmux_target": tmux_target,
     "skip_tts": skip_tts,
-})
+}
+if model:
+    stop_event["model"] = model
+payload = json.dumps(stop_event)
 
 # Read auth token from file -- use temp config to keep it out of process list
 auth_token = ""

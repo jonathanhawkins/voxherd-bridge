@@ -9,6 +9,7 @@ struct OnboardingView: View {
     @State private var hookStatus: HookStatus
     @State private var installing = false
     @State private var showQR = false
+    @State private var prerequisites = Prerequisites.check()
 
     init(preferences: Preferences, processManager: BridgeProcessManager?, dismiss: @escaping () -> Void) {
         self.preferences = preferences
@@ -31,6 +32,7 @@ struct OnboardingView: View {
             header
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
+                    requirementsStep
                     hooksStep
                     tailscaleStep
                     pairingStep
@@ -47,7 +49,7 @@ struct OnboardingView: View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Welcome to VoxHerd")
                 .font(.system(.title2, design: .default, weight: .semibold))
-            Text("Three quick steps to get voice control of your AI agents.")
+            Text("A few quick steps to get voice control of your AI agents.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
@@ -76,8 +78,62 @@ struct OnboardingView: View {
 
     // MARK: - Steps
 
+    private var requirementsStep: some View {
+        StepCard(number: 1, title: "Check what VoxHerd needs") {
+            Text("VoxHerd works with coding agents running inside tmux on this Mac.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+
+            requirementRow(
+                found: prerequisites.tmux != nil,
+                title: "tmux",
+                detail: prerequisites.tmux ?? (prerequisites.homebrew
+                    ? "Not found. In Terminal: brew install tmux"
+                    : "Not found. Install Homebrew, then in Terminal: brew install tmux")
+            )
+            if prerequisites.tmux == nil && !prerequisites.homebrew {
+                Link("Homebrew", destination: URL(string: "https://brew.sh")!)
+                    .font(.callout)
+                    .padding(.leading, 26)
+            }
+
+            requirementRow(
+                found: !prerequisites.agents.isEmpty,
+                title: "A coding agent",
+                detail: prerequisites.agents.isEmpty
+                    ? "None found. Install one and sign in to it in Terminal first."
+                    : prerequisites.agents.map(\.name).joined(separator: ", ")
+            )
+            if prerequisites.agents.isEmpty {
+                HStack(spacing: 12) {
+                    Link("Claude Code", destination: URL(string: "https://github.com/anthropics/claude-code")!)
+                    Link("Codex", destination: URL(string: "https://github.com/openai/codex")!)
+                    Link("Gemini CLI", destination: URL(string: "https://github.com/google-gemini/gemini-cli")!)
+                }
+                .font(.callout)
+                .padding(.leading, 26)
+            }
+
+            Button("Check Again") { prerequisites = Prerequisites.check() }
+        }
+    }
+
+    private func requirementRow(found: Bool, title: String, detail: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: found ? "checkmark.circle.fill" : "xmark.circle.fill")
+                .foregroundStyle(found ? .green : .red)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.callout.weight(.medium))
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+        }
+    }
+
     private var hooksStep: some View {
-        StepCard(number: 1, title: "Install Claude Code hooks") {
+        StepCard(number: 2, title: "Install Claude Code hooks") {
             Text("VoxHerd needs to know when your agents finish so it can announce results. This adds a hook entry to `~/.claude/settings.json` (also `~/.codex/`, `~/.gemini/`, and `~/.grok/hooks/` if those CLIs are installed).")
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -106,14 +162,18 @@ struct OnboardingView: View {
     }
 
     private var tailscaleStep: some View {
-        StepCard(number: 2, title: "Set up Tailscale (optional)") {
+        StepCard(number: 3, title: "Set up Tailscale (optional)") {
             Text("Only needed to talk to your bridge from outside your home network. Free for personal use.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
 
             HStack(spacing: 12) {
                 Link("Tailscale for Mac", destination: URL(string: "https://tailscale.com/download/mac")!)
-                Link("Tailscale for iPhone", destination: URL(string: "https://apps.apple.com/us/app/tailscale/id1470499037")!)
+                Link("for iPhone", destination: URL(string: "https://apps.apple.com/us/app/tailscale/id1470499037")!)
+                // The headset is Android. Without this the one client that most
+                // needs a tailnet -- it has no cellular and roams between
+                // networks -- had no link here at all.
+                Link("for the headset", destination: URL(string: "https://play.google.com/store/apps/details?id=com.tailscale.ipn")!)
                 Spacer()
                 tailscaleStatusBadge
             }
@@ -122,21 +182,36 @@ struct OnboardingView: View {
     }
 
     @ViewBuilder
+    /// Three states, because the middle one is not success and the last one was
+    /// silent.
+    ///
+    /// This had no `else`: with Tailscale absent the badge rendered *nothing*,
+    /// so the step showed download links and gave no sign that anything was
+    /// wanted — the one case where the user has something to do.
+    ///
+    /// "Installed" was also green, which read as done. An install with no
+    /// address is not reachable: `tailscaled` is not up or nobody has signed
+    /// in, and the bridge's `/api/connection-info` has no tailnet URL to hand
+    /// out. Only an address earns green.
     private var tailscaleStatusBadge: some View {
         if NetworkInfo.tailscaleAddress() != nil {
             Label("Connected", systemImage: "checkmark.circle.fill")
                 .foregroundStyle(.green)
                 .font(.callout)
         } else if NetworkInfo.isTailscaleInstalled() {
-            Label("Installed", systemImage: "checkmark.circle.fill")
-                .foregroundStyle(.green)
+            Label("Installed — sign in to connect", systemImage: "exclamationmark.circle.fill")
+                .foregroundStyle(.orange)
+                .font(.callout)
+        } else {
+            Label("Not installed", systemImage: "arrow.down.circle")
+                .foregroundStyle(.secondary)
                 .font(.callout)
         }
     }
 
     private var pairingStep: some View {
-        StepCard(number: 3, title: "Pair your iPhone") {
-            Text("Install the VoxHerd iOS app, then scan the bridge's QR code to connect.")
+        StepCard(number: 4, title: "Pair your iPhone or headset") {
+            Text("On iPhone, install the VoxHerd app and scan the bridge's QR code. On a headset, open VoxHerd: it finds this bridge, and you say the six-digit code this Mac shows.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
 

@@ -42,6 +42,15 @@ $Cwd = if ($hookInput.cwd) { $hookInput.cwd } elseif ($hookInput.workspaceRoot) 
 $ProjectDir = $Cwd
 $ProjectName = if ($ProjectDir) { Split-Path -Leaf $ProjectDir } else { "unknown" }
 $Assistant = if ($env:VOXHERD_HOOK_ASSISTANT) { $env:VOXHERD_HOOK_ASSISTANT.ToLower() } else { "claude" }
+# The model it is running, when the assistant says -- Claude Code sends a plain
+# id. An {id: ...} object is taken too; anything else is left out, and the
+# bridge fills it in from the transcript at the first Stop.
+$Model = ""
+if ($hookInput.model -is [string]) {
+    $Model = $hookInput.model
+} elseif ($null -ne $hookInput.model -and $hookInput.model.id -is [string]) {
+    $Model = $hookInput.model.id
+}
 $Timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 
 # VOXHERD_QUIET: register this session as silent (visible on dashboard, never
@@ -60,6 +69,7 @@ $payload = @{
     project     = $ProjectName
     project_dir = $ProjectDir
     assistant   = $Assistant
+    model       = $Model
     status      = "active"
     timestamp   = $Timestamp
     quiet       = $Quiet

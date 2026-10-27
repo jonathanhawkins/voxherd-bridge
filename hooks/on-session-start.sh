@@ -18,6 +18,10 @@ INPUT=$(cat)
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // .sessionId // empty')
 CWD=$(echo "$INPUT" | jq -r '.cwd // .workspaceRoot // .workspace_root // empty')
 ASSISTANT=$(echo "${VOXHERD_HOOK_ASSISTANT:-claude}" | tr '[:upper:]' '[:lower:]')
+# The model it is running, when the assistant says -- Claude Code sends a plain
+# id ("claude-opus-5-5"). An {id: ...} object is taken too; anything else is
+# left out, and the bridge fills it in from the transcript at the first Stop.
+MODEL=$(echo "$INPUT" | jq -r '.model | if type == "object" then .id else . end | strings' 2>/dev/null)
 
 PROJECT_DIR="$CWD"
 PROJECT_NAME=$(basename "$PROJECT_DIR")
@@ -53,6 +57,7 @@ PAYLOAD=$(jq -n \
   --arg project "$PROJECT_NAME" \
   --arg project_dir "$PROJECT_DIR" \
   --arg assistant "$ASSISTANT" \
+  --arg model "$MODEL" \
   --arg status "active" \
   --arg ts "$TIMESTAMP" \
   --arg tmux "$TMUX_TARGET" \
@@ -62,6 +67,7 @@ PAYLOAD=$(jq -n \
     project: $project,
     project_dir: $project_dir,
     assistant: $assistant,
+    model: (if $model != "" then $model else null end),
     status: $status,
     timestamp: $ts,
     tmux_target: (if $tmux != "" then $tmux else null end),
@@ -76,7 +82,7 @@ trap cleanup EXIT
 TOKEN_FILE="$HOME/.voxherd/auth_token"
 CURL_AUTH_FILE=""
 if [ -f "$TOKEN_FILE" ]; then
-  AUTH_TOKEN=$(cat "$TOKEN_FILE" 2>/dev/null)
+  AUTH_TOKEN=$(cat "$TOKEN_FILE" 2>/dev/null | tr -d '[:space:]')
   if [ -n "$AUTH_TOKEN" ]; then
     CURL_AUTH_FILE=$(mktemp /tmp/vh-curl-XXXXXX)
     printf 'header = "Authorization: Bearer %s"\n' "$AUTH_TOKEN" > "$CURL_AUTH_FILE"
@@ -93,6 +99,7 @@ if [ -n "$CURL_AUTH_FILE" ]; then
     --config "$CURL_AUTH_FILE" \
     -d "$PAYLOAD" \
     "http://localhost:7777/api/sessions/register" 2>&1)
+  CURL_EXIT=$?
   rm -f "$CURL_AUTH_FILE"
 else
   RESPONSE=$(curl -s --max-time 5 \
@@ -101,9 +108,9 @@ else
     -H "X-VoxHerd: 1" \
     -d "$PAYLOAD" \
     "http://localhost:7777/api/sessions/register" 2>&1)
+  CURL_EXIT=$?
 fi
 
-CURL_EXIT=$?
 if [ "$CURL_EXIT" -ne 0 ]; then
   echo "[$TIMESTAMP] on-session-start: curl failed (exit $CURL_EXIT): $RESPONSE" >> "$LOG_FILE"
 fi
