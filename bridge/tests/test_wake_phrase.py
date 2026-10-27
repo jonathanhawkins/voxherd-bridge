@@ -5,8 +5,9 @@ for anyone driving the other two. "Hey agent" names none of them; which session
 hears the command is decided by what the sentence names, then by focus.
 
 "agent" is an ordinary word in a developer's day, so the phrase only counts at
-the start of an utterance and as whole words: "the agent said" and "hey agents"
-must not wake anything.
+the start of an utterance and as whole words: "the agent said" and "hey agentic"
+must not wake anything. The plural does wake: recognisers return "hey agents" for
+"hey agent" often enough that leaving it out read as a microphone that ignored you.
 """
 
 from __future__ import annotations
@@ -36,6 +37,11 @@ ROOT = Path(__file__).resolve().parents[2]
         # The old phrase still works.
         ("Hey Claude, war room", "war room"),
         ("hey clod war room", "war room"),
+        # The plural, as the headset's recogniser heard "hey agent".
+        ("hey agents", ""),
+        ("Hey agents, show me the diff", "show me the diff"),
+        ("okay agents run the tests", "run the tests"),
+        ("OK, agents. Approve", "Approve"),
     ],
 )
 def test_a_wake_phrase_is_stripped(heard: str, rest: str) -> None:
@@ -46,7 +52,7 @@ def test_a_wake_phrase_is_stripped(heard: str, rest: str) -> None:
     "heard",
     [
         "the agent said the tests pass",
-        "hey agents are running",
+        "the agents are running",
         "hey agentic workflows",
         "tell the agent hey agent",
         "agent run the tests",

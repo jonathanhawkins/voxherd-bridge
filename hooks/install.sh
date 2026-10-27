@@ -12,6 +12,7 @@
 #   HOOK_AGENTS=antigravity bash hooks/install.sh  # Antigravity CLI (`agy`)
 #
 #   MODEL_PROFILE=google bash hooks/install.sh     # Gemini 3.8 Flash via agy for summaries + NLU
+#   MODEL_PROFILE=openai bash hooks/install.sh     # GPT-6 Luna via codex for summaries + NLU
 #   MODEL_PROFILE=anthropic bash hooks/install.sh  # Claude Haiku (the default)
 #
 # Notes:
@@ -23,7 +24,9 @@
 # - MODEL_PROFILE picks the small model the bridge itself uses for stop-hook
 #   summaries and intent parsing. It is an install-time choice, not a per-request
 #   one, and it is recorded in ~/.voxherd/models.env. Omit it and nothing is
-#   written, which means the hardcoded Claude Haiku default.
+#   written, which means the hardcoded Claude Haiku default -- except on a
+#   machine with codex and no claude, which gets MODEL_PROFILE=openai, because
+#   the Haiku default could never run there.
 
 set -e
 
@@ -144,6 +147,12 @@ write_models_env() {
       summary_cli="agy";     summary_model="gemini-3.8-flash-low"
       nlu_cli="agy";         nlu_model="gemini-3.8-flash-low"
       ;;
+    openai)
+      # GPT-6 Luna, OpenAI's model for summarisation, through `codex exec` on
+      # the user's ChatGPT sign-in or API key. See PROFILES in bridge/model_profile.py.
+      summary_cli="codex";   summary_model="gpt-6-luna"
+      nlu_cli="codex";       nlu_model="gpt-6-luna"
+      ;;
     anthropic)
       summary_cli="claude";  summary_model="claude-haiku-4-5-20251001"
       nlu_cli="claude";      nlu_model="claude-haiku-4-5-20251001"
@@ -175,7 +184,12 @@ if [ -n "${MODEL_PROFILE:-}" ]; then
   write_models_env "$(printf "%s" "$MODEL_PROFILE" | tr '[:upper:]' '[:lower:]')"
 elif [ -f "$MODELS_ENV" ]; then
   echo "Model profile: keeping existing $MODELS_ENV"
-  echo "  (re-run with MODEL_PROFILE=google or MODEL_PROFILE=anthropic to change it)"
+  echo "  (re-run with MODEL_PROFILE=google, openai or anthropic to change it)"
+elif ! command -v claude &>/dev/null && command -v codex &>/dev/null; then
+  # The Haiku default shells out to `claude`, which is not here: no summary and
+  # no intent parse would ever work. Codex is, so use its profile.
+  echo "Model profile: no claude CLI, codex found -- using openai"
+  write_models_env "openai"
 else
   echo "Model profile: anthropic (default — claude-haiku-4-5-20251001, no models.env written)"
 fi

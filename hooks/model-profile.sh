@@ -27,6 +27,53 @@
 VOXHERD_DEFAULT_CLI="claude"
 VOXHERD_DEFAULT_MODEL="claude-haiku-4-5-20251001"
 
+# `codex exec` is a full agent run; a one-shot call turns most of it off. Same
+# flags, same order, as _CODEX_EXEC_ARGS in bridge/model_profile.py, which says
+# why each one is there. In short: --ignore-user-config keeps the user's MCP
+# servers and VoxHerd's own Codex notify hook out of the call, --ephemeral keeps
+# it out of their session history. A `--` goes ahead of the prompt, or a prompt
+# that begins with "-" is read as an option.
+_VH_CODEX_EXEC_ARGS=(
+  "codex" "exec"
+  "--ephemeral"
+  "--ignore-user-config"
+  "--skip-git-repo-check"
+  "-s" "read-only"
+  "--color" "never"
+  "-c" 'model_reasoning_effort="low"'
+)
+
+# --ignore-user-config also drops where the sign-in is kept, so a keyring sign-in
+# would look signed out. _vh_codex_auth_store prints the user's own
+# cli_auth_credentials_store -- a top-level key only, a quoted value from this
+# list only -- and nothing at all otherwise. Twin of codex_auth_store().
+_VH_CODEX_AUTH_RE='^[[:space:]]*cli_auth_credentials_store[[:space:]]*=[[:space:]]*("([a-z]+)"|'"'"'([a-z]+)'"'"')[[:space:]]*(#.*)?$'
+
+_vh_codex_auth_store() {
+  local file line value
+  if [ -n "${CODEX_HOME:-}" ]; then
+    file="$CODEX_HOME/config.toml"
+  else
+    file="$HOME/.codex/config.toml"
+  fi
+  [ -f "$file" ] || return 0
+  [ -r "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    case "$(_vh_trim "$line")" in
+      \[*) return 0 ;;  # past the top level: [profiles.x] keys are not the user's own
+    esac
+    if [[ "$line" =~ $_VH_CODEX_AUTH_RE ]]; then
+      value="${BASH_REMATCH[2]}${BASH_REMATCH[3]}"
+      case "$value" in
+        file|keyring|auto) printf '%s' "$value" ;;
+      esac
+      return 0
+    fi
+  done < "$file" 2>/dev/null
+  return 0
+}
+
 # --- validation ------------------------------------------------------------
 
 # Only these CLIs may be spawned. Anything else is ignored and the default wins.
@@ -208,8 +255,14 @@ _vh_build_argv() {
   _vh_valid_model "$model" || model="$VOXHERD_DEFAULT_MODEL"
   flag="$(voxherd_model_flag "$cli")"
   if [ "$cli" = "codex" ]; then
-    # `codex exec` takes the prompt positionally, after the flags.
-    _VH_ARGV=("codex" "exec" "$flag" "$model" "$prompt")
+    # `codex exec` takes the prompt positionally, after the flags and a `--`.
+    local store
+    store="$(_vh_codex_auth_store)"
+    _VH_ARGV=("${_VH_CODEX_EXEC_ARGS[@]}")
+    if [ -n "$store" ]; then
+      _VH_ARGV+=("-c" "cli_auth_credentials_store=\"$store\"")
+    fi
+    _VH_ARGV+=("$flag" "$model" "--" "$prompt")
   else
     _VH_ARGV=("$cli" "-p" "$prompt" "$flag" "$model")
   fi

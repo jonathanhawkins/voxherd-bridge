@@ -204,11 +204,16 @@ struct StatusBarView: View {
                     .frame(maxWidth: .infinity, alignment: .center)
                     .padding(.vertical, 8)
             } else {
+                // A height, not a maxHeight. A ScrollView has no ideal height,
+                // and the MenuBarExtra window sizes itself from the ideal: with
+                // maxHeight the window reserved room for the log while the log
+                // laid out at zero, so "45 events" showed no rows and the
+                // window had a blank strip below the controls.
                 LogView(entries: Binding(
                     get: { processManager.recentEvents },
                     set: { processManager.recentEvents = $0 }
                 ))
-                .frame(maxHeight: 200)
+                .frame(height: 200)
             }
         }
     }

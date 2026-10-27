@@ -407,12 +407,13 @@ Parse a voice transcription into a structured intent using the install profile's
 |---|---|
 | `anthropic` (default) | `claude -p "<prompt>" --model claude-haiku-4-5-20251001 --output-format json` |
 | `google` | `agy -p "<prompt>" --model gemini-3.8-flash-low --disable-slash-commands --output-format json` |
+| `openai` | `codex exec --ephemeral --ignore-user-config --skip-git-repo-check -s read-only --color never -c model_reasoning_effort="low" -m gpt-6-luna -- "<prompt>"` |
 
 The `google` profile runs Antigravity's `agy`: Google retired Gemini CLI's personal-account sign-in on 2026-06-18. Gemini CLI still works when set by hand (`VOXHERD_NLU_CLI=gemini`) with a `GEMINI_API_KEY`. The iOS app waits 17 s, a little longer than the bridge, so it hears the bridge's answer or its timeout rather than giving up first; headset clients parse speech on-device and never call it. The CLI runs with `VOXHERD_HOOK_RUNNING=1`, so its own Stop hook does not report the parse to the bridge as a finished session.
 
 The profile is written to `~/.voxherd/models.env` by `MODEL_PROFILE=google bash hooks/install.sh` and read once per process (`bridge/model_profile.py`). Set `VOXHERD_NLU_CLI` / `VOXHERD_NLU_MODEL` in the bridge's environment to override for one session. A missing or corrupt `models.env` falls back to the Anthropic default.
 
-Each CLI wraps the reply differently and the endpoint unwraps each: `claude` returns `{"type":"result","result":"<text>"}`, `gemini` returns `{"response":"<text>","stats":{…}}`, `agy` returns `{"status":"SUCCESS","response":"<text>","usage":{…}}`. A CLI with no JSON envelope has the action object scraped out of raw stdout. A CLI reporting an error — for `agy`, any status but `SUCCESS` — yields `{"error": "Intent parsing failed"}`.
+Each CLI wraps the reply differently and the endpoint unwraps each: `claude` returns `{"type":"result","result":"<text>"}`, `gemini` returns `{"response":"<text>","stats":{…}}`, `agy` returns `{"status":"SUCCESS","response":"<text>","usage":{…}}`. A CLI with no JSON envelope (`codex exec` prints the bare reply) has the action object scraped out of raw stdout. The CLI is spawned with stdin closed, since `codex exec` appends a piped stdin to the prompt. Under the `openai` profile, a `cli_auth_credentials_store` the user set in `$CODEX_HOME/config.toml` is forwarded as one more `-c` before `-m`, because `--ignore-user-config` would otherwise lose a keyring sign-in. A CLI reporting an error — for `agy`, any status but `SUCCESS` — yields `{"error": "Intent parsing failed"}`.
 
 ---
 

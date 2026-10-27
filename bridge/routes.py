@@ -1005,6 +1005,10 @@ async def _run_intent_parse(profile, prompt: str) -> dict:
     """Spawn the profile's NLU model for *prompt* and return the parsed action."""
     proc = await asyncio.create_subprocess_exec(
         *profile.nlu_argv(prompt),
+        # No stdin: `codex exec` appends a piped stdin to the prompt and waits
+        # for its end, and the bridge's own (a TTY in tmux, whatever the menu
+        # bar app hands it) is nothing the model should read.
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         # The parse is a model turn like any other: without this, the

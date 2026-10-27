@@ -29,7 +29,7 @@ from bridge.session_manager import SessionManager
 # ---------------------------------------------------------------------------
 
 # Trigger phrases — matched case-insensitively at the start of transcription,
-# as whole words ("hey agents" is not one), with whatever punctuation the
+# as whole words ("hey agentic" is not one), with whatever punctuation the
 # recogniser puts between them ("Hey, agent."). The wake word prefix is
 # stripped before processing the command.
 #
@@ -41,6 +41,9 @@ WAKE_PHRASES = [
     "hey agent",
     "okay agent",
     "ok agent",
+    "hey agents",     # the plural, as recognisers hear it
+    "okay agents",
+    "ok agents",
     "hey claude",
     "hey clod",      # common misrecognition
     "a claude",       # common misrecognition

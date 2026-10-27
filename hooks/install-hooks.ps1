@@ -4,6 +4,7 @@
 #   powershell -ExecutionPolicy Bypass -File hooks\install-hooks.ps1
 #   $env:HOOK_AGENTS="claude,gemini"; powershell -ExecutionPolicy Bypass -File hooks\install-hooks.ps1
 #   $env:MODEL_PROFILE="google"; powershell -ExecutionPolicy Bypass -File hooks\install-hooks.ps1
+#   $env:MODEL_PROFILE="openai"; powershell -ExecutionPolicy Bypass -File hooks\install-hooks.ps1
 #
 # Notes:
 # - Claude + Gemini support lifecycle hooks and are configured here.
@@ -11,7 +12,9 @@
 # - MODEL_PROFILE picks the small model the bridge itself uses for stop-hook
 #   summaries and intent parsing. It is an install-time choice, not a per-request
 #   one, and it is recorded in %APPDATA%\VoxHerd\models.env. Omit it and nothing
-#   is written, which means the hardcoded Claude Haiku default.
+#   is written, which means the hardcoded Claude Haiku default -- except on a
+#   machine with codex and no claude, which gets MODEL_PROFILE=openai, because
+#   the Haiku default could never run there.
 
 $ErrorActionPreference = "Stop"
 
@@ -100,6 +103,12 @@ function Write-ModelsEnv {
             $summaryCli = "agy"; $summaryModel = "gemini-3.8-flash-low"
             $nluCli = "agy";     $nluModel = "gemini-3.8-flash-low"
         }
+        "openai" {
+            # GPT-6 Luna through `codex exec`, on the user's ChatGPT sign-in or
+            # API key. See PROFILES in bridge\model_profile.py.
+            $summaryCli = "codex"; $summaryModel = "gpt-6-luna"
+            $nluCli = "codex";     $nluModel = "gpt-6-luna"
+        }
         "anthropic" {
             $summaryCli = "claude"; $summaryModel = "claude-haiku-4-5-20251001"
             $nluCli = "claude";     $nluModel = "claude-haiku-4-5-20251001"
@@ -131,7 +140,12 @@ if ($env:MODEL_PROFILE) {
     Write-ModelsEnv -Profile $env:MODEL_PROFILE.Trim().ToLower()
 } elseif (Test-Path $ModelsEnv -PathType Leaf) {
     Write-Host "Model profile: keeping existing $ModelsEnv"
-    Write-Host "  (re-run with MODEL_PROFILE=google or MODEL_PROFILE=anthropic to change it)"
+    Write-Host "  (re-run with MODEL_PROFILE=google, openai or anthropic to change it)"
+} elseif ((-not (Get-Command claude -ErrorAction SilentlyContinue)) -and (Get-Command codex -ErrorAction SilentlyContinue)) {
+    # The Haiku default shells out to `claude`, which is not here: no summary and
+    # no intent parse would ever work. Codex is, so use its profile.
+    Write-Host "Model profile: no claude CLI, codex found -- using openai"
+    Write-ModelsEnv -Profile "openai"
 } else {
     Write-Host "Model profile: anthropic (default -- claude-haiku-4-5-20251001, no models.env written)"
 }

@@ -22,6 +22,7 @@ swallowed silently.
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -56,6 +57,12 @@ DEBOUNCE_SECONDS = 3
 
 LOG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 
+#: Codex runs ``notify`` without waiting for it, so a model call here holds
+#: nothing up; this only bounds a CLI that never answers.
+SUMMARY_TIMEOUT = 15
+#: Enough of the turn's last message to summarise; a long one is mostly detail.
+SUMMARY_CONTEXT_CHARS = 4000
+
 
 def log(msg: str) -> None:
     """Append a timestamped debug line."""
@@ -70,6 +77,70 @@ def log(msg: str) -> None:
             os.close(fd)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Model profile -- which small model, if any, summarises a Codex turn
+# ---------------------------------------------------------------------------
+#
+# The same resolver on-stop.py uses (bridge/model_profile.py, which install.sh
+# copies next to this file), and the same rule: shell out to the profile's CLI
+# when it is this session's own assistant or the user chose a profile. The
+# stock install chose nothing and summarises with claude, which Codex sessions
+# never used -- so they keep the free first-line summary below.
+
+def _load_profile():
+    try:
+        here = Path(__file__).resolve().parent
+        for candidate in (here, here.parent / "bridge", here.parent):
+            if (candidate / "model_profile.py").is_file():
+                if str(candidate) not in sys.path:
+                    sys.path.insert(0, str(candidate))
+                break
+        import model_profile  # type: ignore[import-not-found]
+        return model_profile.resolve()
+    except Exception as e:
+        log(f"  Model profile unavailable: {e}")
+        return None
+
+
+def model_summary(message: str, project: str) -> str:
+    """A 1-2 sentence summary from the profile's model, or "" to fall back."""
+    profile = _load_profile()
+    if profile is None:
+        return ""
+    cli = profile.summary_cli
+    if cli != "codex" and not profile.summary_cli_configured:
+        return ""
+    if not shutil.which(cli):
+        log(f"  {cli} not found, keeping the first-line summary")
+        return ""
+    prompt = (
+        "Summarize what this coding agent just did in 1-2 short sentences for a "
+        "voice announcement. Natural tone, no filler, no markdown.\n\n"
+        f"Project: {project}\n"
+        f"Agent's final message:\n{message.strip()[-SUMMARY_CONTEXT_CHARS:]}"
+    )
+    try:
+        log(f"  Calling {cli} ({profile.summary_model}) for summary...")
+        proc = subprocess.run(
+            profile.summary_argv(prompt),
+            # codex exec appends a piped stdin to the prompt; Codex's own
+            # stdin is nothing the model should read.
+            stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=SUMMARY_TIMEOUT, check=False,
+            env={**os.environ, "VOXHERD_HOOK_RUNNING": "1"},
+        )
+    except Exception as e:
+        log(f"  {cli} summary failed: {e}")
+        return ""
+    if proc.returncode != 0:
+        log(f"  {cli} exited {proc.returncode}: {proc.stderr[:200]}")
+        return ""
+    lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    summary = " ".join(lines).replace("*", "").replace("`", "").strip()[:300]
+    log(f"  {cli} summary: {summary}")
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -138,11 +209,19 @@ log(f"  thread_id={thread_id}")
 log(f"  project={project_name}")
 log(f"  cwd={cwd}")
 
+# VOXHERD_QUIET: mark this worker silent so the bridge skips narration
+# (matches on-stop.py / on-stop.sh). Accepts 1/true/yes/on (case-insensitive).
+quiet = os.environ.get("VOXHERD_QUIET", "").strip().lower() in ("1", "true", "yes", "on")
+
 if should_debounce():
     log("  Debounced — using fallback summary")
     summary = "Task completed."
 else:
     summary = ""
+
+# A quiet worker is never spoken, so it never pays for a summary either.
+if not summary and last_message and not quiet:
+    summary = model_summary(last_message, project_name)
 
 # ---------------------------------------------------------------------------
 # Extract summary from last assistant message
@@ -214,10 +293,6 @@ timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 # Use thread_id as session_id for Codex sessions.
 # Prefix with "codex-" to avoid collision with Claude session IDs.
 session_id = f"codex-{thread_id}" if thread_id else f"codex-{project_name}-{int(time.time())}"
-
-# VOXHERD_QUIET: mark this worker silent so the bridge skips narration
-# (matches on-stop.py / on-stop.sh). Accepts 1/true/yes/on (case-insensitive).
-quiet = os.environ.get("VOXHERD_QUIET", "").strip().lower() in ("1", "true", "yes", "on")
 
 payload = json.dumps({
     "event": "stop",

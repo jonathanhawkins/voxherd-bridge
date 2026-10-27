@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -42,6 +43,33 @@ INSTALL_SH = REPO_ROOT / "hooks" / "install.sh"
 HAIKU = "claude-haiku-4-5-20251001"
 FLASH_LITE = "gemini-3.5-flash-lite"
 AGY_MODEL = "gemini-3.8-flash-low"
+LUNA = "gpt-6-luna"
+
+# Every `codex exec` we spawn, in this order, ahead of `-m <model> <prompt>`.
+CODEX_SAFE = [
+    "codex", "exec",
+    "--ephemeral",            # no session file: summaries stay out of the user's history
+    "--ignore-user-config",   # no MCP servers, and not VoxHerd's own notify hook again
+    "--skip-git-repo-check",  # the hook and the bridge run outside a repository
+    "-s", "read-only",
+    "--color", "never",
+    "-c", 'model_reasoning_effort="low"',
+]
+
+
+def codex_argv(prompt: str, model: str = LUNA, extra: tuple[str, ...] = ()) -> list[str]:
+    """`codex exec` as the resolvers build it: `--` keeps the prompt a prompt."""
+    return [*CODEX_SAFE, *extra, "-m", model, "--", prompt]
+
+
+KEYRING = ("-c", 'cli_auth_credentials_store="keyring"')
+
+
+@pytest.fixture(autouse=True)
+def _no_real_codex_home(tmp_path: Path, monkeypatch) -> None:
+    """The codex argv reads the user's ~/.codex/config.toml for one key. Never
+    let the developer's own file decide what a test expects."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex-home"))
 
 # The google profile, as install.sh writes it.
 GOOGLE_ENV = "\n".join([
@@ -49,6 +77,14 @@ GOOGLE_ENV = "\n".join([
     f"VOXHERD_SUMMARY_MODEL={AGY_MODEL}",
     "VOXHERD_NLU_CLI=agy",
     f"VOXHERD_NLU_MODEL={AGY_MODEL}",
+]) + "\n"
+
+# The openai profile, as install.sh writes it.
+OPENAI_ENV = "\n".join([
+    "VOXHERD_SUMMARY_CLI=codex",
+    f"VOXHERD_SUMMARY_MODEL={LUNA}",
+    "VOXHERD_NLU_CLI=codex",
+    f"VOXHERD_NLU_MODEL={LUNA}",
 ]) + "\n"
 
 # Gemini CLI by hand -- still valid for anyone with a GEMINI_API_KEY.
@@ -158,6 +194,25 @@ def test_profile_env_matches_prd_table() -> None:
         "VOXHERD_NLU_CLI": "claude",
         "VOXHERD_NLU_MODEL": HAIKU,
     }
+
+
+def test_openai_profile_is_luna_through_codex() -> None:
+    """GPT-6 Luna is OpenAI's model for summarisation; `codex exec` runs it on
+    the user's ChatGPT sign-in or API key, so it costs VoxHerd nothing."""
+    assert model_profile.profile_env("openai") == {
+        "VOXHERD_SUMMARY_CLI": "codex",
+        "VOXHERD_SUMMARY_MODEL": LUNA,
+        "VOXHERD_NLU_CLI": "codex",
+        "VOXHERD_NLU_MODEL": LUNA,
+    }
+
+
+def test_openai_profile_round_trips_through_the_file_install_sh_writes(tmp_path: Path) -> None:
+    body = "".join(f"{k}={v}\n" for k, v in model_profile.profile_env("openai").items())
+    profile = model_profile.resolve(env={}, path=write_env(tmp_path, body))
+    assert profile.summary_argv("PROMPT") == codex_argv("PROMPT")
+    assert profile.nlu_argv("PROMPT") == codex_argv("PROMPT")
+    assert profile.summary_cli_configured and profile.nlu_cli_configured
 
 
 def test_unknown_profile_name_falls_back_to_anthropic() -> None:
@@ -346,16 +401,100 @@ def test_model_flag_spelling(cli: str, flag: str) -> None:
 
 def test_codex_takes_the_prompt_positionally_after_exec() -> None:
     """`codex exec` has no -p; the prompt is the trailing positional."""
-    argv = model_profile.cli_argv("codex", "gpt-5.4", "do the thing")
-    assert argv == ["codex", "exec", "-m", "gpt-5.4", "do the thing"]
+    argv = model_profile.cli_argv("codex", LUNA, "do the thing")
+    assert argv == codex_argv("do the thing")
     assert argv[-1] == "do the thing"
     assert "-p" not in argv
 
 
 def test_codex_has_no_single_envelope_json_mode() -> None:
-    assert model_profile.cli_argv("codex", "gpt-5.4", "p", json_output=True) == [
-        "codex", "exec", "-m", "gpt-5.4", "p",
-    ]
+    assert model_profile.cli_argv("codex", LUNA, "p", json_output=True) == codex_argv("p")
+
+
+@pytest.mark.parametrize("flag", [
+    # Without it every call loads the user's MCP servers and fires the notify
+    # hook VoxHerd installed in ~/.codex/config.toml -- a phantom finished session.
+    "--ignore-user-config",
+    # Without it every summary and every intent parse is a session in `codex resume`.
+    "--ephemeral",
+    # Without it a hook run from a non-repository directory refuses to start.
+    "--skip-git-repo-check",
+])
+def test_codex_exec_carries_the_flag_a_one_shot_call_needs(flag: str) -> None:
+    assert flag in model_profile.cli_argv("codex", LUNA, "p")
+    assert flag in model_profile.cli_argv("codex", LUNA, "p", json_output=True)
+
+
+def test_codex_exec_cannot_write_and_reasons_at_low_effort() -> None:
+    argv = model_profile.cli_argv("codex", LUNA, "p")
+    assert argv[argv.index("-s") + 1] == "read-only"
+    assert argv[argv.index("-c") + 1] == 'model_reasoning_effort="low"'
+
+
+@pytest.mark.parametrize("prompt", ["-x does this parse", "--dangerously-bypass-approvals-and-sandbox"])
+def test_a_prompt_that_looks_like_a_flag_follows_a_double_dash(prompt: str) -> None:
+    """Measured on codex-cli 0.161.0: without `--`, clap reads a leading-dash
+    prompt as an option and exits with "unexpected argument"."""
+    argv = model_profile.cli_argv("codex", LUNA, prompt)
+    assert argv[-2:] == ["--", prompt]
+    assert argv.count(prompt) == 1
+
+
+# ---------------------------------------------------------------------------
+# codex: --ignore-user-config must not lose where the sign-in is kept
+# ---------------------------------------------------------------------------
+
+def _codex_config(tmp_path: Path, monkeypatch, body: str) -> Path:
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    (home / "config.toml").write_text(body, encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    return home
+
+
+@pytest.mark.parametrize("store", ["keyring", "auto", "file"])
+def test_codex_keeps_the_users_credential_store(tmp_path: Path, monkeypatch, store: str) -> None:
+    """--ignore-user-config drops cli_auth_credentials_store, so a keyring
+    sign-in looks signed out. Forward that one key and nothing else."""
+    _codex_config(tmp_path, monkeypatch,
+                  f'model = "gpt-6.1-sol"\ncli_auth_credentials_store = "{store}"\n'
+                  '[mcp_servers.secret]\ncommand = "x"\n')
+    argv = model_profile.cli_argv("codex", LUNA, "p")
+    assert argv == codex_argv("p", extra=("-c", f'cli_auth_credentials_store="{store}"'))
+    assert "gpt-6.1-sol" not in argv and "secret" not in " ".join(argv)
+
+
+@pytest.mark.parametrize("body", [
+    "",                                                          # nothing set
+    '[profiles.work]\ncli_auth_credentials_store = "keyring"\n',  # not top level
+    'cli_auth_credentials_store = "$(id)"\n',                   # not a store name
+    'cli_auth_credentials_store = "keyring" ; touch /tmp/vh-x\n',
+    "cli_auth_credentials_store = keyring\n",                  # not a TOML string
+    "\x00\xff binary",
+])
+def test_codex_forwards_no_store_it_cannot_trust(tmp_path: Path, monkeypatch, body: str) -> None:
+    _codex_config(tmp_path, monkeypatch, body)
+    assert model_profile.cli_argv("codex", LUNA, "p") == codex_argv("p")
+
+
+def test_codex_store_comes_from_codex_home_or_dot_codex(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("CODEX_HOME")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".codex").mkdir()
+    (tmp_path / ".codex" / "config.toml").write_text("cli_auth_credentials_store = 'keyring'\n")
+    assert model_profile.cli_argv("codex", LUNA, "p") == codex_argv("p", extra=KEYRING)
+
+
+def test_codex_store_lookup_never_raises(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "dir-not-file").mkdir()
+    (tmp_path / "dir-not-file" / "config.toml").mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "dir-not-file"))
+    assert model_profile.cli_argv("codex", LUNA, "p") == codex_argv("p")
+
+
+def test_no_other_cli_reads_the_codex_config(tmp_path: Path, monkeypatch) -> None:
+    _codex_config(tmp_path, monkeypatch, 'cli_auth_credentials_store = "keyring"\n')
+    assert model_profile.cli_argv("claude", HAIKU, "p") == ["claude", "-p", "p", "--model", HAIKU]
 
 
 def test_prompt_is_a_single_argv_element_not_shell_text() -> None:
@@ -669,6 +808,48 @@ async def test_intent_parse_spawns_gemini_when_configured_by_hand(
 
 
 @pytest.mark.asyncio
+async def test_intent_parse_spawns_codex_luna_under_the_openai_profile(
+    client: httpx.AsyncClient, tmp_path: Path, monkeypatch
+) -> None:
+    """codex exec prints the bare reply: no envelope, so the action is scraped."""
+    monkeypatch.setenv("VOXHERD_MODELS_ENV", str(write_env(tmp_path, OPENAI_ENV)))
+    model_profile.reset_active()
+
+    seen: list[list[str]] = []
+    with patch("asyncio.create_subprocess_exec",
+               _fake_exec_capturing(b'{"action": "status"}\n', seen)):
+        resp = await client.post(
+            "/api/intent/parse", json={"transcription": "how is everyone"},
+            headers=auth_headers(),
+        )
+    assert resp.json() == {"action": "status"}
+    assert seen[0][:-1] == codex_argv("x")[:-1]
+
+
+@pytest.mark.asyncio
+async def test_intent_parse_gives_the_cli_no_stdin(client: httpx.AsyncClient) -> None:
+    """`codex exec` appends piped stdin to the prompt and waits for its end. An
+    inherited stdin -- the menu bar app's, a TTY -- must never reach the model."""
+    stdins: list[object] = []
+
+    async def _fake_exec(*args, **kwargs):
+        stdins.append(kwargs.get("stdin", "inherited"))
+
+        class _Proc:
+            returncode = 0
+
+            async def communicate(self):
+                return b'{"action": "status"}', b""
+
+        return _Proc()
+
+    with patch("asyncio.create_subprocess_exec", _fake_exec):
+        await client.post("/api/intent/parse", json={"transcription": "status"},
+                          headers=auth_headers())
+    assert stdins == [asyncio.subprocess.DEVNULL]
+
+
+@pytest.mark.asyncio
 async def test_intent_parse_reports_error_on_gemini_error_envelope(
     client: httpx.AsyncClient, tmp_path: Path, monkeypatch
 ) -> None:
@@ -762,6 +943,42 @@ def test_bash_resolver_gemini_matches_python(tmp_path: Path) -> None:
 
 
 @bash_only
+def test_bash_resolver_openai_profile_matches_python(tmp_path: Path) -> None:
+    path = write_env(tmp_path, OPENAI_ENV)
+    got = _run_bash_resolver({"VOXHERD_MODELS_ENV": str(path)})
+    expected = model_profile.resolve(env={}, path=path)
+    assert got["summary_argv"] == expected.summary_argv("PROMPT") == codex_argv("PROMPT")
+    assert got["nlu_argv"] == expected.nlu_argv("PROMPT")
+    assert got["summary_cli_source"] == "file"
+
+
+@bash_only
+@pytest.mark.parametrize("body,extra", [
+    ('cli_auth_credentials_store = "keyring"\n', KEYRING),
+    ("cli_auth_credentials_store = 'auto'  # comment\n", ("-c", 'cli_auth_credentials_store="auto"')),
+    ('[profiles.work]\ncli_auth_credentials_store = "keyring"\n', ()),
+    ('cli_auth_credentials_store = "$(touch /tmp/vh-pwned)"\n', ()),
+])
+def test_bash_resolver_forwards_the_codex_store_like_python(
+    tmp_path: Path, monkeypatch, body: str, extra: tuple[str, ...]
+) -> None:
+    codex_home = _codex_config(tmp_path, monkeypatch, body)
+    path = write_env(tmp_path, OPENAI_ENV)
+    got = _run_bash_resolver({"VOXHERD_MODELS_ENV": str(path), "CODEX_HOME": str(codex_home)})
+    expected = model_profile.resolve(env={}, path=path)
+    assert got["summary_argv"] == expected.summary_argv("PROMPT") == codex_argv("PROMPT", extra=extra)
+
+
+@bash_only
+def test_bash_resolver_finds_dot_codex_under_home(tmp_path: Path) -> None:
+    (tmp_path / ".codex").mkdir()
+    (tmp_path / ".codex" / "config.toml").write_text('cli_auth_credentials_store = "keyring"\n')
+    got = _run_bash_resolver({"VOXHERD_MODELS_ENV": str(write_env(tmp_path, OPENAI_ENV)),
+                              "HOME": str(tmp_path)})
+    assert got["summary_argv"] == codex_argv("PROMPT", extra=KEYRING)
+
+
+@bash_only
 def test_bash_resolver_env_beats_file(tmp_path: Path) -> None:
     path = write_env(tmp_path, GOOGLE_ENV)
     got = _run_bash_resolver({
@@ -830,6 +1047,14 @@ def test_powershell_resolver_agrees_on_defaults_and_allowlist() -> None:
     # agy's extras: slash commands off, and claude's JSON flag spelling.
     assert 'if ($Cli -eq "agy") { $argv += @("--disable-slash-commands") }' in text
     assert 'if ($Cli -eq "claude" -or $Cli -eq "agy") { $argv += @("--output-format", "json") }' in text
+    # codex: the same flags, in the same order, ahead of -m and the prompt.
+    codex = re.search(r'\$script:VoxHerdCodexExecArgs\s*=\s*@\(([^)]*)\)', text)
+    assert codex, "ModelProfile.ps1 must name its codex exec flags"
+    flags = re.findall(r"'([^']*)'|\"([^\"]*)\"", codex.group(1))
+    assert [a or b for a, b in flags] == CODEX_SAFE
+    assert '+ @($flag, $Model, "--", $Prompt)' in text
+    assert "Get-VoxHerdCodexAuthStore" in text
+    assert "'file', 'keyring', 'auto'" in text, "same store allowlist as _CODEX_AUTH_STORES"
 
 
 @pwsh_only
@@ -837,6 +1062,7 @@ def test_powershell_resolver_agrees_on_defaults_and_allowlist() -> None:
     (None, "claude", HAIKU),
     (GOOGLE_ENV, "agy", AGY_MODEL),
     (GEMINI_ENV, "gemini", FLASH_LITE),
+    (OPENAI_ENV, "codex", LUNA),
     ("VOXHERD_SUMMARY_CLI=bash\n", "claude", HAIKU),
     ("not an env file", "claude", HAIKU),
 ])
@@ -907,6 +1133,7 @@ def test_install_hooks_ps1_writes_the_same_values_as_profiles() -> None:
 def test_install_sh_documents_the_model_profile_flag() -> None:
     text = INSTALL_SH.read_text(encoding="utf-8")
     assert "MODEL_PROFILE=google bash hooks/install.sh" in text
+    assert "MODEL_PROFILE=openai bash hooks/install.sh" in text
     assert "models.env" in text
 
 
@@ -962,3 +1189,92 @@ def test_install_sh_ships_the_shared_resolvers() -> None:
     text = INSTALL_SH.read_text(encoding="utf-8")
     assert '"model-profile.sh"' in text, "the bash resolver must be installed next to the hooks"
     assert "model_profile.py" in text, "the Python resolver must be installed next to on-stop.py"
+
+
+# ---------------------------------------------------------------------------
+# The documented codex command must be the one the resolvers build
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("doc,model", [("CLAUDE.md", "<model>"), ("docs/api.md", LUNA)])
+def test_documented_codex_command_matches_the_resolver(doc: str, model: str) -> None:
+    """The flag list lives in three resolvers and two docs. The resolvers have
+    parity tests; this keeps the docs from going stale behind them."""
+    text = (REPO_ROOT / doc).read_text(encoding="utf-8")
+    row = next((line for line in text.splitlines() if line.startswith("| `openai`")), None)
+    assert row, f"{doc} has no openai profile row"
+    want = " ".join(model_profile._CODEX_EXEC_ARGS) + f' -m {model} -- "<prompt>"'
+    assert f"`{want}`" in row, f"{doc} documents a different codex command than cli_argv builds"
+
+
+def test_codex_branch_has_no_json_flag_to_add() -> None:
+    """codex exec has no envelope mode; the table must not pretend otherwise."""
+    assert "codex" not in model_profile._JSON_FLAG
+
+
+# ---------------------------------------------------------------------------
+# A codex-only machine gets the openai profile without being asked
+# ---------------------------------------------------------------------------
+
+_JQ = shutil.which("jq")
+installer_only = pytest.mark.skipif(
+    shutil.which("bash") is None or _JQ is None, reason="install.sh needs bash and jq",
+)
+
+
+def _run_install(tmp_path: Path, clis: tuple[str, ...], **extra_env: str) -> tuple[Path, str]:
+    """install.sh in a throwaway HOME, with only *clis* on PATH."""
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir(exist_ok=True)
+    (fakebin / "jq").symlink_to(_JQ)
+    for name in clis:
+        exe = fakebin / name
+        exe.write_text("#!/bin/sh\nexit 0\n")
+        exe.chmod(0o755)
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("VOXHERD_", "MODEL_PROFILE", "HOOK_AGENTS", "CODEX_HOME"))}
+    env.update(HOME=str(home), PATH=f"{fakebin}{os.pathsep}/usr/bin{os.pathsep}/bin", **extra_env)
+    done = subprocess.run(["bash", str(INSTALL_SH)], capture_output=True, text=True,
+                          timeout=60, env=env, check=False)
+    assert done.returncode == 0, done.stdout + done.stderr
+    return home / ".voxherd" / "models.env", done.stdout
+
+
+@installer_only
+def test_codex_only_install_writes_the_openai_profile(tmp_path: Path) -> None:
+    """With no claude to run, the Haiku default can never summarise or parse."""
+    models_env, out = _run_install(tmp_path, ("codex",))
+    assert model_profile.read_models_env(models_env) == model_profile.profile_env("openai")
+    assert "openai" in out
+
+
+@installer_only
+@pytest.mark.parametrize("clis", [("claude",), ("claude", "codex"), ()])
+def test_install_with_claude_or_nothing_writes_no_profile(tmp_path: Path, clis) -> None:
+    models_env, _ = _run_install(tmp_path, clis)
+    assert not models_env.exists(), "the Haiku default is still written as no file at all"
+
+
+@installer_only
+def test_codex_only_install_keeps_an_existing_profile(tmp_path: Path) -> None:
+    existing = tmp_path / "home" / ".voxherd" / "models.env"
+    existing.parent.mkdir(parents=True)
+    existing.write_text(GOOGLE_ENV)
+    models_env, _ = _run_install(tmp_path, ("codex",))
+    assert models_env.read_text() == GOOGLE_ENV
+
+
+@installer_only
+def test_an_explicit_profile_beats_the_codex_only_default(tmp_path: Path) -> None:
+    models_env, _ = _run_install(tmp_path, ("codex",), MODEL_PROFILE="anthropic")
+    assert model_profile.read_models_env(models_env) == model_profile.profile_env("anthropic")
+
+
+def test_install_hooks_ps1_picks_openai_on_a_codex_only_machine() -> None:
+    """The Windows installer cannot be run here; pin the same rule statically."""
+    text = (REPO_ROOT / "hooks" / "install-hooks.ps1").read_text(encoding="utf-8")
+    assert re.search(
+        r'-not \(Get-Command claude[^)]*\)\) -and \(Get-Command codex[^)]*\)', text
+    ), "install-hooks.ps1 must choose openai when codex is present and claude is not"
+    assert 'Write-ModelsEnv -Profile "openai"' in text

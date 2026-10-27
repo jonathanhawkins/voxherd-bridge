@@ -6,7 +6,9 @@ summary that gets spoken aloud, and the structured-JSON intent parse behind
 a per-request one — a summary's model must never depend on which client happens
 to be connected when the turn ends.
 
-``hooks/install.sh`` writes ``~/.voxherd/models.env`` (``%APPDATA%\\VoxHerd`` on
+Three named profiles: ``anthropic`` (Claude Haiku, the default), ``google``
+(Gemini 3.8 Flash through ``agy``) and ``openai`` (GPT-6 Luna through
+``codex exec``). ``hooks/install.sh`` writes ``~/.voxherd/models.env`` (``%APPDATA%\\VoxHerd`` on
 Windows)::
 
     VOXHERD_SUMMARY_CLI=agy
@@ -74,6 +76,19 @@ PROFILES: dict[str, dict[str, str]] = {
         "nlu_cli": "agy",
         "nlu_model": "gemini-3.8-flash-low",
     },
+    # The `openai` profile, for Codex users. GPT-6 Luna is the model OpenAI's
+    # Codex docs recommend for summarisation and extraction, and its cheapest
+    # ($0.10 in / $0.50 out per million tokens, against Haiku 4.5's $1 / $5).
+    # `codex exec` runs it on the user's ChatGPT sign-in or API key. Effort is
+    # pinned low in the argv (_CODEX_EXEC_ARGS), not in the model id. Measured
+    # 2026-10-27 on codex-cli 0.161.0: 4.4-5.8 s a call, ~12k tokens, most of
+    # them Codex's own agent instructions rather than the transcript.
+    "openai": {
+        "summary_cli": "codex",
+        "summary_model": "gpt-6-luna",
+        "nlu_cli": "codex",
+        "nlu_model": "gpt-6-luna",
+    },
 }
 
 DEFAULT_PROFILE = "anthropic"
@@ -103,14 +118,53 @@ _MODEL_FLAG: dict[str, str] = {
 }
 
 #: Per-CLI flag for "give me a JSON envelope instead of prose". ``codex exec``
-#: only offers a JSONL event stream, so it is left out; callers fall back to
+#: only offers a JSONL event stream, so it has no entry; callers fall back to
 #: scraping the object out of raw stdout.
 _JSON_FLAG: dict[str, tuple[str, ...]] = {
     "claude": ("--output-format", "json"),
     "gemini": ("-o", "json"),
-    "codex": (),
     "agy": ("--output-format", "json"),
 }
+
+#: ``codex exec`` is a full agent run, so a one-shot call has to turn most of
+#: that off. Every flag here is load-bearing:
+#:
+#: * ``--ephemeral`` -- no session file, or every summary and every intent
+#:   parse would show up in the user's ``codex resume`` list.
+#: * ``--ignore-user-config`` -- skip ``~/.codex/config.toml``: its MCP servers
+#:   (slow to start) and the ``notify`` hook VoxHerd itself installs there,
+#:   which would report the summary call as a session that just finished.
+#:   Sign-in still comes from ``CODEX_HOME``. The cost: a custom provider set
+#:   in that file is not used for summaries.
+#: * ``--skip-git-repo-check`` -- hooks and the bridge run from directories
+#:   that are not repositories, where ``codex exec`` otherwise refuses.
+#: * ``-s read-only`` -- the model can read but never write or run a change.
+#: * ``--color never`` -- plain stdout for the hook to speak.
+#: * ``model_reasoning_effort="low"`` -- a 1-2 sentence summary needs no more,
+#:   and low used a third fewer tokens than the default medium.
+#:
+#: They go ahead of ``-m <model>``, and a ``--`` goes ahead of the prompt:
+#: without it clap reads a prompt that begins with ``-`` as an option and
+#: exits with "unexpected argument" (measured, codex-cli 0.161.0).
+_CODEX_EXEC_ARGS: tuple[str, ...] = (
+    "codex", "exec",
+    "--ephemeral",
+    "--ignore-user-config",
+    "--skip-git-repo-check",
+    "-s", "read-only",
+    "--color", "never",
+    "-c", 'model_reasoning_effort="low"',
+)
+
+#: ``--ignore-user-config`` also drops where the sign-in is kept: a user with
+#: ``cli_auth_credentials_store = "keyring"`` looks signed out without it. So
+#: that one top-level key is read back out of ``$CODEX_HOME/config.toml`` and
+#: forwarded, and nothing else in the file is. The value must be one of these.
+_CODEX_AUTH_STORES: tuple[str, ...] = ("file", "keyring", "auto")
+_CODEX_AUTH_KEY = "cli_auth_credentials_store"
+_CODEX_AUTH_RE = re.compile(
+    r"""\A\s*cli_auth_credentials_store\s*=\s*(?:"([a-z]+)"|'([a-z]+)')\s*(?:\#.*)?\Z"""
+)
 
 #: ``agy`` is an agent first: a prompt that happens to start with "/" would run
 #: as one of its slash commands or skills. Nothing we send should.
@@ -338,6 +392,31 @@ def profile_env(name: str) -> dict[str, str]:
 # Command construction
 # --------------------------------------------------------------------------
 
+def codex_auth_store(env: dict[str, str] | None = None) -> str | None:
+    """The user's ``cli_auth_credentials_store``, if they set one, else None.
+
+    Read line by line, top-level keys only (a line before the first ``[table]``
+    header), and only a quoted value from :data:`_CODEX_AUTH_STORES`. This is
+    not a TOML parser and does not need to be: anything it cannot be sure of is
+    left out, which is exactly today's behaviour. Never raises.
+    """
+    env = os.environ if env is None else env
+    try:
+        codex_home = (env.get("CODEX_HOME") or "").strip()
+        base = Path(codex_home) if codex_home else Path.home() / ".codex"
+        text = (base / "config.toml").read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    for line in text.splitlines():
+        if line.lstrip().startswith("["):
+            return None  # past the top level: a key under [profiles.x] is not the user's own
+        match = _CODEX_AUTH_RE.match(line)
+        if match:
+            store = match.group(1) or match.group(2)
+            return store if store in _CODEX_AUTH_STORES else None
+    return None
+
+
 def model_flag(cli: str) -> str:
     """The flag this CLI spells ``--model`` with."""
     return _MODEL_FLAG.get(cli, "--model")
@@ -357,12 +436,13 @@ def cli_argv(cli: str, model: str, prompt: str, json_output: bool = False) -> li
     model = model.strip()
 
     if cli == "codex":
-        # `codex exec` takes the prompt positionally, after the flags.
-        argv = ["codex", "exec", model_flag(cli), model]
-        if json_output:
-            argv.extend(_JSON_FLAG["codex"])
-        argv.append(prompt)
-        return argv
+        # `codex exec` takes the prompt positionally, after the flags and a `--`.
+        # It has no envelope mode, so json_output changes nothing here.
+        argv = [*_CODEX_EXEC_ARGS]
+        store = codex_auth_store()
+        if store:
+            argv.extend(("-c", f'{_CODEX_AUTH_KEY}="{store}"'))
+        return [*argv, model_flag(cli), model, "--", prompt]
 
     argv = [cli, "-p", prompt, model_flag(cli), model, *_EXTRA_ARGS.get(cli, ())]
     if json_output:
@@ -420,6 +500,7 @@ __all__ = [
     "ModelProfile",
     "active",
     "cli_argv",
+    "codex_auth_store",
     "model_flag",
     "models_env_path",
     "parse_models_env",
