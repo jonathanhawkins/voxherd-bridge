@@ -22,7 +22,7 @@ The XREAL Aura app puts every agent you have running in the room with you: each 
 - **Read the code they touch.** "Open format dot ts" opens the file beside the terminal, highlighted, and can follow the agent's edits.
 - **Hear what happened.** Finished agents speak a one-line summary, placed toward their panel.
 
-**Get started:** install [VoxHerd from Google Play](https://play.google.com/store/apps/details?id=com.voxherd.aura) on the headset, run this bridge on your Mac ([download the latest release](https://github.com/jonathanhawkins/voxherd-bridge/releases/latest)), and pair them: the Mac shows a six-digit code, and you say it to the headset. Nothing leaves your network -- the headset talks only to the bridge.
+**Get started:** install VoxHerd from Google Play on the headset (the listing is coming soon), run this bridge on your Mac ([download the latest release](https://github.com/jonathanhawkins/voxherd-bridge/releases/latest)), and pair them: the Mac shows a six-digit code, and you say it to the headset. Nothing leaves your network -- the headset talks only to the bridge.
 
 ## Why VoxHerd?
 
@@ -41,7 +41,7 @@ If you run multiple AI coding sessions across different projects, you know the p
 | **Linux** | espeak-ng TTS | Stable |
 | **Windows** | System tray app (pystray) | Beta |
 | **Windows** | pyttsx3 TTS | Beta |
-| **XREAL Aura** | Android XR app | [Google Play](https://play.google.com/store/apps/details?id=com.voxherd.aura) |
+| **XREAL Aura** | Android XR app | Google Play (coming soon) |
 | **iOS** | Voice remote app | Available separately |
 
 ## Quick Start
