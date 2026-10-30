@@ -1,13 +1,28 @@
 # VoxHerd
 
-**Herd your AI coding agents with your voice.**
+**Herd your AI coding agents with your voice -- now on XREAL Aura.**
 
-VoxHerd is a voice-first controller for AI coding assistants. It lets you manage multiple [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://developers.openai.com/codex), and [Gemini CLI](https://github.com/google-gemini/gemini-cli) sessions from Meta Ray-Ban glasses, your phone, or just your laptop mic. Agents announce when they finish work via text-to-speech. You issue follow-up commands by talking. No browser tab required -- walk around, supervise, and redirect your agents by voice.
+[![VoxHerd on XREAL Aura](https://i.ytimg.com/vi/OdLMuicxTkI/maxresdefault.jpg)](https://youtu.be/OdLMuicxTkI)
+
+*[Watch VoxHerd on XREAL Aura on YouTube](https://youtu.be/OdLMuicxTkI)*
+
+VoxHerd is a voice-first controller for AI coding assistants. It lets you manage multiple [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://developers.openai.com/codex), and [Gemini CLI](https://github.com/google-gemini/gemini-cli) sessions from an XREAL Aura headset, your iPhone, or just your laptop mic. Agents announce when they finish work via text-to-speech. You issue follow-up commands by talking. No browser tab required -- walk around, supervise, and redirect your agents by voice.
 
 ```
 Voice input -> STT -> intent parse -> WebSocket -> Bridge Server (FastAPI :7777) -> assistant dispatch
 Assistant hooks (lifecycle events) -> HTTP POST -> Bridge Server -> WebSocket -> TTS -> speaker
 ```
+
+## VoxHerd for XREAL Aura
+
+The XREAL Aura app puts every agent you have running in the room with you: each one gets its own live terminal panel, curved around you in Full Space.
+
+- **Talk to your agents.** "Hey agent, tell checkout api to add rate limiting." Bare follow-ups go to the panel you're looking at.
+- **Approve with a word.** Permission prompts become cards: say "approve" or "deny", or pinch the option you want.
+- **Read the code they touch.** "Open format dot ts" opens the file beside the terminal, highlighted, and can follow the agent's edits.
+- **Hear what happened.** Finished agents speak a one-line summary, placed toward their panel.
+
+**Get started:** install [VoxHerd from Google Play](https://play.google.com/store/apps/details?id=com.voxherd.aura) on the headset, run this bridge on your Mac ([download the latest release](https://github.com/jonathanhawkins/voxherd-bridge/releases/latest)), and pair them: the Mac shows a six-digit code, and you say it to the headset. Nothing leaves your network -- the headset talks only to the bridge.
 
 ## Why VoxHerd?
 
@@ -26,6 +41,7 @@ If you run multiple AI coding sessions across different projects, you know the p
 | **Linux** | espeak-ng TTS | Stable |
 | **Windows** | System tray app (pystray) | Beta |
 | **Windows** | pyttsx3 TTS | Beta |
+| **XREAL Aura** | Android XR app | [Google Play](https://play.google.com/store/apps/details?id=com.voxherd.aura) |
 | **iOS** | Voice remote app | Available separately |
 
 ## Quick Start
@@ -97,7 +113,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
 1. AI assistant hooks fire on session lifecycle events (start, stop/after-turn, notification)
 2. Hook scripts POST events to the bridge server at `localhost:7777`
 3. Bridge forwards events to connected clients over WebSocket
-4. Connected app (iOS, macOS menu bar, Windows tray, Linux panel) announces results via TTS
+4. Connected app (XREAL Aura, iOS, macOS menu bar, Windows tray, Linux panel) announces results via TTS
 5. Voice commands are parsed, routed to the right project, and dispatched to the configured assistant via `--resume`
 
 The bridge is the central hub. Desktop apps manage the bridge process, show session status, and provide QR codes for mobile pairing. AI assistant CLIs keep their own project context -- VoxHerd just routes voice commands to the right session and announces results.
